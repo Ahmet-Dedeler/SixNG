@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 mod glb;
+mod assemble;
 mod map2d;
 mod map3d;
 mod mem;

@@ -196,6 +196,13 @@ impl ModelView {
                     l.model.joints.len(),
                     l.model.images.len()
                 );
+                let missing = l.model.materials.iter().filter(|m| m.gap == "no colour texture").count();
+                if missing > 0 {
+                    self.status += &format!(
+                        " · {missing} of {} materials have no colour texture (not decodable or not in the game files; shown plain white, not guessed)",
+                        l.model.materials.len()
+                    );
+                }
                 self.gpu = Some(g);
                 self.loaded = Some(l);
                 self.frames_since_load = 0;
@@ -649,6 +656,7 @@ impl ModelView {
             let col = match m.gap.as_str() {
                 "flat" => egui::Color32::from_rgb(230, 70, 70),
                 "lowmip" => egui::Color32::from_rgb(240, 190, 40),
+                "no colour texture" => egui::Color32::from_rgb(170, 170, 170),
                 _ => egui::Color32::from_rgb(90, 200, 110),
             };
             let visible = self.gpu.as_ref().map(|g| g.meshes.iter().filter(|me| me.material == k).all(|me| me.visible)).unwrap_or(true);
@@ -664,7 +672,7 @@ impl ModelView {
                     }
                 }
                 let sel = self.material_sel == Some(k);
-                if ui.selectable_label(sel, egui::RichText::new(format!("{} · {} · {}", m.name, m.class, m.alpha_mode)).color(col)).clicked() {
+                if ui.selectable_label(sel, egui::RichText::new(format!("{} · {} · {}{}", m.name, m.class, m.alpha_mode, if m.gap == "no colour texture" { " · no colour texture (shown white)" } else { "" })).color(col)).clicked() {
                     self.material_sel = if sel { None } else { Some(k) };
                 }
             });
@@ -778,6 +786,36 @@ pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx:
         let model = glb::load(&p, &root)?;
         return Ok(Loaded { model, lods, lod, out_root: root, source: dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), info });
     }
+    // character outfit: "<archive>#outfit:<prefix>"
+    if let Some((archive, prefix)) = q.split_once("#outfit:") {
+        let (a, ix) = index_for(ws, archive, idx)?;
+        let parts = crate::assemble::outfit_parts(&ix, prefix);
+        if parts.is_empty() {
+            return Err(anyhow::anyhow!("no parts found for {prefix}"));
+        }
+        let mut model: Option<glb::Model> = None;
+        let mut first = Vec::new();
+        let mut errs = Vec::new();
+        for e in &parts {
+            match export_load(&a, e, cache, lod) {
+                Ok((mut m, lods, _)) => {
+                    crate::assemble::fix_ped_normals(&mut m);
+                    if first.is_empty() {
+                        first = lods;
+                    }
+                    match &mut model {
+                        None => model = Some(m),
+                        Some(into) => glb::merge(into, m),
+                    }
+                }
+                Err(err) => errs.push(format!("{}: {err:#}", e.id)),
+            }
+        }
+        let model = model.ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
+        let names: Vec<String> = parts.iter().map(|e| e.name.clone().unwrap_or_default()).collect();
+        let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs });
+        return Ok(Loaded { model, lods: first.into_iter().take(1).collect(), lod: 0, out_root: cache.to_path_buf(), source: format!("{} (outfit, {} parts)", prefix, parts.len()), info });
+    }
     // entry: "<archive>@<hex>" or a name regex (in levels unless "archive:regex")
     let (archive, rest) = match q.split_once('@') {
         Some((a, o)) => (a.to_string(), Some(o.to_string())),
@@ -795,8 +833,45 @@ pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx:
         Some(re) => find_name(&ix, re.trim_start_matches('~'))?,
         None => unreachable!(),
     };
+    let (mut model, lods, info) = export_load(&a, e, cache, lod)?;
+    let lod = lod.min(lods.len() - 1);
+    if e.name.as_deref().map_or(false, crate::assemble::is_ped_part) {
+        crate::assemble::fix_ped_normals(&mut model);
+    }
+    // animals: the fragment is a skeleton with a placeholder plane; add the textured parts
+    let name = e.name.as_deref().unwrap_or("");
+    if crate::assemble::is_animal(name) && e.rtype.as_deref() == Some("ft") {
+        let parts = crate::assemble::animal_parts(&ix, name);
+        let mut added = 0;
+        let mut info = info;
+        let mut names = Vec::new();
+        for p in &parts {
+            if let Ok((m, _, _)) = export_load(&a, p, cache, lod) {
+                if added == 0 {
+                    model.meshes.clear();
+                    model.triangles = 0;
+                    model.vertices = 0;
+                }
+                glb::merge(&mut model, m);
+                added += 1;
+                names.push(p.name.clone().unwrap_or_default());
+            }
+        }
+        if added > 0 {
+            if let Some(o) = info.as_object_mut() {
+                o.insert("assembled_from".into(), serde_json::json!(names));
+            }
+            return Ok(Loaded { model, lods: lods.into_iter().skip(lod).take(1).collect(), lod: 0, out_root: cache.to_path_buf(), source: format!("{} {} (+{} parts)", e.id, name, added), info });
+        }
+        return Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source: format!("{} {}", e.id, name), info });
+    }
+    Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source: format!("{} {}", e.id, name).trim().to_string(), info })
+}
+
+/// Export one entry into the viewer cache and load the GLB of a LOD level.
+fn export_load(a: &sixng_core::game::ArchiveInfo, e: &sixng_core::scan::Entry, cache: &Path, lod: usize) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
     let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: false, skip_embedded_textures: false };
-    let item = export::export_entry(&a, e, &opts)?;
+    let item = export::export_entry(a, e, &opts)?;
     let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(format!("{}_{:x}", export_sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off));
     let lods = lods_in(&dir);
     if lods.is_empty() {
@@ -804,8 +879,9 @@ pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx:
     }
     let lod = lod.min(lods.len() - 1);
     let info = std::fs::read(dir.join("model.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    let model = glb::load(&lods[lod], cache)?;
-    Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source: format!("{} {}", e.id, e.name.as_deref().unwrap_or("")).trim().to_string(), info })
+    let mut model = glb::load(&lods[lod], cache)?;
+    crate::assemble::mark_missing_colour(&mut model);
+    Ok((model, lods, info))
 }
 
 trait CloneWith {
@@ -841,4 +917,25 @@ fn find_name<'a>(ix: &'a ArchiveIndex, re: &str) -> anyhow::Result<&'a sixng_cor
 /// Same rule as sixng_core::export::sanitize (kept local: it is private there).
 pub(crate) fn export_sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.' { c } else { '_' }).collect()
+}
+
+/// Entry ids of the parts an animal root or a character outfit is put
+/// together from (None for ordinary models).
+pub(crate) fn assembly_ids(ws: &Workspace, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>, id: &str) -> Option<Vec<String>> {
+    if let Some((archive, prefix)) = id.split_once("#outfit:") {
+        let (_, ix) = index_for(ws, archive, idx).ok()?;
+        return Some(crate::assemble::outfit_parts(&ix, prefix).iter().map(|e| e.id.clone()).collect());
+    }
+    let (archive, off) = id.split_once('@')?;
+    let (_, ix) = index_for(ws, archive, idx).ok()?;
+    let off = u64::from_str_radix(off, 16).ok()?;
+    let e = ix.entries.iter().find(|e| e.off == off)?;
+    let name = e.name.as_deref()?;
+    if e.rtype.as_deref() == Some("ft") && crate::assemble::is_animal(name) {
+        let parts = crate::assemble::animal_parts(&ix, name);
+        if !parts.is_empty() {
+            return Some(std::iter::once(e.id.clone()).chain(parts.iter().map(|p| p.id.clone())).collect());
+        }
+    }
+    None
 }

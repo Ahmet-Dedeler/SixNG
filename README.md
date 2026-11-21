@@ -211,6 +211,20 @@ again**).
   favourites, **Export (glTF + textures)** (queued as a job) and a
   **Files** panel for the exported files (Show in Explorer, Open, Copy
   path). Clicking a model on either map opens its item page.
+- **People** and **Animals** are categories of their own. An animal's
+  entry (`crr_iguana_green_m_00`) is only a skeleton with a placeholder
+  plane; the viewer puts its default parts together (body, eyes, head, fur,
+  teeth …, without accessories like harnesses or costumes), each with its
+  own textures. Named characters (`cs_…`, `u_…`, `player_story…`) are
+  listed as one entry that puts one item per outfit slot together (head,
+  hair, top, jacket, trousers, shoes …). Single ped pieces are hidden as
+  variants. Names are made readable: "Iguana (green, male)",
+  "Dog (rottweiler, female)", "Farm monster man".
+- Colours are never guessed. Many ped clothing and skin materials have no colour
+  texture that SixNG can read (clothing colour is in BCPack; skin is built
+  by the game at run time). Such materials render plain white, and the
+  viewer says how many materials have no colour texture; the material list
+  marks each one. Normal maps and decals still show.
 - **Model viewer**, **Map 2D**, **Map 3D**, **Textures**: below.
 - **Jobs**: every CLI command as a form (built from `sixng --help`, so it
   stays in step with the CLI). Jobs run one at a time in the background

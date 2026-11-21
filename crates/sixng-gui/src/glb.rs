@@ -578,3 +578,63 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         extras: d.j["scenes"][0]["extras"].clone(),
     })
 }
+
+/// Append another model's meshes, materials and images (for animals and
+/// characters assembled from parts). The appended meshes are drawn in their
+/// bind pose (not skinned to this model's joints).
+pub fn merge(into: &mut Model, other: Model) {
+    let empty = into.meshes.is_empty();
+    let img0 = into.images.len();
+    let mat0 = into.materials.len();
+    into.images.extend(other.images);
+    for mut m in other.materials {
+        for x in [&mut m.base, &mut m.normal, &mut m.packed, &mut m.emissive] {
+            if let Some(i) = x {
+                *i += img0;
+            }
+        }
+        into.materials.push(m);
+    }
+    for mut me in other.meshes {
+        me.material = me.material.map(|i| i + mat0);
+        me.skinned = false;
+        into.meshes.push(me);
+    }
+    if empty {
+        into.bbox = other.bbox;
+    } else {
+        for k in 0..3 {
+            into.bbox[0][k] = into.bbox[0][k].min(other.bbox[0][k]);
+            into.bbox[1][k] = into.bbox[1][k].max(other.bbox[1][k]);
+        }
+    }
+    into.triangles += other.triangles;
+    into.vertices += other.vertices;
+}
+
+/// Smooth vertex normals from the triangles, welding vertices at the same
+/// position (seams stay smooth). For meshes whose stored normals are wrong.
+pub fn recompute_normals(me: &mut Mesh) {
+    let key = |p: [f32; 3]| [(p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64];
+    let mut acc: HashMap<[i64; 3], [f32; 3]> = HashMap::new();
+    for t in me.indices.chunks_exact(3) {
+        let (a, b, c) = (me.verts[t[0] as usize].pos, me.verts[t[1] as usize].pos, me.verts[t[2] as usize].pos);
+        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+        let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+        for &i in t {
+            let e = acc.entry(key(me.verts[i as usize].pos)).or_insert([0.0; 3]);
+            for k in 0..3 {
+                e[k] += n[k];
+            }
+        }
+    }
+    for v in me.verts.iter_mut() {
+        if let Some(n) = acc.get(&key(v.pos)) {
+            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
+            if l > 0.0 {
+                v.nrm = [n[0] / l, n[1] / l, n[2] / l];
+            }
+        }
+    }
+}

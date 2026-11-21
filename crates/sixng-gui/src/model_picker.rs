@@ -20,6 +20,8 @@ pub enum Cat {
     VehicleParts,
     Wheels,
     Weapons,
+    People,
+    Animals,
     Props,
     Vegetation,
     Interiors,
@@ -33,6 +35,8 @@ pub const CATS: &[(Cat, &str)] = &[
     (Cat::VehicleParts, "Vehicle parts"),
     (Cat::Wheels, "Wheels"),
     (Cat::Weapons, "Weapons"),
+    (Cat::People, "People"),
+    (Cat::Animals, "Animals"),
     (Cat::Props, "Props"),
     (Cat::Vegetation, "Vegetation"),
     (Cat::Interiors, "Interiors"),
@@ -59,6 +63,12 @@ fn is_variant(n: &str) -> bool {
 fn categorise(name: Option<&str>, rtype: &str, vehicle_re: &regex::Regex) -> Cat {
     let Some(n) = name else { return Cat::Unnamed };
     let n = n.to_ascii_lowercase();
+    if crate::assemble::is_animal(&n) {
+        return Cat::Animals;
+    }
+    if crate::assemble::is_ped_part(&n) || crate::assemble::is_whole_ped(&n) {
+        return Cat::People;
+    }
     if n.starts_with("rim_") || n.starts_with("tyre_") || n.starts_with("wheel_") {
         Cat::Wheels
     } else if n.starts_with("w_") || n.starts_with("wpn_") {
@@ -233,6 +243,7 @@ impl ModelPicker {
             let vehicle_re = regex::Regex::new(sixng_core::export::NON_VEHICLE_FT).unwrap();
             let mut v = Vec::new();
             let mut errs = Vec::new();
+            let mut outfits: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
             for a in ARCHIVES {
                 log(&format!("loading index {a}"));
                 match crate::model_view::index_for(&ws, a, &idx) {
@@ -246,7 +257,22 @@ impl ModelPicker {
                             };
                             let name = e.name.clone().unwrap_or_else(|| format!("unnamed_{:x}", e.off));
                             let lname = name.to_ascii_lowercase();
-                            v.push(Item { cat: categorise(e.name.as_deref(), rtype, &vehicle_re), variant: e.name.is_some() && is_variant(&lname), lname, name, id: e.id.clone(), rtype, bytes: e.usize });
+                            let cat = categorise(e.name.as_deref(), rtype, &vehicle_re);
+                            // animals: only the roots (their parts are put together in the viewer);
+                            // people: whole characters below, single pieces as variants
+                            let variant = match cat {
+                                Cat::Animals => rtype == "dr" || lname.contains("_bounds"),
+                                Cat::People => !crate::assemble::is_whole_ped(&lname),
+                                _ => e.name.is_some() && is_variant(&lname),
+                            };
+                            if let Some(p) = crate::assemble::outfit_prefix(&lname) {
+                                *outfits.entry(p).or_insert(0) += e.usize;
+                            }
+                            v.push(Item { cat, variant, lname, name, id: e.id.clone(), rtype, bytes: e.usize });
+                        }
+                        let arch = a.to_string();
+                        for (p, bytes) in std::mem::take(&mut outfits) {
+                            v.push(Item { cat: Cat::People, variant: false, lname: p.clone(), name: p.clone(), id: format!("{arch}.rpf#outfit:{p}"), rtype: "outfit", bytes });
                         }
                     }
                     Err(e) => errs.push(format!("{a}: {e:#}")),

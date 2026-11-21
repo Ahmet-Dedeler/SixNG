@@ -34,12 +34,17 @@ pub struct Library {
     filter_key: (Option<Cat>, String, bool, usize),
     pub thumbs: Thumbs,
     tile: f32,
+    /// part ids of put-together models (animals, characters), by item id
+    parts: std::collections::HashMap<String, Option<Vec<String>>>,
 }
 
 /// Readable name from a model name: `phoenix_hi` → "Phoenix",
 /// `prop_am_parking_valet_01a` → "Parking valet 01a". Game display names are
 /// not decoded, so this is a best effort from the model name.
 pub fn display_name(name: &str) -> String {
+    if let Some(p) = crate::assemble::pretty_name(name) {
+        return p;
+    }
     let mut n = name.to_ascii_lowercase();
     for s in ["_hi", "_mid", "_lo"] {
         if let Some(x) = n.strip_suffix(s) {
@@ -79,7 +84,7 @@ pub fn export_dir(out: &Path, id: &str) -> Option<PathBuf> {
 
 impl Library {
     pub fn new(game: &str, work: &str, thumb_budget_mb: u64) -> Self {
-        Library { view: View::Home, back: Vec::new(), search: String::new(), hide_variants: true, filtered: Vec::new(), filter_key: (None, String::new(), true, 0), thumbs: Thumbs::new(game, work, thumb_budget_mb), tile: 150.0 }
+        Library { view: View::Home, back: Vec::new(), search: String::new(), hide_variants: true, filtered: Vec::new(), filter_key: (None, String::new(), true, 0), thumbs: Thumbs::new(game, work, thumb_budget_mb), tile: 150.0, parts: Default::default() }
     }
 
     pub fn show_item(&mut self, id: &str) {
@@ -311,6 +316,11 @@ impl Library {
         let ctx = ui.ctx().clone();
         let it = items.iter().find(|it| it.id == id);
         let name = it.map(|i| i.name.clone()).unwrap_or_else(|| id.to_string());
+        let parts = self
+            .parts
+            .entry(id.to_string())
+            .or_insert_with(|| crate::model_view::assembly_ids(&sixng_core::export::Workspace::new(&mv.game, &mv.work), &mv.indexes, id))
+            .clone();
         ui.horizontal_top(|ui| {
             let t = self.thumbs.get(&ctx, id);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(320.0, 320.0), egui::Sense::hover());
@@ -334,7 +344,12 @@ impl Library {
                         ui.label(cat_label(it.cat));
                         ui.end_row();
                         ui.label("Type");
-                        ui.label(if it.rtype == "ft" { "fragment (skinned / breakable)" } else { "drawable" });
+                        ui.label(match it.rtype {
+                            "ft" if crate::assemble::is_animal(&it.lname) => "animal (put together from its parts)",
+                            "ft" => "fragment (skinned / breakable)",
+                            "outfit" => "character (default outfit put together from its parts)",
+                            _ => "drawable",
+                        });
                         ui.end_row();
                         ui.label("Size");
                         ui.label(crate::human(it.bytes));
@@ -352,14 +367,46 @@ impl Library {
                     }
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("⬇ Export (glTF + textures)").on_hover_text(format!("Queues a job: extract to {out_root}")).clicked() {
-                        *act = Some(Action::Job(format!("export {name}"), vec!["extract".into(), archive_of(id).into(), "--id".into(), id.into(), "-o".into(), out_root.into(), "--tex".into(), "both".into()]));
+                    let (ids, hover) = match &parts {
+                        Some(p) => (p.join(","), format!("Queues a job: extract the {} parts to {out_root} (one glTF each, in the same bind pose, so they line up when imported together)", p.len())),
+                        None => (id.to_string(), format!("Queues a job: extract to {out_root}")),
+                    };
+                    if ui.button("⬇ Export (glTF + textures)").on_hover_text(hover).clicked() {
+                        let first = parts.as_ref().and_then(|p| p.first().cloned()).unwrap_or_else(|| id.to_string());
+                        *act = Some(Action::Job(format!("export {name}"), vec!["extract".into(), archive_of(&first).into(), "--id".into(), ids, "-o".into(), out_root.into(), "--tex".into(), "both".into()]));
                     }
                 });
             });
         });
         ui.separator();
         ui.heading("Files");
+        if let Some(p) = &parts {
+            ui.label(format!("Put together from {} parts:", p.len()));
+            egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                egui::Grid::new("item_parts").num_columns(3).striped(true).show(ui, |ui| {
+                    for pid in p {
+                        let pname = items.iter().find(|i| &i.id == pid).map(|i| i.name.clone()).unwrap_or_else(|| pid.clone());
+                        ui.label(egui::RichText::new(&pname).monospace());
+                        match export_dir(Path::new(out_root), pid) {
+                            Some(dir) => {
+                                if ui.small_button("Show in Explorer").clicked() {
+                                    let _ = std::process::Command::new("explorer").arg(&dir).spawn();
+                                }
+                                if ui.small_button("Copy path").clicked() {
+                                    ui.ctx().copy_text(dir.display().to_string());
+                                }
+                            }
+                            None => {
+                                ui.weak("not exported yet");
+                                ui.label("");
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+            });
+            return;
+        }
         match export_dir(Path::new(out_root), id) {
             None => {
                 ui.label(format!("Not exported yet to {out_root}. Use Export above; the files appear here when the job finishes."));
