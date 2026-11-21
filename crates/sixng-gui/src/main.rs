@@ -26,6 +26,7 @@ mod bakejob;
 mod model_picker;
 mod mapbake;
 mod model_view;
+mod vehicle_db;
 mod texture_view;
 mod audio_view;
 mod render3d;

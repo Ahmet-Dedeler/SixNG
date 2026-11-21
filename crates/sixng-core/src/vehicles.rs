@@ -12,7 +12,8 @@
 //!   configuration (joaat names: frame, bumpers, exhaust, brake disc,
 //!   caliper, **one `rim_*` and one `tyre_*`** in 3,197 of them).
 //! - `fc1c7000` variation sets (4,772): `fb1f80ff` model, `8c866829` an
-//!   ARGB paint palette (100 colours) in 2,246 sets, `59a59c3e` weighted
+//!   ARGB paint-colour list in 2,246 sets (1 to 400 entries with repeats,
+//!   e.g. 400 entries / 10 distinct: a weighted draw table), `59a59c3e` weighted
 //!   part groups (`37a6f9ef` slot, `a12ff3a2` [{`8e6612bf` part,
 //!   `dc732774` weight %}]).
 
@@ -58,6 +59,31 @@ fn get<'v>(v: &'v Value, h: u32) -> Option<&'v Value> {
 
 fn u32s(v: Option<&Value>) -> Vec<u32> {
     v.and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect()).unwrap_or_default()
+}
+
+/// joaat -> lower-case model name, from every index's entry names (with and
+/// without `_hi`).
+pub fn model_names(ws: &crate::export::Workspace) -> HashMap<u32, String> {
+    let mut names = HashMap::new();
+    for ar in ws.archives() {
+        let Ok(x) = ws.load_index(&ar) else { continue };
+        for e in &x.entries {
+            let Some(n) = e.name.as_deref() else { continue };
+            let b = n.rsplit(|c| c == '/' || c == char::from(92u8)).next().unwrap_or(n).split('.').next().unwrap_or(n).to_ascii_lowercase();
+            for c in [b.clone(), b.trim_end_matches("_hi").to_string()] {
+                names.entry(meta7a::joaat(&c)).or_insert(c);
+            }
+        }
+    }
+    names
+}
+
+/// `sixng vehicles packs --out <out>` in one call.
+pub fn build(ws: &crate::export::Workspace, out: &std::path::Path) -> Result<Value> {
+    let a = ws.resolve("packs")?;
+    let ix = ws.load_index(&a)?;
+    let metas: Vec<&Entry> = ix.entries.iter().filter(|e| e.kind == crate::classify::Kind::Resource && e.sub == "7a").collect();
+    export(&a, &metas, &model_names(ws), out)
 }
 
 /// Write `<out>/vehicles/vehicles.json`. `names`: joaat -> model name.
@@ -159,7 +185,7 @@ pub fn export(a: &ArchiveInfo, metas: &[&Entry], names: &HashMap<u32, String>, o
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("vehicles.json");
     std::fs::write(&path, serde_json::to_vec_pretty(&json!({
-        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear look like the rim radius in metres: 0.2538 / 0.2234 on a dirt bike = 21 / 18 inch rims; the shared rim_* models have radius 0.5; how wheelScale scales them is not established), configurations (body colour ARGB + the part models incl. rim and tyre), palettes (ARGB paint palettes), part_groups (weighted part choices). Names resolve where known; others are joaat hex.",
+        "note": "Per vehicle model: model_info (vehicles.meta-like; wheelScale / wheelScaleRear size the wheels; the shared rim_* models have radius 0.5 and the tyres 0.875, and the model viewer scales both by 1.625 x wheelScale, a factor fitted by eye, not the game's verified rule), configurations (body colour ARGB + the part models incl. rim and tyre), palettes (ARGB paint-colour lists; colours repeat, so repetition reads as the draw weight), part_groups (weighted part choices). Names resolve where known; others are joaat hex.",
         "sources": sources,
         "vehicles": list,
     }))?)?;

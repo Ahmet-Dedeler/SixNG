@@ -42,6 +42,10 @@ pub struct Automation {
     pub ui_shot: Option<PathBuf>,
 }
 
+/// Shared-wheel scale per unit of the car's wheelScale: fitted by eye on
+/// phoenix (0.37 at wheelScale 0.2277); the game's rule is not decoded.
+pub const WHEEL_FACTOR: f32 = 0.37 / 0.227_721;
+
 pub struct ModelView {
     pub query: String,
     pub status: String,
@@ -75,6 +79,13 @@ pub struct ModelView {
     pub wheel_rim: String,
     pub wheel_tyre: String,
     pub wheel_scale: f32,
+    pub wheel_scale_rear: f32,
+    /// Size the shared wheels from the car's wheelScale (WHEEL_FACTOR x).
+    pub wheel_auto: bool,
+    pub vehicles: crate::vehicle_db::VehicleDb,
+    /// Model the vehicle data was applied to, and the chosen configuration.
+    veh_applied: String,
+    pub veh_cfg: Option<usize>,
     wheel_pending: Arc<Mutex<Option<Result<Vec<Loaded>, String>>>>,
     wheel_key: String,
     wheels: Vec<GpuModel>,
@@ -119,6 +130,11 @@ impl ModelView {
             wheel_rim: "rim_muscle_001_hi".into(),
             wheel_tyre: "tyre_muscle_001_hi".into(),
             wheel_scale: 0.37,
+            wheel_scale_rear: 0.37,
+            wheel_auto: true,
+            vehicles: crate::vehicle_db::VehicleDb::new(),
+            veh_applied: String::new(),
+            veh_cfg: None,
             wheel_pending: Arc::new(Mutex::new(None)),
             wheel_key: String::new(),
             wheels: Vec::new(),
@@ -131,7 +147,22 @@ impl ModelView {
 
     /// Nothing loading (model or picker list): for automation screenshots.
     pub fn idle(&self) -> bool {
-        !self.loading && (!self.show_picker || self.picker.loaded())
+        !self.loading && self.idle_for_shot() && (!self.show_picker || self.picker.loaded())
+    }
+
+    /// Car extras settled: vehicle data applied and the fitted wheels loaded.
+    fn idle_for_shot(&self) -> bool {
+        let Some(l) = self.loaded.as_ref().filter(|l| l.info["wheel_mounts"].is_array()) else { return true };
+        let veh = match &*self.vehicles.state.lock().unwrap() {
+            crate::vehicle_db::State::Idle | crate::vehicle_db::State::Loading(_) => false,
+            crate::vehicle_db::State::Failed(_) => true,
+            crate::vehicle_db::State::Ready(db) => {
+                let key = crate::vehicle_db::model_key(&l.source);
+                !db.contains_key(&key) || self.veh_applied == key
+            }
+        };
+        let wheels = !self.wheels_on || (!self.wheel_loading && self.wheel_key == format!("{}|{}", self.wheel_rim, self.wheel_tyre));
+        veh && wheels
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -302,6 +333,113 @@ impl ModelView {
 
     fn apply_paint(&mut self, _rs: &egui_wgpu::RenderState) {}
 
+    /// Decoded vehicle data for the loaded car: spawn configurations (body
+    /// colour + rim + tyre), paint palettes, wheelScale. The first
+    /// configuration is applied when a car opens.
+    fn vehicle_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(l) = &self.loaded else { return };
+        if !l.info["wheel_mounts"].is_array() {
+            return;
+        }
+        let key = crate::vehicle_db::model_key(&l.source);
+        let Some(db) = self.vehicles.get(&self.game, &self.work, ui.ctx()) else {
+            if let Some(s) = self.vehicles.status() {
+                ui.label(egui::RichText::new(s).weak());
+                ui.separator();
+            }
+            return;
+        };
+        let Some(v) = db.get(&key) else {
+            ui.label(egui::RichText::new(format!("no vehicle data for '{key}'")).weak());
+            ui.separator();
+            return;
+        };
+        if self.veh_applied != key {
+            self.veh_applied = key.clone();
+            self.veh_cfg = None;
+            if !v.configs.is_empty() {
+                self.apply_config(v, 0);
+            } else {
+                self.apply_scale(v);
+            }
+        }
+        ui.heading(format!("Vehicle: {key}"));
+        let ws = |x: Option<f32>| x.map(|x| format!("{x:.4}")).unwrap_or_else(|| "?".into());
+        ui.label(format!("wheelScale {} / rear {}", ws(v.wheel_scale), ws(v.wheel_scale_rear)));
+        if !v.configs.is_empty() {
+            let label = |i: usize| {
+                let c = &v.configs[i];
+                format!("{} · {} · {}", i + 1, c.rim.as_deref().unwrap_or("no rim"), c.tyre.as_deref().unwrap_or("no tyre"))
+            };
+            let mut pick = None;
+            egui::ComboBox::from_label(format!("config ({})", v.configs.len()))
+                .selected_text(self.veh_cfg.map(label).unwrap_or_else(|| "custom".into()))
+                .width(220.0)
+                .show_ui(ui, |ui| {
+                    for i in 0..v.configs.len() {
+                        ui.horizontal(|ui| {
+                            if let Some(c) = v.configs[i].colour {
+                                let (r, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                                ui.painter().rect_filled(r, 2.0, srgb32(c));
+                            }
+                            if ui.selectable_label(self.veh_cfg == Some(i), label(i)).clicked() {
+                                pick = Some(i);
+                            }
+                        });
+                    }
+                });
+            if let Some(i) = pick {
+                self.apply_config(v, i);
+            }
+        }
+        for (pi, p) in v.palettes.iter().enumerate().take(4) {
+            ui.label(format!("palette {} · {} colours", pi + 1, p.len())).on_hover_text("Weighted paint colours (the stored list repeats colours; hover a swatch for its share). Click one to use it as the primary colour.");
+            ui.horizontal_wrapped(|ui| {
+                ui.set_max_width(300.0);
+                ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+                for (c, w) in p {
+                    let (r, resp) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::click());
+                    ui.painter().rect_filled(r, 2.0, srgb32(*c));
+                    ui.painter().rect_stroke(r, 2.0, egui::Stroke::new(1.0, egui::Color32::from_gray(90)), egui::StrokeKind::Inside);
+                    let col = srgb32(*c);
+                    if resp.on_hover_text(format!("#{:02x}{:02x}{:02x} · {:.1} %", col.r(), col.g(), col.b(), w * 100.0)).clicked() {
+                        self.look.paint = *c;
+                        self.veh_cfg = None;
+                    }
+                }
+            });
+        }
+        if v.palettes.len() > 4 {
+            ui.label(egui::RichText::new(format!("{} more palettes in vehicles.json", v.palettes.len() - 4)).weak().small());
+        }
+        ui.label(egui::RichText::new("Colours read as linear, shown in sRGB (unverified).").weak().small()).on_hover_text("Spawn configurations each set a body colour, rim and tyre; the first is applied when a car opens. Stored colours are all dark, so they are taken as linear values; not checked in game.");
+        ui.separator();
+    }
+
+    fn apply_scale(&mut self, v: &crate::vehicle_db::Vehicle) {
+        if self.wheel_auto {
+            if let Some(f) = v.wheel_scale {
+                self.wheel_scale = f * WHEEL_FACTOR;
+                self.wheel_scale_rear = v.wheel_scale_rear.unwrap_or(f) * WHEEL_FACTOR;
+            }
+        }
+    }
+
+    fn apply_config(&mut self, v: &crate::vehicle_db::Vehicle, i: usize) {
+        let c = &v.configs[i];
+        if let Some(col) = c.colour {
+            self.look.paint = col;
+        }
+        if let Some(r) = &c.rim {
+            self.wheel_rim = format!("{r}_hi");
+        }
+        if let Some(t) = &c.tyre {
+            self.wheel_tyre = format!("{t}_hi");
+        }
+        self.veh_cfg = Some(i);
+        self.apply_scale(v);
+    }
+
     /// Wheel mounts of the loaded car (bone, glTF-space pivot).
     fn mounts(&self) -> Vec<(String, Vec3)> {
         let Some(l) = &self.loaded else { return vec![] };
@@ -371,7 +509,9 @@ impl ModelView {
                 let right = bone.strip_prefix("wheel_").map(|s| s.starts_with('r')).unwrap_or(false);
                 let mirror = if right { Mat4::from_scale(Vec3::new(-1.0, 1.0, 1.0)) } else { Mat4::IDENTITY };
                 let spin = Mat4::from_quat(Quat::from_rotation_x(self.wheel_spin));
-                render3d::Instance::new(Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(self.wheel_scale)), false)
+                let rear = bone.strip_prefix("wheel_").map(|s| s.chars().nth(1) == Some('r')).unwrap_or(false);
+                let sc = if rear { self.wheel_scale_rear } else { self.wheel_scale };
+                render3d::Instance::new(Mat4::from_translation(*p) * spin * mirror * Mat4::from_scale(Vec3::splat(sc)), false)
             })
             .collect();
         if let Some(ren) = &self.renderer {
@@ -576,6 +716,7 @@ impl ModelView {
         let (globals, skin) = self.joint_mats();
         let show_wheels = self.wheels_on && !self.mounts().is_empty();
         let (under, top) = self.lines(&globals);
+        let settled = self.idle_for_shot();
         let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
         if let Some(g) = &self.gpu {
             if !skin.is_empty() {
@@ -621,7 +762,7 @@ impl ModelView {
         }
         if let Some(path) = self.auto.screenshot.clone() {
             self.auto.frames += 1;
-            let ready = (self.gpu.is_some() && self.frames_since_load >= 3 && !self.wheel_loading) || (!self.loading && self.auto.frames > 600);
+            let ready = (self.gpu.is_some() && self.frames_since_load >= 3 && settled) || (!self.loading && self.auto.frames > 600);
             if ready {
                 if let Some((w, h, px)) = ren.read_back(rs) {
                     match render3d::save_png(&path, w, h, &px) {
@@ -698,6 +839,7 @@ impl ModelView {
         ui.add(egui::Slider::new(&mut self.look.emissive, 0.0..=12.0).text("emissive"));
         ui.add(egui::Slider::new(&mut self.look.wet, 0.0..=1.0).text("wet"));
         ui.separator();
+        self.vehicle_ui(ui);
         ui.heading("Car paint");
         ui.horizontal(|ui| {
             ui.label("primary");
@@ -729,7 +871,11 @@ impl ModelView {
                         ui.label("tyre");
                         ui.add(egui::TextEdit::singleline(&mut self.wheel_tyre).desired_width(140.0));
                     });
-                    ui.add(egui::Slider::new(&mut self.wheel_scale, 0.2..=0.6).text("wheel scale (not decoded; 0.37 fits phoenix)"));
+                    ui.checkbox(&mut self.wheel_auto, "size from the car's wheelScale").on_hover_text(format!("scale = {WHEEL_FACTOR:.3} x wheelScale (front / rear). The factor is fitted by eye on phoenix; the game's exact rule is not decoded."));
+                    ui.add_enabled_ui(!self.wheel_auto, |ui| {
+                        ui.add(egui::Slider::new(&mut self.wheel_scale, 0.2..=0.8).text("front wheel scale"));
+                        ui.add(egui::Slider::new(&mut self.wheel_scale_rear, 0.2..=0.8).text("rear wheel scale"));
+                    });
                 }
             }
         }
@@ -1066,4 +1212,9 @@ pub(crate) fn assembly_ids(ws: &Workspace, idx: &Arc<Mutex<HashMap<String, Arc<A
         }
     }
     None
+}
+
+/// sRGB [0,1] triple as an egui colour.
+fn srgb32(c: [f32; 3]) -> egui::Color32 {
+    egui::Color32::from_rgb((c[0] * 255.0).round() as u8, (c[1] * 255.0).round() as u8, (c[2] * 255.0).round() as u8)
 }

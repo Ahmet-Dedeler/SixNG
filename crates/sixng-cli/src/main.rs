@@ -1055,16 +1055,5 @@ fn do_export(a: &sixng_core::game::ArchiveInfo, sel: &[&sixng_core::scan::Entry]
 /// joaat(lower-case model name) -> name, from the recovered entry names of
 /// every indexed archive (with and without the `_hi` suffix).
 fn model_names(ws: &sixng_core::export::Workspace) -> std::collections::HashMap<u32, String> {
-    let mut names = std::collections::HashMap::new();
-    for ar in ws.archives() {
-        let Ok(x) = ws.load_index(&ar) else { continue };
-        for e in &x.entries {
-            let Some(n) = e.name.as_deref() else { continue };
-            let b = n.rsplit(|c| c == '/' || c == char::from(92u8)).next().unwrap_or(n).split('.').next().unwrap_or(n).to_ascii_lowercase();
-            for c in [b.clone(), b.trim_end_matches("_hi").to_string()] {
-                names.entry(sixng_core::meta7a::joaat(&c)).or_insert(c);
-            }
-        }
-    }
-    names
+    sixng_core::vehicles::model_names(ws)
 }
