@@ -342,9 +342,8 @@ pub fn describe(r: &Resource) -> DrawableInfo {
 }
 
 /// Decode the packed positions of a mesh blob. Each vertex is one u64 at
-/// 0x80 + 8*i: bits 16..31 = x, 32..47 = y, 48..63 = z (u16 each; bits
-/// 0..15 unknown). The header's x/y steps are scaled for 24-bit values, so
-/// x and y multiply by 256.
+/// 0x80 + 8*i. x and y are 24-bit: high 16 bits at 16..31 (x) and 32..47
+/// (y), low bytes at 0..7 (x) and 8..15 (y). z is 16-bit at 48..63.
 pub fn decode_positions(b: &[u8], h: &MeshBlobHeader) -> Vec<[f32; 3]> {
     let n = h.vertex_count_guess.unwrap_or(0) as usize;
     let mut v = Vec::with_capacity(n);
@@ -361,8 +360,8 @@ pub fn decode_positions(b: &[u8], h: &MeshBlobHeader) -> Vec<[f32; 3]> {
         let Some(q) = b.get(o..o + 8).map(|x| u64::from_le_bytes(x.try_into().unwrap())) else { break };
         let (bx, sx) = (h.position_base, h.position_step);
         v.push([
-            ((q >> 16) & 0xffff) as f32 * 256.0 * sx[0] + bx[0],
-            ((q >> 32) & 0xffff) as f32 * 256.0 * sx[1] + bx[1],
+            ((((q >> 16) & 0xffff) << 8) | (q & 0xff)) as f32 * sx[0] + bx[0],
+            ((((q >> 32) & 0xffff) << 8) | ((q >> 8) & 0xff)) as f32 * sx[1] + bx[1],
             (q >> 48) as f32 * sx[2] + bx[2],
         ]);
     }

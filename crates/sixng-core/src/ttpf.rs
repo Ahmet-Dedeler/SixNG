@@ -12,7 +12,8 @@
 //!              0x1C BC7 = per-format BCPack, the Xbox Series hardware texture codec,
 //!              no public decoder; 0x00 stored), bits 30-31 = 4 KiB pages added to the virtual offset
 //!       u32 b: virtual offset = 0x1000 + (b & 0xFFFFF) * 0x4000 + (a >> 30) * 0x1000
-//!              (the 0x1000 is the header page); b >> 20 = ?
+//!              (the 0x1000 is the header page); b >> 20 = bytes of padding after
+//!              the chunk's data (stored length = next offset - offset - pad)
 //!       A chunk runs to the next entry, both in the file and in the virtual space.
 //!       The last entry is a terminator (file end, end of the virtual space). The
 //!       virtual space can exceed 4 GiB (the header's size field is truncated).
@@ -23,7 +24,7 @@
 //!       ...              other tables (u32 list, n x 32-byte digests)
 //! descriptor:
 //!       u32 d0: bits 0-13 width-1, bits 14-27 height-1, bits 28-31 mip count-1
-//!       u32 d1: bits 0-2 flags, bits 3-10 DXGI format, bits 20-23 ?, bits 24-27 tile mode
+//!       u32 d1: bits 0-2 flags, bits 3-9 DXGI format, bit 10 flag (other layout; not decoded), bits 20-23 ?, bits 24-27 tile mode
 //!              (0 = SW_64KB_D, 1/2/3 = SW_4KB_S, see `gfx10`)
 //!       u64 loc: bits 0-20 first 4 KiB page of the texture, counted after the
 //!              0x1000 header page; higher bits ?
@@ -58,8 +59,8 @@ pub struct TtpfTex {
 
 pub struct Ttpf {
     pub path: PathBuf,
-    /// (file offset, virtual offset, flags byte) per chunk, plus a terminator.
-    chunks: Vec<(u64, u64, u8)>,
+    /// (file offset, virtual offset, flags byte, trailing pad bytes) per chunk, plus a terminator.
+    chunks: Vec<(u64, u64, u8, u64)>,
     pub virt_size: u64,
     pub textures: Vec<TtpfTex>,
     by_hash: HashMap<u64, usize>,
@@ -91,7 +92,7 @@ impl Ttpf {
             if a == 0 && b == 0 {
                 break;
             }
-            chunks.push((((a & 0xFF_FFFF) as u64) << 8, 0x1000 + (b & 0xF_FFFF) as u64 * 0x4000 + (a >> 30) as u64 * 0x1000, (a >> 24) as u8));
+            chunks.push((((a & 0xFF_FFFF) as u64) << 8, 0x1000 + (b & 0xF_FFFF) as u64 * 0x4000 + (a >> 30) as u64 * 0x1000, (a >> 24) as u8, (b >> 20) as u64));
         }
         let eoff = ((0x10 + 8 * n + 0xFF) & !0xFF) as u64;
         f.seek(SeekFrom::Start(eoff))?;
@@ -112,7 +113,7 @@ impl Ttpf {
                 hash: u64le(&body, 16 * nt + 8 * i),
                 width: (d0 & 0x3FFF) + 1,
                 height: ((d0 >> 14) & 0x3FFF) + 1,
-                dxgi_format: (d1 >> 3) & 0xFF,
+                dxgi_format: (d1 >> 3) & 0x7F,
                 virt: (loc & 0x1F_FFFF) * 0x1000 + 0x1000,
                 size: 0,
                 d0,
@@ -145,8 +146,8 @@ impl Ttpf {
         let end = virt + len;
         let mut f = File::open(&self.path)?;
         for i in 0..self.chunks.len().saturating_sub(1) {
-            let (foff, v0, fl) = self.chunks[i];
-            let (fnext, v1, _) = self.chunks[i + 1];
+            let (foff, v0, fl, pad) = self.chunks[i];
+            let (fnext, v1, _, _) = self.chunks[i + 1];
             if v1 <= virt || v0 >= end {
                 continue;
             }
@@ -155,7 +156,7 @@ impl Ttpf {
                 continue;
             }
             f.seek(SeekFrom::Start(foff))?;
-            let mut comp = vec![0u8; (fnext - foff) as usize];
+            let mut comp = vec![0u8; (fnext - foff).saturating_sub(pad) as usize];
             f.read_exact(&mut comp)?;
             let raw = if fl & 0x3F == 0 {
                 comp // stored (5 chunks in all stores; sizes match)
@@ -178,7 +179,7 @@ impl Ttpf {
         let end = virt + len;
         let mut n = 0;
         for w in self.chunks.windows(2) {
-            let ((_, v0, fl), (_, v1, _)) = (w[0], w[1]);
+            let ((_, v0, fl, _), (_, v1, _, _)) = (w[0], w[1]);
             if v1 > virt && v0 < end && fl & 0x1C != 0 {
                 n += end.min(v1) - virt.max(v0);
             }
@@ -285,7 +286,7 @@ pub fn decode_rgba(t: &TtpfTex, data: &[u8], m: u32) -> Result<(Vec<u8>, u32, u3
         return Err(anyhow!("unsupported format {}", ti.format));
     }
     let (mw, mh) = ((t.width >> m).max(1), (t.height >> m).max(1));
-    let l = t.layout().ok_or_else(|| anyhow!("tile mode {} / {} not supported", t.tile_mode(), ti.format))?;
+    let l = t.layout().ok_or_else(|| anyhow!("tile mode {} / {}{} not supported", t.tile_mode(), ti.format, if t.flag_bit10() { " / descriptor bit 10" } else { "" }))?;
     if m as usize >= l.mips.len() {
         return Err(anyhow!("mip {m} out of range"));
     }
@@ -309,9 +310,14 @@ impl TtpfTex {
     }
     /// Mip-chain layout (`None` for unsupported tile modes or element sizes:
     /// only 8- and 16-byte BCn elements are mapped).
+    /// Descriptor d1 bit 10 (rare: under 0.2% of entries). Its data is laid out
+    /// differently (the normal layout gives a mosaic), so it is not decoded.
+    pub fn flag_bit10(&self) -> bool {
+        self.d1 & 0x400 != 0
+    }
     pub fn layout(&self) -> Option<crate::gfx10::Layout> {
         let fmt = crate::texture::Fmt::from_dxgi(self.dxgi_format);
-        if fmt == crate::texture::Fmt::Unknown {
+        if fmt == crate::texture::Fmt::Unknown || self.flag_bit10() {
             return None;
         }
         let bd = fmt.block_dim();
@@ -374,7 +380,7 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
         }
     }
     if !t.decodable() {
-        return Err(anyhow!("tile mode {} / format {} not supported", t.tile_mode(), t.dxgi_format));
+        return Err(anyhow!("tile mode {} / format {}{} not supported", t.tile_mode(), t.dxgi_format, if t.flag_bit10() { " / descriptor bit 10" } else { "" }));
     }
     let (data, skipped) = store.data_ex(t)?;
     // Top mips in BCPack chunks: fall back to the largest mip stored as zlib.
