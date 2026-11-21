@@ -25,6 +25,7 @@ mod model_picker;
 mod mapbake;
 mod model_view;
 mod texture_view;
+mod audio_view;
 mod render3d;
 mod jobs;
 mod thumbs;
@@ -181,6 +182,7 @@ enum Tab {
     Map2D,
     Map3D,
     Textures,
+    Audio,
 }
 
 #[derive(Default)]
@@ -228,6 +230,7 @@ struct App {
     map2d: map2d::Map2D,
     map3d: map3d::Map3D,
     textures: texture_view::TextureView,
+    audio: audio_view::AudioView,
     shot: Option<(PathBuf, u32, bool)>,
     map3d_start: Option<[f32; 3]>,
     bake: bakejob::BakeJob,
@@ -265,6 +268,7 @@ impl App {
             map2d: map2d::Map2D::new(&work),
             map3d: map3d::Map3D::new(&game, &work),
             textures: texture_view::TextureView::new(&game, &work),
+            audio: audio_view::AudioView::new(&game, &work),
             shot: None,
             map3d_start: None,
             bake: bakejob::BakeJob::default(),
@@ -588,6 +592,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Map2D, "🗺 Map 2D");
                 ui.selectable_value(&mut self.tab, Tab::Map3D, "🌆 Map 3D");
                 ui.selectable_value(&mut self.tab, Tab::Textures, "🖼 Textures");
+                ui.selectable_value(&mut self.tab, Tab::Audio, "🔊 Audio");
                 ui.separator();
                 let n = self.jobs.active_count();
                 let jl = if n > 0 { format!("⚙ Jobs ({n})") } else { "⚙ Jobs".to_string() };
@@ -620,6 +625,7 @@ impl eframe::App for App {
                     }
                     Some(library::Action::ShowMap) => self.tab = Tab::Map2D,
                     Some(library::Action::ShowTextures) => self.tab = Tab::Textures,
+                    Some(library::Action::ShowAudio) => self.tab = Tab::Audio,
                     Some(library::Action::Job(label, args)) => {
                         self.jobs.enqueue(&label, args);
                         self.tab = Tab::Jobs;
@@ -653,6 +659,10 @@ impl eframe::App for App {
         }
         if self.tab == Tab::Textures {
             egui::CentralPanel::default().show(ctx, |ui| self.textures.ui(ui));
+            return;
+        }
+        if self.tab == Tab::Audio {
+            egui::CentralPanel::default().show(ctx, |ui| self.audio.ui(ui));
             return;
         }
         if self.tab == Tab::Map2D || self.tab == Tab::Map3D {
@@ -961,7 +971,7 @@ impl App {
             }
             return;
         }
-        let ready = frames > 40 && !self.bake.running() && match self.tab { Tab::Model => self.model.idle(), Tab::Textures => self.textures.idle(), _ if self.setup.open => true, Tab::Library => self.library.idle() && self.model.picker.loaded(), Tab::Status => self.status.sizes.lock().unwrap().is_some(), Tab::Jobs | Tab::Settings => true, _ => self.map2d.data.is_some() };
+        let ready = frames > 40 && !self.bake.running() && match self.tab { Tab::Model => self.model.idle(), Tab::Textures => self.textures.idle(), Tab::Audio => self.audio.idle(), _ if self.setup.open => true, Tab::Library => self.library.idle() && self.model.picker.loaded(), Tab::Status => self.status.sizes.lock().unwrap().is_some(), Tab::Jobs | Tab::Settings => true, _ => self.map2d.data.is_some() };
         if ready && frames < 100_000 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.shot = Some((path, 100_000, exit));
@@ -996,10 +1006,15 @@ impl App {
             Some("status") => Some(Tab::Status),
             Some("settings") => Some(Tab::Settings),
             Some("archives") => Some(Tab::Browser),
+            Some("audio") => Some(Tab::Audio),
             _ => None,
         };
         if let Some(t) = page {
             self.tab = t;
+            if let Some(b) = c.get("bank").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) {
+                let play = c.get("play").and_then(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16).ok());
+                self.audio.select_bank(b, play);
+            }
             if let Some(id) = c.get("item") {
                 self.library.show_item(id);
             }

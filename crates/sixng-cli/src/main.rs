@@ -1,6 +1,6 @@
 //! sixng: command-line front end (machine-readable JSON on stdout,
 //! NDJSON progress events on stderr).
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use sixng_core::classify::Kind;
@@ -328,6 +328,45 @@ enum Cmd {
         /// Archive (default levels).
         #[arg(default_value = "levels")]
         archive: String,
+    },
+    /// Audio banks (ADAT) in an archive: scan once (index in <work>/index/audio_<archive>.json), then list banks and streams. Stream ids are hashes; names are not recovered.
+    Audio {
+        /// Archive (default audio).
+        #[arg(default_value = "audio")]
+        archive: String,
+        /// Scan again even if an index exists.
+        #[arg(long)]
+        rescan: bool,
+        /// Only list streams at least this long (seconds).
+        #[arg(long, default_value_t = 0.0)]
+        min_seconds: f64,
+        /// How many banks to list (0 = all).
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+    },
+    /// Export audio: Ogg Opus (lossless remux), WAV (decoded) or the raw bank (.awc). Needs `sixng audio` first.
+    AudioExport {
+        /// Archive (default audio).
+        #[arg(long, default_value = "audio")]
+        archive: String,
+        /// Bank offset in hex (from `sixng audio`).
+        #[arg(long)]
+        bank: Option<String>,
+        /// Stream id in hex (default: every stream of the bank).
+        #[arg(long)]
+        stream: Option<String>,
+        /// opus | wav | both | awc (raw bank).
+        #[arg(long, default_value = "opus")]
+        format: String,
+        /// Output folder.
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Skip streams shorter than this (seconds).
+        #[arg(long, default_value_t = 0.0)]
+        min_seconds: f64,
+        /// Export every bank (with --bank omitted).
+        #[arg(long)]
+        all: bool,
     },
     /// Inspect a ttpf texture store: list its textures, or decode some to PNG.
     Ttpf {
@@ -755,6 +794,80 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = export::link_archetypes(&ws, &a, &metas, &unnamed, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64(), "out": ws.index_dir().join("archetype_links.json")}));
+        }
+        Cmd::Audio { archive, rescan, min_seconds, limit } => {
+            use sixng_core::audio;
+            let a = ws.resolve(archive)?;
+            let t = Instant::now();
+            let ix = match (rescan, audio::load_index(&ws.work, &a.id)) {
+                (false, Ok(ix)) => ix,
+                _ => {
+                    let ix = audio::scan(&a.path, &a.id, pr)?;
+                    audio::save_index(&ws.work, &ix)?;
+                    ix
+                }
+            };
+            let mut layouts = std::collections::BTreeMap::<String, usize>::new();
+            let mut codecs = std::collections::BTreeMap::<String, usize>::new();
+            let mut secs = 0.0;
+            for s in ix.banks.iter().flat_map(|b| &b.streams) {
+                *layouts.entry(s.layout.clone()).or_default() += 1;
+                if s.layout != "none" {
+                    *codecs.entry(format!("{}", s.codec)).or_default() += 1;
+                    secs += s.seconds();
+                }
+            }
+            let list: Vec<_> = ix
+                .banks
+                .iter()
+                .filter(|b| b.streams.iter().any(|s| s.layout != "none" && s.seconds() >= *min_seconds))
+                .take(if *limit == 0 { usize::MAX } else { *limit })
+                .map(|b| {
+                    json!({"bank": format!("{:x}", b.off), "size": b.size, "seconds": b.seconds(), "streams": b.streams.iter().filter(|s| s.layout != "none" && s.seconds() >= *min_seconds).map(|s| json!({"id": format!("{:08x}", s.id), "seconds": s.seconds(), "samples": s.samples, "rate": s.rate, "codec": s.codec, "channels": s.channels, "layout": s.layout})).collect::<Vec<_>>()})
+                })
+                .collect();
+            out.print(&json!({"ok": true, "archive": a.id, "index": audio::index_path(&ws.work, &a.id), "banks": ix.banks.len(), "streams_by_layout": layouts, "codec_bytes": codecs, "total_seconds": secs, "list": list, "seconds": t.elapsed().as_secs_f64(), "note": ix.note}));
+        }
+        Cmd::AudioExport { archive, bank, stream, format, out: dir, min_seconds, all } => {
+            use sixng_core::audio;
+            let a = ws.resolve(archive)?;
+            let ix = audio::load_index(&ws.work, &a.id)?;
+            if !["opus", "wav", "both", "awc"].contains(&format.as_str()) {
+                bail!("--format must be opus, wav, both or awc");
+            }
+            let banks: Vec<&audio::Bank> = match bank {
+                Some(h) => {
+                    let off = u64::from_str_radix(h.trim_start_matches("0x"), 16)?;
+                    vec![ix.banks.iter().find(|b| b.off == off).ok_or_else(|| anyhow!("no bank at {off:#x}"))?]
+                }
+                None if *all => ix.banks.iter().collect(),
+                None => bail!("give --bank <hex> or --all"),
+            };
+            let sid = stream.as_ref().map(|h| u32::from_str_radix(h.trim_start_matches("0x"), 16)).transpose()?;
+            let t = Instant::now();
+            let (mut files, mut errors) = (Vec::new(), Vec::new());
+            for (i, b) in banks.iter().enumerate() {
+                pr("export", i as u64, banks.len() as u64);
+                let bytes = audio::read_bank(&a.path, b)?;
+                if format == "awc" {
+                    std::fs::create_dir_all(dir)?;
+                    let p = dir.join(format!("{:x}.awc", b.off));
+                    std::fs::write(&p, &bytes)?;
+                    files.push(p.display().to_string());
+                    continue;
+                }
+                for s in &b.streams {
+                    if sid.map_or(false, |x| x != s.id) || s.layout == "none" || s.seconds() < *min_seconds {
+                        continue;
+                    }
+                    match audio::export_stream(&bytes, b, s, dir, format) {
+                        Ok(f) => files.extend(f),
+                        Err(e) => errors.push(e.to_string()),
+                    }
+                }
+            }
+            pr("export", banks.len() as u64, banks.len() as u64);
+            out.print(&json!({"ok": true, "files": files.len(), "first": files.iter().take(20).collect::<Vec<_>>(), "errors": errors.len(), "first_errors": errors.iter().take(10).collect::<Vec<_>>(), "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::RawDecode { input, dxgi, width, height, output } => {
             let d = std::fs::read(input)?;

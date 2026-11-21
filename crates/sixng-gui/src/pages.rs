@@ -60,6 +60,7 @@ const PAGES: &[(Tab, &str)] = &[
     (Tab::Map2D, "Map 2D"),
     (Tab::Map3D, "Map 3D"),
     (Tab::Textures, "Textures"),
+    (Tab::Audio, "Audio"),
     (Tab::Jobs, "Jobs"),
     (Tab::Status, "Status"),
     (Tab::Settings, "Settings"),
@@ -138,6 +139,8 @@ impl App {
         self.map3d = crate::map3d::Map3D::new(&self.game, &self.work);
         self.map3d.load_settings();
         self.textures = crate::texture_view::TextureView::new(&self.game, &self.work);
+        self.audio.stop();
+        self.audio = crate::audio_view::AudioView::new(&self.game, &self.work);
         self.library = crate::library::Library::new(&self.game, &self.work, self.thumb_budget_mb);
         self.jobs.set_folders(&self.game, &self.work);
         self.status = Status::default();

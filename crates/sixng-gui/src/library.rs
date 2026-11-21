@@ -13,6 +13,7 @@ pub enum Action {
     OpenModel(String),
     ShowMap,
     ShowTextures,
+    ShowAudio,
     /// queue `sixng <args>` as a job
     Job(String, Vec<String>),
     OpenJobs,
@@ -219,6 +220,9 @@ impl Library {
                 }
                 if self.card(ui, "Textures", "every texture store", None) {
                     *act = Some(Action::ShowTextures);
+                }
+                if self.card(ui, "Audio", "sound banks: play and export", None) {
+                    *act = Some(Action::ShowAudio);
                 }
                 if self.card(ui, "Unnamed", &format!("{} models without a recovered name", mv.picker.count(Cat::Unnamed)), None) {
                     self.go(View::Category(Cat::Unnamed));

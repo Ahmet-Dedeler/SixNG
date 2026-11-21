@@ -1,4 +1,5 @@
 //! sixng-core: GTA VI (RPF9, Xbox Series) asset extraction core.
+pub mod audio;
 pub mod bounds;
 pub mod classify;
 pub mod navmesh;

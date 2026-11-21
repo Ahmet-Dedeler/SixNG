@@ -49,12 +49,15 @@ There is one Rust core library with two front ends:
 | Collision (physics bounds) | **works (geometry); partial (surface names)**: `sixng collision [levels]` decodes the unnamed bound resources in `levels.rpf` (the GTA V `.ybn` equivalent: composite → geometry bounds with triangles, boxes, spheres, capsules, cylinders) to one GLB per file in world coordinates, **split into one primitive per surface id**, plus `index.jsonl` (bbox, polygon counts, materials, primitive list) and `surfaces.json`. Surface ids are 15-bit hashes of the names in the game's material list (`ROAD_TARMAC`, `TRACK_GRASS_SHORT`, `METAL_RAILING` …); the hash function is unknown, so names are not attached yet. Checked visually: a building with window openings, a car park with railings and pillars, and terrain with coherent surface patches. A sample of 400 entries gave 353 bounds; the whole archive is about 87 K files, ~15 GB of GLB. |
 | Lights | **works (position, colour, direction); partial (other attributes)**: `sixng lights [levels]` follows the light extensions on archetypes and entities (GTA V `CExtensionDefLightEffect` / `CLightAttrDef` equivalent) through the meta pool references and writes `lights/levels/sets.jsonl` (**136,466 light sets, 274,819 lights** with local position, RGB colour, direction/tangent and every other field by hash) and `world.jsonl` (**624,184 placed lights** in world space, transformed by each entity that uses the archetype). Checked visually: the whole-map plot reads like a night satellite view, and a 1 km city cell shows lamp rows along both edges of a bridge and the arterials, and grids over car parks. The light fields are now named from their own member hashes (case-sensitive joaat of the GTA V `CLightAttr` names): `intensity`, `falloff` (range), `falloffExponent`, cone angles, corona, volumetric and fade distances, `timeFlags`; 774,847 placed lights including interiors. ~1 min, ~0.7 GB. |
 | Navmesh, road surface | **works (navmesh, road polygons, lane graph)**: `sixng navmesh [--roads-only]` decodes the navmesh tiles in `navmeshes.rpf` (GTA V `.ynv` equivalent, 128 m tiles) to GLB in world coordinates, one primitive per polygon flag; **flag 0x2000 = road surface** (checked visually). `sixng paths levels` writes the road/path-node graph (GTA V `.ynd` equivalent): 63,808 nodes with speed limit, street hash, **named node flags** (34 of 51: NoGps, Junction, InTunnel, Highway slip / exit, Stop, Yield, Bridge, WaterNode …), road class and density; 145,518 links with length, lane counts per direction and named flags (GpsCanGoBothWays, LeadsToDeadEnd / LeadsFromDeadEnd from the game's names; unpaved / track, two-way and no-ambient-traffic (bit 6) inferred); and **1,546 junctions** with entrances, turn paths and, for 369 signalised ones, **traffic-light phases** (duration and the placed traffic-light props, matched by entity hash for 99.6 %). |
+| Audio (`audio.rpf`) | **works (Opus streams); raw only (music, other codecs)**: `sixng audio` finds the sound banks (`ADAT` containers, the GTA V `.awc` equivalent) by scanning the archive (~2.5 min, index ~30 MB): **7,160 banks, 1.6 M streams, about 1,300 hours**. Opus streams (99.7 %) export as **Ogg Opus** (lossless remux) or **WAV** (decoded with libopus, 16-bit, 48 kHz) and play in the GUI's **Audio** page. Multichannel music (3,008 streams, 512 KiB blocks with an undecoded header) and 1,550 streams with another codec byte export only as the raw bank (`.awc`). Stream names are 29-bit hashes and are **not recovered**; streams are listed by bank offset and stream id. The Opus encoder delay is taken as the default 312 samples and the end is trimmed to the stream's sample count. |
 | XML / text metadata | **works**: exported as is. |
 | PSO / RBF metadata | **raw only**: the field names are hashed. |
 
 ## Setup and build
 
-You need Rust 1.80+ (stable) on Windows. There are no other dependencies.
+You need Rust 1.80+ (stable) on Windows, and **CMake** (for libopus, used
+by audio decoding; `.cargo/config.toml` sets the CMake policy libopus
+needs with CMake 4).
 
 ```powershell
 cd SixNG
@@ -159,6 +162,10 @@ exits with code 1.
 # BCPack texture gaps: every material with flat / low-mip textures, slot roles, class, terrain-layer
 # surface guesses and placement weight (~6 min; uses placements, batches, collision, surfaces)
 .\target\release\sixng.exe texture-gaps levels -o work\out --file work\texture_gaps.json --placements work\out\placements\levels
+# Audio banks in audio.rpf: scan once (~2.5 min), then list (--min-seconds, --limit)
+.\target\release\sixng.exe audio --min-seconds 30 --limit 10 --pretty
+# Export a bank's streams as Ogg Opus / WAV / both, or the raw bank (awc); --stream <hex> for one, --all for every bank
+.\target\release\sixng.exe audio-export --bank 12a2000 --format both -o work\out\audio
 # Or every world-data step in order (placements, batches, collision, navmesh, paths, lights, interiors, surfaces)
 .\target\release\sixng.exe world all -o work\out
 # Restrict the big exports to one region (RAGE metres; use "=" so negative values parse)
@@ -458,6 +465,21 @@ hash, the same `hash64` that `model.json` lists for each material slot:
 in the Model viewer, open a material and click **view** on a slot to jump
 here. From the command line: `--texture <hash>` (or `--tab textures`)
 with `--window-screenshot out.png --exit`.
+
+### Audio
+
+The **🔊 Audio** tab (or the Library's **Audio** card) lists the sound
+banks in `audio.rpf`. The first visit offers a scan, which reads the
+archive once (about 2.5 min) and saves `<work>/index/audio_audio.json.gz`;
+`sixng audio` writes the same index. Filter banks by bank offset or stream
+id (hex) and a minimum length; pick a bank to see its streams with length,
+rate field and layout. **▶ Play** decodes a stream and plays it on the
+default output device; the speaker button mutes and unmutes, and the slider
+next to it sets the volume. **.opus** / **.wav** export one stream,
+**Export all .opus / .wav** the whole bank, and **Export bank .awc** its
+raw bytes, all to `<work>/out/audio/`. Music and other-codec streams are
+listed but only export raw. From the command line: `--tab audio [--bank
+<hex>] --screenshot out.png --exit`.
 
 ## Output layout
 

@@ -1,0 +1,4 @@
+[env]
+# libopus (audio preview / WAV export) is built with CMake; its old
+# cmake_minimum_required needs this with CMake 4.
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
