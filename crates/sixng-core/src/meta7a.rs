@@ -471,6 +471,11 @@ pub struct Mlo {
     pub set_entities: Vec<usize>,
     /// Archetype bbox min/max (+0x40 / +0x4C), interior space.
     pub bbox: [[f32; 3]; 2],
+    /// Rooms (`0b1811f1`): (name hash, file entity indices of the room's
+    /// attachedObjects). attachedObjects index the interior's entity list.
+    pub rooms: Vec<(u32, Vec<usize>)>,
+    /// Entity sets: (name hash, file entity indices), in set order.
+    pub sets: Vec<(u32, Vec<usize>)>,
 }
 
 /// Interior archetypes in one meta resource.
@@ -488,14 +493,36 @@ pub fn mlos(m: &Meta) -> Vec<Mlo> {
             };
             let entities = ptrs(o + 0xC0);
             let mut set_entities = Vec::new();
+            let mut sets = Vec::new();
             let sz = m.structs.get(&0xd6a7_99f9).map(|x| x.size as usize).unwrap_or(0);
             if let (Some((_, base)), true) = (m.ptr(r.u64(o + 0xF0)), sz > 0) {
                 for k in 0..(r.u16(o + 0xF8) as usize).min(1000) {
-                    set_entities.extend(ptrs(base + k * sz + 0x18));
+                    let es = ptrs(base + k * sz + 0x18);
+                    set_entities.extend(&es);
+                    sets.push((r.u32(base + k * sz), es));
                 }
             }
+            // Rooms via the generic decoder (field order differs per build).
+            let get = |v: &serde_json::Value, h: u32| v.get(field_name(h)).or_else(|| v.get(format!("{h:08x}"))).cloned();
+            let rooms = m
+                .object(MLO_ARCHETYPE, o, 6)
+                .and_then(|v| get(&v, 0xcd20_d7a8))
+                .and_then(|v| v.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .map(|rm| {
+                    let name = get(rm, 0xe6e1_7f14).and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                    let att = get(rm, 0x8e05_312c)
+                        .and_then(|x| x.as_array().cloned())
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|i| i.as_u64().and_then(|i| entities.get(i as usize).copied()))
+                        .collect();
+                    (name, att)
+                })
+                .collect();
             let v3 = |a: usize| [r.f32(a), r.f32(a + 4), r.f32(a + 8)];
-            Mlo { name: r.u32(o + 0x74), entities, set_entities, bbox: [v3(o + 0x40), v3(o + 0x4C)] }
+            Mlo { name: r.u32(o + 0x74), entities, set_entities, bbox: [v3(o + 0x40), v3(o + 0x4C)], rooms, sets }
         })
         .collect()
 }

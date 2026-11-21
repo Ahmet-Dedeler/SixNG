@@ -29,7 +29,7 @@ pub const DERIVED: &[&str] = &[
     "diffusetexture_layer2", "diffusetexture_layer3", "dirtdiffusetex", "dirtnoisetex", "distancemap", "dusttexture", "emissiveanimatedtexture",
     "emissivedistortiontexture", "emissivetex", "emissivetexture", "exposuretexture", "extinctionlut", "flowtexture", "foamtexture", "fogtexture",
     "furnoisetexture", "g_skyparaboloid", "g_skyradiancecache", "gradtexture", "grassmasktexture", "heightmapdata", "heightmaptexture",
-    "heighttexture", "interactionfoam", "interiordiffusemap", "iridescencetex", "iridescencetexture", "layer0tex", "layer1tex", "lightningtexture",
+    "heighttexture", "interactionfoam", "interiordiffusemap", "iridescencetex", "iridescencetexture", "layer0tex", "layer1tex", "lightningtexture", "limbo",
     "liquidextinctionlut", "liquidtintmask", "liquidtintpalette", "lookuptexture", "lutdata", "lutmask", "lyr0diffusetex", "lyr0normaltex",
     "lyr1diffusetex", "lyr1normaltex", "lyr2diffusetex", "lyr2normaltex", "lyr3diffusetex", "lyr3normaltex", "masktex", "masktex2", "materialatex",
     "materialbtexture", "materialbtexture2", "materialctexture", "materialid", "materialpalettedata", "mipmapsource", "noisetexture", "puddlebump",

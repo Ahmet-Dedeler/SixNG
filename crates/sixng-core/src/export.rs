@@ -882,8 +882,12 @@ pub struct PlacementSummary {
     pub parent_id: Option<String>,
     pub entities: usize,
     pub resolved: usize,
-    /// Min / max entity position (RAGE world space).
+    /// Min / max entity position (RAGE world space; interior- or
+    /// group-local when `space` says so).
     pub bbox: Option<[[f32; 3]; 2]>,
+    /// world, interior (interior-local), world+interior or group (group-local).
+    #[serde(default)]
+    pub space: String,
 }
 
 /// Decode map placement files (0x7a meta resources with entities) from
@@ -911,7 +915,24 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
             let p = dir.join(format!("{:x}.json", e.off));
             let mut doc = serde_json::to_value(&mf).ok()?;
             doc["id"] = serde_json::json!(e.id);
+            let fi = crate::meta7a::Meta::parse(&r).map(|m| crate::interiorents::file_info(&m));
+            let space = fi.as_ref().map(|f| f.space).unwrap_or("world");
+            doc["space"] = serde_json::json!(space);
+            if let Some(f) = fi.as_ref().filter(|f| !f.interiors.is_empty()) {
+                doc["interiors"] = serde_json::json!(f.interiors);
+            }
             if let Some(ents) = doc["entities"].as_array_mut() {
+                if let Some(f) = &fi {
+                    for (i, j) in ents.iter_mut().enumerate() {
+                        if let Some(v) = f.entities.get(&i) {
+                            let mut v = v.clone();
+                            if let Some(o) = v.as_object_mut() {
+                                o.remove("index");
+                            }
+                            j["interior"] = v;
+                        }
+                    }
+                }
                 let ps = parents.get(&e.id);
                 for (i, (j, en)) in ents.iter_mut().zip(&mf.entities).enumerate() {
                     let lod = &mut j["lod"];
@@ -926,7 +947,11 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
                     }
                 }
             }
-            doc["coordinate_system"] = serde_json::json!("position: RAGE world space, Z-up, right-handed, metres. rotation: quaternion (x, y, z, w) as stored = inverse of the entity rotation (rotation_world is the entity rotation). gltf: node transform to place this entity's model.glb in a Y-up glTF scene (translation = (x, z, -y)). Checked visually on two map files.");
+            doc["coordinate_system"] = serde_json::json!(match space {
+                "interior" => "position: INTERIOR-LOCAL space (interior archetype file: these entities are an interior's contents, placed in the world only through interior instances, see `sixng interiors`), Z-up, right-handed, metres. rotation and gltf as for world files.",
+                "group" => "position: GROUP-LOCAL space (named entity group; no map data places it), Z-up, right-handed, metres. rotation and gltf as for world files.",
+                _ => "position: RAGE world space, Z-up, right-handed, metres. rotation: quaternion (x, y, z, w) as stored = inverse of the entity rotation (rotation_world is the entity rotation). gltf: node transform to place this entity's model.glb in a Y-up glTF scene (translation = (x, z, -y)). Checked visually on two map files.",
+            });
             fs::write(&p, serde_json::to_vec(&doc).ok()?).ok()?;
             let mut lo = [f32::MAX; 3];
             let mut hi = [f32::MIN; 3];
@@ -945,6 +970,7 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
                 entities: mf.entities.len(),
                 resolved: mf.entities.iter().filter(|x| x.name.is_some()).count(),
                 bbox: Some([lo, hi]),
+                space: space.to_string(),
             })
         })
         .collect();
