@@ -20,6 +20,8 @@ pub mod ttpf;
 pub mod gaps;
 pub mod lodlinks;
 pub mod interiorents;
+pub mod pso;
+pub mod vehicles;
 pub mod rpf9;
 pub mod scan;
 pub mod surface;

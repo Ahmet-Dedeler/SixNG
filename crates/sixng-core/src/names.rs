@@ -21,6 +21,11 @@ use std::path::{Path, PathBuf};
 
 /// Names found by searching word combinations (verified only by the hash
 /// match; each name is a plausible texture or variable name).
+/// Case-sensitive field names (joaat of the name as written) confirmed in
+/// PSO schemas and the vehicle meta resource: GTA V handling and
+/// vehicles.meta field names.
+pub const DERIVED_EXACT: &[&str] = &["fMass", "fInitialDragCoeff", "fDriveBiasFront", "fDriveBiasRear", "fBrakeForce", "fHandBrakeForce", "fSteeringLock", "fLowSpeedTractionLossMult", "fSuspensionCompDamp", "fSuspensionReboundDamp", "fSuspensionUpperLimit", "fSuspensionLowerLimit", "fSuspensionRaise", "fAntiRollBarForce", "fCollisionDamageMult", "fWeaponDamageMult", "fDeformationDamageMult", "fEngineDamageMult", "fPetrolTankVolume", "fOilVolume", "fPetrolConsumptionRate", "fStoppieBalancePoint", "fWheelieBalancePoint", "fBackEndPopUpBuildingImpulseMult", "fBackEndPopUpCarImpulseMult", "fBackEndPopUpMaxDeltaSpeed", "fSideSlipMult", "fPitchMult", "fYawMult", "fRollMult", "fLiftMult", "fMoveRes", "fThrust", "fThrustFallOff", "fWeaponDamageScaledToVehHealthMult", "fWheelMass", "fGearRatios", "fFinalDriveRatio", "Wheels", "Lights", "Sirens", "modelName", "metallic", "colors", "Color", "Name", "Type", "Key", "Item", "Flags", "Value", "Data", "Items", "Index", "Entries", "Count", "dirtLevelMax", "gameName", "buoyancySphereOffset", "minSeatHeight", "envEffScaleMin", "NmBraceOverrideSet", "layout", "type", "frequency", "plateType", "audioNameHash", "animConvRoofWindowsAffected", "vehicleMakeName", "damageMapScale", "bumpersNeedToCollideWithMap", "AllowJoyriding", "maxNum", "pretendOccupantsScale", "animConvRoofName", "animConvRoofDictName", "explosionInfo", "wheelScaleRear", "dirtLevelMin", "vehicleClass", "swankness", "needsRopeTexture", "ptfxAssetName", "wheelScale", "vfxInfoName", "visibleSpawnDistScale", "wheelType", "rewards", "envEffScaleMin2", "doorsWithCollisionWhenClosed", "defaultBodyHealth", "envEffScaleMax", "lodDistances", "txdName", "AllowSundayDriving", "driveableDoors", "HDTextureDist", "envEffScaleMax2", "steerWheelMult", "buoyancySphereSizeScale", "weaponForceMult", "pOverrideRagdollThreshold", "identicalModelSpawnDistance", "maxNumOfSameColor", "handlingId", "damageOffsetScale"];
+
 pub const DERIVED: &[&str] = &[
     "anisotex", "anisotexture", "blendshapedata", "bloomsource", "bloomtarget", "boxblurtexture", "bumptex", "bumptexture", "bumptexture2",
     "bumptexture_layer0", "bumptexture_layer1", "bumptexture_layer2", "bumptexture_layer3", "cableconstants", "clearcoattex", "clearcoattexture",
@@ -123,6 +128,12 @@ fn loaded() -> std::sync::Arc<Loaded> {
                         dst.insert(h, v);
                     }
                 }
+            }
+        }
+        for n in DERIVED_EXACT {
+            let v = exact.entry(joaat_exact(n)).or_default();
+            if !v.iter().any(|(x, _)| x == n) {
+                v.push((n.to_string(), "derived".into()));
             }
         }
         for n in DERIVED {

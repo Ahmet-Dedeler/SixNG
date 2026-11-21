@@ -335,6 +335,35 @@ enum Cmd {
         #[arg(default_value = "levels")]
         archive: String,
     },
+    /// Decode PSO files (self-describing meta in plain files) to JSON: <out>/pso/<archive>/<offset>.json (root and objects by struct; field names resolve where known).
+    Pso {
+        /// Archive (default data).
+        #[arg(default_value = "data")]
+        archive: String,
+        #[command(flatten)]
+        filter: FilterArgs,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
+    /// Vehicle handling records from the PSO files (mass, drag, transmission, engine, suspension, steering, damage …), named by model where the name is known: <out>/pso/handling.json.
+    Handling {
+        /// Archive (default data).
+        #[arg(default_value = "data")]
+        archive: String,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
+    /// Vehicle data from the game-data meta resource: model info (wheel scale, wheel type, handling id, …), configurations (body colour ARGB, rim, tyre, parts), paint palettes and weighted part groups: <out>/vehicles/vehicles.json.
+    Vehicles {
+        /// Archive (default packs).
+        #[arg(default_value = "packs")]
+        archive: String,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// Interior membership of every placement: per map file its space (world, interior-local, group-local) and per entity its interior, room and entity set: <work>/index/interior_entities.jsonl. Placements carry the same fields.
     InteriorEntities {
         /// Archive (default levels).
@@ -840,6 +869,36 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let v = export::link_archetypes(&ws, &a, &metas, &unnamed, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64(), "out": ws.index_dir().join("archetype_links.json")}));
         }
+        Cmd::Pso { archive, filter, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let mut f = filter.to_filter()?;
+            if f.kinds.is_empty() {
+                f.kinds = vec![Kind::Pso];
+            }
+            let sel = f.select(&ix)?;
+            let t = Instant::now();
+            let (ok, bad) = sixng_core::pso::export(&a, &sel, po, pr)?;
+            out.print(&json!({"ok": true, "archive": a.id, "decoded": ok, "failed": bad, "seconds": t.elapsed().as_secs_f64(), "out": po.join("pso")}));
+        }
+        Cmd::Handling { archive, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let sel: Vec<_> = ix.entries.iter().filter(|e| e.kind == Kind::Pso).collect();
+            let names = model_names(&ws);
+            let t = Instant::now();
+            let v = sixng_core::pso::export_handling(&a, &sel, &names, po)?;
+            out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+        }
+        Cmd::Vehicles { archive, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let metas: Vec<_> = ix.entries.iter().filter(|e| e.kind == Kind::Resource && e.sub == "7a").collect();
+            let names = model_names(&ws);
+            let t = Instant::now();
+            let v = sixng_core::vehicles::export(&a, &metas, &names, po)?;
+            out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+        }
         Cmd::InteriorEntities { archive } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
@@ -991,4 +1050,21 @@ fn do_export(a: &sixng_core::game::ArchiveInfo, sel: &[&sixng_core::scan::Entry]
     let v = do_export_collect(a, sel, oa, pr)?;
     out.print(&json!({"ok": true, "result": v}));
     Ok(())
+}
+
+/// joaat(lower-case model name) -> name, from the recovered entry names of
+/// every indexed archive (with and without the `_hi` suffix).
+fn model_names(ws: &sixng_core::export::Workspace) -> std::collections::HashMap<u32, String> {
+    let mut names = std::collections::HashMap::new();
+    for ar in ws.archives() {
+        let Ok(x) = ws.load_index(&ar) else { continue };
+        for e in &x.entries {
+            let Some(n) = e.name.as_deref() else { continue };
+            let b = n.rsplit(|c| c == '/' || c == char::from(92u8)).next().unwrap_or(n).split('.').next().unwrap_or(n).to_ascii_lowercase();
+            for c in [b.clone(), b.trim_end_matches("_hi").to_string()] {
+                names.entry(sixng_core::meta7a::joaat(&c)).or_insert(c);
+            }
+        }
+    }
+    names
 }

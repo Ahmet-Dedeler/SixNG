@@ -63,6 +63,8 @@ pub struct Meta<'a> {
     pub structs: HashMap<u32, StructDef>,
     /// (struct hash, byte size, sys offset)
     pub blocks: Vec<(u32, u32, usize)>,
+    /// PSO file (`pso.rs`): pointers are pool references only.
+    pub pso: bool,
 }
 
 pub const ENTITY: u32 = 0xce50_1483;
@@ -114,15 +116,17 @@ impl<'a> Meta<'a> {
                 (r.u32(o), r.u32(o + 4), r.meta_off(r.u64(o + 8)).unwrap_or(usize::MAX))
             })
             .collect();
-        Some(Meta { r, structs, blocks })
+        Some(Meta { r, structs, blocks, pso: false })
     }
 
     /// Resolve a pointer field: a real system pointer (`0x5xxxxxxx`) or a
     /// pool reference into the instance blocks: u64 with the 1-based block
     /// index in the low 12 bits and the byte offset in bits 20+.
     pub fn ptr(&self, v: u64) -> Option<(u32, usize)> {
-        if let Some(o) = self.r.meta_off(v) {
-            return Some((0, o));
+        if !self.pso {
+            if let Some(o) = self.r.meta_off(v) {
+                return Some((0, o));
+            }
         }
         let bi = (v & 0xFFF) as usize;
         let off = (v >> 20) as usize;
@@ -183,6 +187,19 @@ impl<'a> Meta<'a> {
 }
 
 impl<'a> Meta<'a> {
+    /// Byte size of an array element member (0 if unknown).
+    fn elem_size(&self, el: &Member) -> usize {
+        match el.ty {
+            0x01 | 0x10 | 0x11 | 0x60 => 1,
+            0x12 | 0x13 => 2,
+            0x14 | 0x15 | 0x4a | 0x21 => 4,
+            0x31 | 0x32 | 0x33 | 0x34 => 16,
+            0x08 | 0x4f | 0x07 | 0x4d => 8,
+            0x05 => self.structs.get(&el.extra).map(|x| x.size as usize).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
     fn value(&self, sd: &StructDef, m: &Member, p: usize, depth: u32) -> Option<serde_json::Value> {
         use serde_json::json;
         let r = self.r;
@@ -196,7 +213,7 @@ impl<'a> Meta<'a> {
             0x15 | 0x4a => json!(r.u32(p)),
             0x21 => f(0),
             0x32 | 0x33 => json!([f(0), f(1), f(2)]),
-            0x34 => json!([f(0), f(1), f(2), f(3)]),
+            0x34 | 0x31 => json!([f(0), f(1), f(2), f(3)]),
             0x08 | 0x4f => json!(format!("{:016x}", r.u64(p))),
             0x05 => self.object(m.extra, p, depth + 1).unwrap_or_else(|| json!({"struct": format!("{:08x}", m.extra)})),
             // Polymorphic pointers (extra 0) take the struct of the block they point into.
@@ -208,19 +225,53 @@ impl<'a> Meta<'a> {
                 let n = r.u16(p + 8) as usize;
                 let el = sd.members.get(m.reference as usize)?;
                 let Some((_, base)) = self.ptr(r.u64(p)) else { return Some(json!([])) };
-                let esz = match el.ty {
-                    0x10 | 0x11 | 0x60 => 1,
-                    0x12 | 0x13 => 2,
-                    0x14 | 0x15 | 0x4a | 0x21 => 4,
-                    0x32 | 0x33 | 0x34 => 16,
-                    0x08 | 0x4f | 0x07 => 8,
-                    0x05 => self.structs.get(&el.extra).map(|x| x.size as usize).unwrap_or(0),
-                    _ => 0,
-                };
+                let esz = self.elem_size(el);
                 if esz == 0 || n > 100_000 {
                     return Some(json!({"array": n, "elem_type": el.ty, "elem_extra": format!("{:08x}", el.extra)}));
                 }
                 json!((0..n).filter_map(|i| self.value(sd, el, base + i * esz, depth)).collect::<Vec<_>>())
+            }
+            0x01 => json!(r.sys.get(p).map(|&x| x != 0)),
+            // Map (PSO): u32 count, u32 capacity, u64 pointer to a hash table
+            // struct (control bytes `b8794c89`, slots `93c495af`); only the
+            // occupied slots ({key, value}) are returned.
+            0x75 => {
+                let Some((h, o)) = self.ptr(r.u64(p + 8)) else { return Some(json!([])) };
+                let t = self.object(h, o, depth + 1)?;
+                let (Some(ctrl), Some(slots)) = (t.get(field_name(0xb879_4c89)).and_then(|x| x.as_array()), t.get(field_name(0x93c4_95af)).and_then(|x| x.as_array())) else { return Some(t) };
+                json!(ctrl
+                    .iter()
+                    .zip(slots)
+                    .filter(|(c, _)| c.as_u64().is_some_and(|c| c < 0x80))
+                    .map(|(_, sl)| json!({"key": sl.get(field_name(0x6098_a50e)), "value": sl.get(field_name(0x063f_a3f2))}))
+                    .collect::<Vec<_>>())
+            }
+            // Bit set / flags (PSO, 16 bytes): the first 64 bits.
+            0x65 => json!(format!("{:016x}", r.u64(p))),
+            // Tagged value (PSO, 16 bytes): u32 tag, then payload.
+            0x62 => json!({"tag": r.u32(p), "u32": [r.u32(p + 4), r.u32(p + 8), r.u32(p + 12)], "f32": [r.f32(p + 4), r.f32(p + 8), r.f32(p + 12)]}),
+            // 64-bit hash (PSO).
+            0x4d => json!(format!("{:016x}", r.u64(p))),
+            // Array, count first (PSO): u32 count, u32 capacity, u64 pointer.
+            0x5c => {
+                let n = r.u32(p) as usize;
+                let el = sd.members.get(m.reference as usize)?;
+                let esz = self.elem_size(el);
+                let Some((_, base)) = self.ptr(r.u64(p + 8)) else { return Some(json!([])) };
+                if esz == 0 || n > 100_000 {
+                    return Some(json!({"array": n, "elem_type": el.ty, "elem_extra": format!("{:08x}", el.extra)}));
+                }
+                json!((0..n).filter_map(|i| self.value(sd, el, base + i * esz, depth)).collect::<Vec<_>>())
+            }
+            // Inline fixed array: `extra` elements of the referenced member.
+            0x50 => {
+                let el = sd.members.get(m.reference as usize)?;
+                let esz = self.elem_size(el);
+                let n = m.extra as usize;
+                if esz == 0 || n > 100_000 {
+                    return Some(json!({"inline_array": n, "elem_type": el.ty}));
+                }
+                json!((0..n).filter_map(|i| self.value(sd, el, p + i * esz, depth)).collect::<Vec<_>>())
             }
             _ => json!({"type": m.ty, "sub": m.sub, "hex": r.sys.get(p..p + 16).map(|b| b.iter().map(|x| format!("{x:02x}")).collect::<String>())}),
         })
@@ -230,7 +281,7 @@ impl<'a> Meta<'a> {
     /// and arrays (depth-limited). Field names are joaat hashes unless known.
     pub fn object(&self, hash: u32, o: usize, depth: u32) -> Option<serde_json::Value> {
         let sd = self.structs.get(&hash)?;
-        if depth > 8 {
+        if depth > 16 {
             return Some(serde_json::json!({"struct": format!("{hash:08x}"), "depth_limit": true}));
         }
         let mut out = serde_json::Map::new();
