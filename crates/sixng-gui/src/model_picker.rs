@@ -27,7 +27,7 @@ pub enum Cat {
     Unnamed,
 }
 
-const CATS: &[(Cat, &str)] = &[
+pub const CATS: &[(Cat, &str)] = &[
     (Cat::All, "All"),
     (Cat::Vehicles, "Vehicles"),
     (Cat::VehicleParts, "Vehicle parts"),
@@ -137,6 +137,37 @@ impl ModelPicker {
         }
     }
 
+    /// The full model list once loaded (shared with the Library).
+    pub fn items(&self) -> Option<Arc<Vec<Item>>> {
+        self.items.clone()
+    }
+
+    pub fn count(&self, c: Cat) -> usize {
+        self.counts.get(&c).copied().unwrap_or(0)
+    }
+
+    pub fn is_favourite(&self, id: &str) -> bool {
+        self.favourites.iter().any(|f| f == id)
+    }
+
+    pub fn toggle_favourite(&mut self, id: &str) {
+        if self.is_favourite(id) {
+            self.favourites.retain(|f| f != id);
+        } else {
+            self.favourites.push(id.to_string());
+        }
+        self.save();
+        self.dirty = true;
+    }
+
+    pub fn recents(&self) -> &[String] {
+        &self.recents
+    }
+
+    pub fn favourites(&self) -> &[String] {
+        &self.favourites
+    }
+
     pub fn loaded(&self) -> bool {
         self.items.is_some() || self.failed
     }
@@ -158,7 +189,7 @@ impl ModelPicker {
     }
 
     /// Load the archive indexes on a worker thread (shared with the viewer's cache).
-    fn ensure_loaded(&mut self, ws: Workspace, idx: Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>, ctx: &egui::Context) {
+    pub fn ensure_loaded(&mut self, ws: Workspace, idx: Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>, ctx: &egui::Context) {
         if let Some(r) = self.pending.lock().unwrap().take() {
             self.loading = false;
             match r {
@@ -223,7 +254,7 @@ impl ModelPicker {
             }
             v.sort_by(|a, b| a.lname.cmp(&b.lname));
             refine_vehicles(&mut v);
-            if v.is_empty() { Err(if errs.is_empty() { "no indexed models (index the archives in the Browser tab first)".into() } else { errs.join("; ") }) } else { Ok(v) }
+            if v.is_empty() { Err(if errs.is_empty() { "no indexed models (run the setup or index the archives on the Jobs page first)".into() } else { errs.join("; ") }) } else { Ok(v) }
             }));
             let r = r.unwrap_or_else(|p| Err(format!("model list crashed: {}", p.downcast_ref::<String>().cloned().or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string())).unwrap_or_default())));
             log(&match &r { Ok(v) => format!("done: {} models", v.len()), Err(e) => format!("error: {e}") });

@@ -24,6 +24,10 @@ mod mapbake;
 mod model_view;
 mod texture_view;
 mod render3d;
+mod jobs;
+mod thumbs;
+mod library;
+mod pages;
 
 /// Command-line automation (verification screenshots):
 /// `sixng-gui --model <id|regex|glb> [--lod N] [--mode N] [--slot N] [--rma N] [--wire] [--skeleton]
@@ -67,9 +71,15 @@ impl Cli {
 
 /// App settings (game and work folders); see `settings_path`.
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+#[serde(default)]
 struct AppSettings {
     game: Option<String>,
     work: Option<String>,
+    /// export folder (Export / extract jobs)
+    out: Option<String>,
+    thumb_budget_mb: Option<u64>,
+    /// the first-run setup was finished or skipped
+    setup_done: bool,
 }
 
 /// `sixng-settings.json` next to the exe (portable installs), else in %APPDATA%\SixNG.
@@ -160,6 +170,10 @@ fn app_icon() -> egui::IconData {
 
 #[derive(PartialEq, Clone, Copy)]
 enum Tab {
+    Library,
+    Jobs,
+    Status,
+    Settings,
     Browser,
     Model,
     Map2D,
@@ -216,6 +230,13 @@ struct App {
     map3d_start: Option<[f32; 3]>,
     bake: bakejob::BakeJob,
     settings_msg: String,
+    library: library::Library,
+    jobs: jobs::Jobs,
+    setup: pages::Setup,
+    status: pages::Status,
+    palette: pages::Palette,
+    thumb_budget_mb: u64,
+    setup_done: bool,
 }
 
 impl App {
@@ -224,7 +245,20 @@ impl App {
         let work = default_work();
         let _ = std::fs::create_dir_all(&work);
         let _ = std::fs::OpenOptions::new().create(true).append(true).open(std::path::Path::new(&work).join("gui.log")).and_then(|mut f| { use std::io::Write; writeln!(f, "[start] work = {work} (SIXNG_WORK {}, settings {:?}, file {:?}: {})", std::env::var("SIXNG_WORK").is_ok(), load_settings().work, settings_path(), settings_path().map(|p| match std::fs::read(&p) { Ok(b) => match serde_json::from_slice::<AppSettings>(&b) { Ok(_) => "ok".to_string(), Err(e) => format!("parse error {e}") }, Err(e) => format!("read error {e}") }).unwrap_or_default()) });
+        let st = load_settings();
+        let thumb_budget_mb = st.thumb_budget_mb.unwrap_or(512);
+        let out = st.out.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| Path::new(&work).join("out").display().to_string());
+        // the wizard opens on first start or when the game folder is gone (not for automation runs)
+        let need_game = game.trim().is_empty() || !Path::new(game.trim()).is_dir();
+        let setup = pages::Setup { open: need_game || (!st.setup_done && cli.args.is_empty()) || cli.get("tab") == Some("setup"), ..Default::default() };
         let mut a = App {
+            library: library::Library::new(&game, &work, thumb_budget_mb),
+            jobs: jobs::Jobs::new(&game, &work),
+            setup,
+            status: pages::Status::default(),
+            palette: pages::Palette::default(),
+            thumb_budget_mb,
+            setup_done: st.setup_done,
             model: model_view::ModelView::new(&game, &work),
             map2d: map2d::Map2D::new(&work),
             map3d: map3d::Map3D::new(&game, &work),
@@ -233,12 +267,12 @@ impl App {
             map3d_start: None,
             bake: bakejob::BakeJob::default(),
             settings_msg: String::new(),
-            tab: Tab::Browser,
+            tab: Tab::Library,
             cli,
             cli_started: false,
             game,
             work,
-            out: "work/out".into(),
+            out,
             archives: vec![],
             sel_archive: None,
             index: None,
@@ -295,7 +329,7 @@ impl App {
 Optional layers not exported yet (the map works without them): {}.", opt.join(", ")) }
                     )
                 } else {
-                    format!("Export the world data first: Browse tab → World data → {}.", req.join(", "))
+                    format!("Export the world data first: Status page → Export world data, or Archives → World data → {}.", req.join(", "))
                 };
                 if ui.add_enabled(can, egui::Button::new(label)).on_hover_text(&hover).on_disabled_hover_text(&hover).clicked() {
                     if let Err(e) = self.bake.start(&self.game, &self.work) {
@@ -303,11 +337,11 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
                     }
                 }
                 if !can {
-                    ui.colored_label(egui::Color32::from_rgb(230, 180, 80), format!("Needs world data first: Browse tab → World data → {}", req.join(", ")));
+                    ui.colored_label(egui::Color32::from_rgb(230, 180, 80), format!("Needs world data first: Status page → Export world data, or Archives → World data → {}", req.join(", ")));
                 } else if !baked {
                     ui.label("No baked map yet.");
                 } else if !opt.is_empty() {
-                    ui.weak(format!("missing optional layers: {}", opt.join(", "))).on_hover_text("Export them from Browse → World data, then re-bake to add them.");
+                    ui.weak(format!("missing optional layers: {}", opt.join(", "))).on_hover_text("Export them from Archives → World data (or Jobs), then re-bake to add them.");
                 }
                 if let Some(r) = &self.bake.result {
                     ui.separator();
@@ -509,8 +543,36 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
-        if self.game.trim().is_empty() || !Path::new(self.game.trim()).is_dir() {
-            self.ask_game_folder(ctx);
+        self.jobs.poll();
+        for (_, ok) in self.jobs.take_finished() {
+            if ok {
+                // indexes / world data may have changed
+                self.refresh();
+                self.status = pages::Status::default();
+            }
+        }
+        self.setup_tick();
+        if self.bake.running() {
+            if let Some(ok) = self.bake.poll(&self.work) {
+                if ok {
+                    self.map2d.reload();
+                    self.map3d.reset_data();
+                }
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(500));
+        }
+        if self.jobs.active_count() > 0 {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+        if self.setup.open {
+            if !self.cli_started && self.cli.get("tab") == Some("setup") {
+                self.cli_started = true;
+                if let Some(p) = self.cli.get("screenshot") {
+                    self.shot = Some((PathBuf::from(p), 0, self.cli.has("exit")));
+                }
+            }
+            self.setup_ui(ctx);
+            self.window_shot(ctx);
             return;
         }
         if !self.cli_started {
@@ -519,14 +581,66 @@ impl eframe::App for App {
         }
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Browser, "📦 Browser");
+                ui.selectable_value(&mut self.tab, Tab::Library, "🏠 Library");
                 ui.selectable_value(&mut self.tab, Tab::Model, "🧊 Model viewer");
                 ui.selectable_value(&mut self.tab, Tab::Map2D, "🗺 Map 2D");
                 ui.selectable_value(&mut self.tab, Tab::Map3D, "🌆 Map 3D");
                 ui.selectable_value(&mut self.tab, Tab::Textures, "🖼 Textures");
+                ui.separator();
+                let n = self.jobs.active_count();
+                let jl = if n > 0 { format!("⚙ Jobs ({n})") } else { "⚙ Jobs".to_string() };
+                ui.selectable_value(&mut self.tab, Tab::Jobs, jl);
+                ui.selectable_value(&mut self.tab, Tab::Status, "📊 Status");
+                ui.selectable_value(&mut self.tab, Tab::Settings, "🔧 Settings");
+                ui.selectable_value(&mut self.tab, Tab::Browser, "📦 Archives").on_hover_text("Advanced: browse raw archive entries");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("🔍 Search  Ctrl+K").clicked() {
+                        self.palette.open = true;
+                    }
+                    if self.bake.running() {
+                        ui.spinner();
+                        ui.weak("baking map");
+                    }
+                });
             });
         });
+        self.palette_ui(ctx);
         self.window_shot(ctx);
+        match self.tab {
+            Tab::Library => {
+                let out = self.out.clone();
+                let mut act = None;
+                egui::CentralPanel::default().show(ctx, |ui| act = self.library.ui(ui, frame, &mut self.model, &out));
+                match act {
+                    Some(library::Action::OpenModel(id)) => {
+                        self.model.open(&id, 0, ctx);
+                        self.tab = Tab::Model;
+                    }
+                    Some(library::Action::ShowMap) => self.tab = Tab::Map2D,
+                    Some(library::Action::ShowTextures) => self.tab = Tab::Textures,
+                    Some(library::Action::Job(label, args)) => {
+                        self.jobs.enqueue(&label, args);
+                        self.tab = Tab::Jobs;
+                    }
+                    Some(library::Action::OpenJobs) => self.tab = Tab::Jobs,
+                    None => {}
+                }
+                return;
+            }
+            Tab::Jobs => {
+                egui::CentralPanel::default().show(ctx, |ui| self.jobs.ui(ui));
+                return;
+            }
+            Tab::Status => {
+                egui::CentralPanel::default().show(ctx, |ui| self.status_ui(ui));
+                return;
+            }
+            Tab::Settings => {
+                egui::CentralPanel::default().show(ctx, |ui| self.settings_ui(ui));
+                return;
+            }
+            _ => {}
+        }
         if self.tab == Tab::Model {
             egui::CentralPanel::default().show(ctx, |ui| self.model.ui(ui, frame));
             if let Some(h) = self.model.view_texture.take() {
@@ -554,16 +668,14 @@ impl eframe::App for App {
             }
             egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| self.map3d.ui(ui, frame));
             if let Some(m) = self.map3d.open_model.take() {
-                self.tab = Tab::Model;
-                self.model.open(&m, 0, ctx);
+                self.open_from_map(&m, ctx);
             }
             return;
         }
         if self.tab == Tab::Map2D {
             egui::CentralPanel::default().show(ctx, |ui| self.map2d.ui(ui));
             if let Some(m) = self.map2d.open_model.take() {
-                self.tab = Tab::Model;
-                self.model.open(&m, 0, ctx);
+                self.open_from_map(&m, ctx);
             }
             return;
         }
@@ -604,7 +716,7 @@ impl eframe::App for App {
                     }
                 }
                 if ui.button("💾 Save").on_hover_text("Remember these game and work folders (used from the next start, wherever the app is launched from)").clicked() {
-                    let st = AppSettings { game: Some(self.game.clone()), work: Some(self.work.clone()) };
+                    let st = self.settings();
                     self.settings_msg = match save_settings(&st) {
                         Ok(()) => "Saved. Restart the app to use the new folders everywhere.".into(),
                         Err(e) => format!("Could not save settings: {e}"),
@@ -847,7 +959,7 @@ impl App {
             }
             return;
         }
-        let ready = frames > 40 && !self.bake.running() && match self.tab { Tab::Model => self.model.idle(), Tab::Textures => self.textures.idle(), _ => self.map2d.data.is_some() };
+        let ready = frames > 40 && !self.bake.running() && match self.tab { Tab::Model => self.model.idle(), Tab::Textures => self.textures.idle(), _ if self.setup.open => true, Tab::Library => self.library.idle() && self.model.picker.loaded(), Tab::Status => self.status.sizes.lock().unwrap().is_some(), Tab::Jobs | Tab::Settings => true, _ => self.map2d.data.is_some() };
         if ready && frames < 100_000 {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             self.shot = Some((path, 100_000, exit));
@@ -857,39 +969,47 @@ impl App {
         ctx.request_repaint();
     }
 
-    /// First start (or the saved folder is gone): ask for the game folder,
-    /// save it, and rebuild the views that hold it.
-    fn ask_game_folder(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() * 0.3);
-                ui.heading("Where is your GTA VI install?");
-                ui.label("Pick the game folder (the one that contains the .rpf archives). It is saved for next time.");
-                if !self.game.trim().is_empty() {
-                    ui.colored_label(egui::Color32::from_rgb(230, 150, 90), format!("The saved folder {} does not exist.", self.game));
-                }
-                ui.add_space(8.0);
-                if ui.button("Choose game folder…").clicked() {
-                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
-                        self.game = p.display().to_string();
-                        let st = AppSettings { game: Some(self.game.clone()), work: Some(self.work.clone()) };
-                        if let Err(e) = save_settings(&st) {
-                            self.settings_msg = format!("Could not save settings: {e}");
-                        }
-                        self.model = model_view::ModelView::new(&self.game, &self.work);
-                        self.map3d = map3d::Map3D::new(&self.game, &self.work);
-                        self.textures = texture_view::TextureView::new(&self.game, &self.work);
-                        self.refresh();
-                    }
-                }
-                ui.add_space(4.0);
-                ui.label(egui::RichText::new("You can also set SIXNG_GAME, or change it later on the Browser tab.").small());
-            });
-        });
+    /// A model picked on the map: its Library item page when the model is
+    /// listed there, else straight to the viewer.
+    fn open_from_map(&mut self, m: &str, ctx: &egui::Context) {
+        let ml = m.to_ascii_lowercase();
+        let hit = self.model.picker.items().and_then(|items| items.iter().find(|it| it.id == m || it.lname == ml).map(|it| it.id.clone()));
+        match hit {
+            Some(id) => {
+                self.library.show_item(&id);
+                self.tab = Tab::Library;
+            }
+            None => {
+                self.tab = Tab::Model;
+                self.model.open(m, 0, ctx);
+            }
+        }
     }
 
     fn apply_cli(&mut self, ctx: &egui::Context) {
         let c = self.cli.clone();
+        let page = match c.get("tab") {
+            Some("library") => Some(Tab::Library),
+            Some("jobs") => Some(Tab::Jobs),
+            Some("status") => Some(Tab::Status),
+            Some("settings") => Some(Tab::Settings),
+            Some("archives") => Some(Tab::Browser),
+            _ => None,
+        };
+        if let Some(t) = page {
+            self.tab = t;
+            if let Some(id) = c.get("item") {
+                self.library.show_item(id);
+            }
+            if c.has("palette") {
+                self.palette.open = true;
+                self.palette_query(c.get("palette").unwrap_or(""));
+            }
+            if let Some(p) = c.get("screenshot") {
+                self.shot = Some((PathBuf::from(p), 0, c.has("exit")));
+            }
+            return;
+        }
         if c.get("tab") == Some("textures") || c.get("texture").is_some() {
             self.tab = Tab::Textures;
             if let Some(h) = c.get("texture").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) {
@@ -1094,8 +1214,30 @@ impl App {
     }
 }
 
+/// The SixNG banner (logo) as a texture, loaded once.
+fn banner(ctx: &egui::Context) -> egui::TextureHandle {
+    let id = egui::Id::new("sixng_banner");
+    if let Some(h) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return h;
+    }
+    let png = include_bytes!("../../../assets/logo/sixng_banner_640.png");
+    let ci = match image::load_from_memory(png) {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (w, h) = img.dimensions();
+            egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], img.as_raw())
+        }
+        Err(_) => egui::ColorImage::new([1, 1], egui::Color32::TRANSPARENT),
+    };
+    let h = ctx.load_texture("sixng_banner", ci, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, h.clone()));
+    h
+}
+
 fn human(n: u64) -> String {
-    if n >= 1 << 20 {
+    if n >= 10 << 30 {
+        format!("{:.1} GB", n as f64 / (1u64 << 30) as f64)
+    } else if n >= 1 << 20 {
         format!("{:.1} MB", n as f64 / (1u64 << 20) as f64)
     } else if n >= 1024 {
         format!("{:.1} KB", n as f64 / 1024.0)

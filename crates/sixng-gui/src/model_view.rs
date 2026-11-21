@@ -59,7 +59,7 @@ pub struct ModelView {
     pub material_sel: Option<usize>,
     pub auto: Automation,
     frames_since_load: u32,
-    indexes: Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>,
+    pub indexes: Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>,
     pub game: String,
     pub work: String,
     pub size: [u32; 2],
@@ -763,7 +763,7 @@ pub fn index_for(ws: &Workspace, archive: &str, cache: &Arc<Mutex<HashMap<String
     Ok((a, ix))
 }
 
-fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<Loaded> {
+pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<Loaded> {
     let q = q.trim();
     if q.to_lowercase().ends_with(".glb") {
         let p = PathBuf::from(q);

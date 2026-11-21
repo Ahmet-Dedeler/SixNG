@@ -69,11 +69,11 @@ There is no default game folder; you set it once:
 - CLI: `--game <folder>` or the `SIXNG_GAME` environment variable, or the
   folder saved by the GUI. Without one, the CLI stops with a message that
   says how to set it.
-- GUI: on first start it asks for the game folder (the one with the
-  `.rpf` archives) and saves it to `sixng-settings.json` next to the exe (or
-  `%APPDATA%\SixNG\settings.json` if that folder is not writable).
-  Change it later on the Browser tab (**💾 Save**). `SIXNG_GAME` overrides
-  the saved folder.
+- GUI: on first start a setup wizard asks for the game folder (the one
+  with the `.rpf` archives) and the work folder, and saves them to
+  `sixng-settings.json` next to the exe (or `%APPDATA%\SixNG\settings.json`
+  if that folder is not writable). Change them later on the **Settings**
+  page. `SIXNG_GAME` overrides the saved folder.
 
 The work directory (indexes, output, caches) defaults to `./work` for the
 CLI and to a `work` folder next to the exe for the GUI; override it with
@@ -192,28 +192,45 @@ most 50 items; the manifest has everything.
 .\target\release\sixng-gui.exe
 ```
 
-1. **Game** and **Work** are set from the same defaults as the CLI. Use
-   **Browse…** to choose another install.
-2. The left panel lists the archives. Click **Index** on any that are not
-   indexed yet; a progress bar shows while it runs.
-3. The middle panel shows the entries of the selected archive. Filter
-   them with a regex search and the kind and type drop-downs. Tick rows,
-   then use **Extract selected** or **Extract all N filtered** to export
-   into **Output**. The **PNG** and **DDS** check boxes set the texture
-   formats.
-4. The right panel previews the selected entry:
-   - texture dictionaries: pick a texture and see it decoded;
-   - models: their JSON description;
-   - text and binary: a text or hex view.
-5. The **World data** row runs the whole-map exports into **Output**, with
-   the same default selection as the CLI (`sixng world <step>`):
-   Placements, Batches, Collision, Road navmesh, Lane graph, Lights,
-   Interiors (with the collision second pass) and Surfaces. Run them left
-   to right; Interiors needs Collision, and Surfaces needs Collision, Lane
-   graph and Batches.
+The GUI renders with wgpu (Direct3D 12 / Vulkan).
 
-The GUI renders with wgpu (Direct3D 12 / Vulkan). Its tabs are
-**Browser** (above), **Model viewer**, **Map 2D** and **Map 3D**.
+**First start.** A setup wizard asks for the game and work folders, then
+offers to prepare everything in the background: index the archives, link
+unnamed buildings to their models, export the world data and bake the
+map. Each step can be skipped and run later (**Settings → Run setup
+again**).
+
+**Pages** (tabs along the top):
+
+- **Library** (home): models by category as thumbnail grids, with
+  readable names made from the model names (game display names are not
+  decoded). Thumbnails render in the background with the app's own
+  renderer and are cached in `<work>	humbs` under a size limit set in
+  Settings. Recently opened models and favourites are listed on the home
+  page. An item page shows the model's details, **Open in 3D viewer**,
+  favourites, **Export (glTF + textures)** (queued as a job) and a
+  **Files** panel for the exported files (Show in Explorer, Open, Copy
+  path). Clicking a model on either map opens its item page.
+- **Model viewer**, **Map 2D**, **Map 3D**, **Textures**: below.
+- **Jobs**: every CLI command as a form (built from `sixng --help`, so it
+  stays in step with the CLI). Jobs run one at a time in the background
+  with a queue, progress bars, Cancel, the log and the result, and a
+  button to open the output folder. `sixng.exe` must sit next to
+  `sixng-gui.exe`.
+- **Status**: archives indexed, models per category, world data and map
+  state, the BCPack texture-gap summary, and disk use per folder in the
+  work folder with the change since the last check.
+- **Settings**: game, work and export folders, the thumbnail cache size,
+  and **Run setup again**.
+- **Archives** (advanced): the raw entry browser. Pick an archive on the
+  left (**Index** it first if needed), filter entries by regex, kind and
+  type, preview them on the right (decoded textures, model JSON, text or
+  hex) and extract the ticked or filtered entries. Its **World data** row
+  runs the whole-map exports (same as `sixng world <step>`).
+
+**Ctrl+K** (or **🔍 Search** at the top right) opens a search box over all
+models and pages; with an empty query it lists favourites and recent
+models. Arrow keys and Enter pick a result.
 
 ### Model viewer
 
@@ -233,7 +250,7 @@ Unnamed.
 You can also open by entry id (`levels.rpf@10f266d010`), by name regex
 (`^phoenix_hi$`, searched in `levels`; `data:^w_pi` for another
 archive), from an exported `.glb`, or with **Open in model viewer** in
-the Browser. Entries are exported on the fly into `<work>/gui_cache_v2`
+the Archives page. Entries are exported on the fly into `<work>/gui_cache_v2`
 (models plus PNG textures; v2 since the 2026-11-20 LOD fix).
 
 - Shading: base colour, normal map (DirectX green), packed
@@ -269,8 +286,8 @@ First bake the map from the world exports (`sixng world all` output in
   **Cancel** button and the elapsed time. Both map tabs reload when it
   finishes; it takes about 2 minutes.
 - It lists missing world data. Placements are required; the other layers
-  are optional, and the button says which Browser → World data steps to
-  run.
+  are optional, and the button says which world-data steps to
+  run (from the Status page, Archives → World data, or Jobs).
 
 From the command line:
 
