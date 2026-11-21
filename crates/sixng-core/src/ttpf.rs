@@ -63,6 +63,10 @@ pub struct TtpfTex {
     /// from the chunk table (each copy is its own chunk).
     #[serde(skip)]
     pub cube_base: Option<u64>,
+    /// Mip count recovered from the store layout where the descriptor's
+    /// field does not fit (see `Ttpf::open`); `mips()` prefers it.
+    #[serde(skip)]
+    pub mips_fixed: Option<u32>,
 }
 
 pub struct Ttpf {
@@ -91,6 +95,40 @@ fn decode_bc1(comp: &[u8], blocks: usize) -> Option<Vec<u8>> {
     static TABLES: std::sync::OnceLock<(Window, QuadTable)> = std::sync::OnceLock::new();
     let (w, q) = TABLES.get_or_init(|| (Window::default_table(), QuadTable::default_table()));
     bcpack::bc1::decode(comp, blocks, w, q).ok().map(|o| o.blocks)
+}
+
+/// The descriptor's mip field (d0 bits 28-31) undercounts on many textures:
+/// e.g. every tile-mode-1/2 texture with field 0 and a second location in
+/// `loc` holds 3 mips, not 1 (41.5 K textures). Mips are stored smallest
+/// first with mip 0 last, so a wrong count puts mip 0 at the wrong offset
+/// (a scrambled band of the smaller mips at the top). The store packs each
+/// texture's chain right up to the next texture, so where the field's size
+/// does not reach the next texture and exactly one mip count does, that
+/// count is used. Single-slice 2D textures only; checked as mip n+1 = mip n
+/// downsampled.
+fn fix_mip_counts(textures: &mut [TtpfTex]) {
+    let mut order: Vec<usize> = (0..textures.len()).collect();
+    order.sort_by_key(|&i| textures[i].virt);
+    for w in order.windows(2) {
+        let (i, n) = (w[0], w[1]);
+        let gap = textures[n].virt - textures[i].virt;
+        let t = &textures[i];
+        if gap == t.size || t.tile_mode() > 3 || t.slices() != 1 {
+            continue;
+        }
+        let fmt = crate::texture::Fmt::from_dxgi(t.dxgi_format);
+        let (Some(sw), false) = (t.swizzle(), fmt == crate::texture::Fmt::Unknown) else { continue };
+        let bd = fmt.block_dim();
+        let full = 32 - t.width.max(t.height).leading_zeros();
+        let fits: Vec<u32> = (1..=full)
+            .filter(|&m| crate::gfx10::Layout::new(sw, t.width.div_ceil(bd), t.height.div_ceil(bd), m, fmt.bytes_per_elem()).is_some_and(|l| l.total == gap))
+            .collect();
+        if let [m] = fits[..] {
+            let t = &mut textures[i];
+            t.mips_fixed = Some(m);
+            t.size = gap;
+        }
+    }
 }
 
 fn u32le(b: &[u8], o: usize) -> u32 {
@@ -147,6 +185,7 @@ impl Ttpf {
                 d1,
                 loc,
                 cube_base: None,
+                mips_fixed: None,
             });
         }
         for t in textures.iter_mut() {
@@ -158,6 +197,7 @@ impl Ttpf {
             }
             t.size = t.layout().map(|l| l.total).unwrap_or(0);
         }
+        fix_mip_counts(&mut textures);
         let by_hash = textures.iter().enumerate().map(|(i, t)| (t.hash, i)).collect();
         Ok(Ttpf { path: path.to_path_buf(), chunks, virt_size, textures, by_hash })
     }
@@ -309,6 +349,9 @@ impl TtpfTex {
     /// texture 7, i.e. down to 16 px). On cube maps (tile modes 9-12) the
     /// field is the count itself: "2" cubes store one mip per face.
     pub fn mips(&self) -> u32 {
+        if let Some(m) = self.mips_fixed {
+            return m;
+        }
         if (9..=12).contains(&self.tile_mode()) {
             (self.d0 >> 28).max(1)
         } else {
@@ -420,6 +463,11 @@ pub struct PngStats {
     /// means the alpha channel holds a constant, not opacity.
     #[serde(default)]
     pub alpha_range: Option<[u8; 2]>,
+    /// Mip count the PNG was decoded with. PNGs written before the mip
+    /// count fix (`fix_mip_counts`) have none and are re-decoded when the
+    /// count changed.
+    #[serde(default)]
+    pub mips: Option<u32>,
 }
 
 fn stats(rgba: &[u8], w: u32, h: u32) -> PngStats {
@@ -435,7 +483,7 @@ fn stats(rgba: &[u8], w: u32, h: u32) -> PngStats {
     let n = (rgba.len() / 4).max(1) as f64;
     let m = s.map(|x| (x / n) as f32);
     let normal_like = m[2] > 200.0 && (100.0..160.0).contains(&m[0]) && (100.0..160.0).contains(&m[1]);
-    PngStats { width: w, height: h, mean_rgba: m, normal_like, mip: 0, alpha_range: Some([amin, amax]) }
+    PngStats { width: w, height: h, mean_rgba: m, normal_like, mip: 0, alpha_range: Some([amin, amax]), mips: None }
 }
 
 /// Decode mip 0 of a texture to `<dir>/<hash>.png` (plus a `.json` with
@@ -446,7 +494,7 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
     if p.exists() {
         // stats written before alpha_range existed are refreshed below, and so
         // are lower-mip PNGs whose top mips now decode (BC1 BCPack)
-        if let Some(st) = std::fs::read(&js).ok().and_then(|b| serde_json::from_slice::<PngStats>(&b).ok()).filter(|st| st.alpha_range.is_some() && !matches!(store.best_mip(t), Some(m) if m < st.mip)) {
+        if let Some(st) = std::fs::read(&js).ok().and_then(|b| serde_json::from_slice::<PngStats>(&b).ok()).filter(|st| st.alpha_range.is_some() && !matches!(store.best_mip(t), Some(m) if m < st.mip) && (t.mips_fixed.is_none() || st.mips == Some(t.mips()))) {
             return Ok((p, st));
         }
     }
@@ -467,6 +515,7 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
     let (rgba, w, h) = decode_rgba(t, &data, mip)?;
     let mut st = stats(&rgba, w, h);
     st.mip = mip;
+    st.mips = Some(t.mips());
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!("{:016x}.{:?}.tmp.png", t.hash, std::thread::current().id()).replace(['(', ')'], ""));
     crate::texture::save_png(&tmp, &rgba, w, h)?;
@@ -478,6 +527,24 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tex(d0: u32, d1: u32, virt: u64) -> TtpfTex {
+        let mut t = TtpfTex { hash: virt, width: (d0 & 0x3FFF) + 1, height: ((d0 >> 14) & 0x3FFF) + 1, dxgi_format: (d1 >> 3) & 0x7F, virt, size: 0, d0, d1, loc: 0, cube_base: None, mips_fixed: None };
+        t.size = t.layout().map(|l| l.total).unwrap_or(0);
+        t
+    }
+
+    #[test]
+    fn mip_count_from_store_spacing() {
+        // 1024x1024 BC1, tile mode 1, mip field 0 (descriptor says 1 mip),
+        // followed by the next texture 688128 bytes later = 3 mips.
+        let mut v = vec![tex(0x00ffc3ff, 0x0120023b, 0x1000), tex(0x00ffc3ff, 0x0120023b, 0x1000 + 688128)];
+        assert_eq!(v[0].mips(), 1);
+        fix_mip_counts(&mut v);
+        assert_eq!((v[0].mips(), v[0].size), (3, 688128));
+        // the last texture has no neighbour and keeps the descriptor count
+        assert_eq!(v[1].mips_fixed, None);
+    }
 
     #[test]
     fn only_bc1_bcpack_decodes() {
