@@ -24,8 +24,11 @@
 //!       ...              other tables (u32 list, n x 32-byte digests)
 //! descriptor:
 //!       u32 d0: bits 0-13 width-1, bits 14-27 height-1, bits 28-31 mip count-1
-//!       u32 d1: bits 0-2 flags, bits 3-9 DXGI format, bit 10 flag (other layout; not decoded), bits 20-23 ?, bits 24-27 tile mode
-//!              (0 = SW_64KB_D, 1/2/3 = SW_4KB_S, see `gfx10`)
+//!       u32 d1: bits 0-2 flags, bits 3-9 DXGI format, bits 10-19 array size-1,
+//!              bits 20-23 ?, bits 24-27 tile mode
+//!              (0 = SW_64KB_D, 1/2/3 = SW_4KB_S, see `gfx10`; 9-12 = SW_4KB_S
+//!              cube maps stored as tile mode - 8 copies, see
+//!              `gfx10::Layout::with_cube_copies`)
 //!       u64 loc: bits 0-20 first 4 KiB page of the texture, counted after the
 //!              0x1000 header page; higher bits ?
 //! ```
@@ -55,6 +58,10 @@ pub struct TtpfTex {
     pub d0: u32,
     pub d1: u32,
     pub loc: u64,
+    /// Cube maps (tile modes 9-12): offset of the full-resolution copy,
+    /// from the chunk table (each copy is its own chunk).
+    #[serde(skip)]
+    pub cube_base: Option<u64>,
 }
 
 pub struct Ttpf {
@@ -119,9 +126,16 @@ impl Ttpf {
                 d0,
                 d1,
                 loc,
+                cube_base: None,
             });
         }
         for t in textures.iter_mut() {
+            if (9..=12).contains(&t.tile_mode()) {
+                let n = (t.tile_mode() - 8) as usize;
+                if let Ok(i) = chunks.binary_search_by_key(&t.virt, |c| c.1) {
+                    t.cube_base = chunks.get(i + n - 1).map(|c| c.1 - t.virt);
+                }
+            }
             t.size = t.layout().map(|l| l.total).unwrap_or(0);
         }
         let by_hash = textures.iter().enumerate().map(|(i, t)| (t.hash, i)).collect();
@@ -254,9 +268,14 @@ impl TtpfSet {
 
 impl TtpfTex {
     /// Mip count: d0 bits 28-31 + 1 (UI textures have 1-2, a 1024 map
-    /// texture 7, i.e. down to 16 px).
+    /// texture 7, i.e. down to 16 px). On cube maps (tile modes 9-12) the
+    /// field is the count itself: "2" cubes store one mip per face.
     pub fn mips(&self) -> u32 {
-        (self.d0 >> 28) + 1
+        if (9..=12).contains(&self.tile_mode()) {
+            (self.d0 >> 28).max(1)
+        } else {
+            (self.d0 >> 28) + 1
+        }
     }
     /// A `TexInfo` describing this texture, with `data_off` = 0 relative to
     /// the bytes returned by `Ttpf::data`.
@@ -277,8 +296,14 @@ impl TtpfTex {
     }
 }
 
-/// Decode mip `m` of a ttpf texture to RGBA8. Returns (rgba, width, height).
+/// Decode mip `m` of a ttpf texture to RGBA8 (slice 0 of an array).
+/// Returns (rgba, width, height).
 pub fn decode_rgba(t: &TtpfTex, data: &[u8], m: u32) -> Result<(Vec<u8>, u32, u32)> {
+    decode_rgba_slice(t, data, m, 0)
+}
+
+/// Decode slice `sl` of mip `m` of a ttpf texture to RGBA8.
+pub fn decode_rgba_slice(t: &TtpfTex, data: &[u8], m: u32, sl: u32) -> Result<(Vec<u8>, u32, u32)> {
     use crate::texture as tx;
     let ti = t.tex_info("");
     let fmt = tx::Fmt::from_dxgi(t.dxgi_format);
@@ -286,11 +311,14 @@ pub fn decode_rgba(t: &TtpfTex, data: &[u8], m: u32) -> Result<(Vec<u8>, u32, u3
         return Err(anyhow!("unsupported format {}", ti.format));
     }
     let (mw, mh) = ((t.width >> m).max(1), (t.height >> m).max(1));
-    let l = t.layout().ok_or_else(|| anyhow!("tile mode {} / {}{} not supported", t.tile_mode(), ti.format, if t.flag_bit10() { " / descriptor bit 10" } else { "" }))?;
+    let l = t.layout().ok_or_else(|| anyhow!("tile mode {} / {} not supported", t.tile_mode(), ti.format))?;
     if m as usize >= l.mips.len() {
         return Err(anyhow!("mip {m} out of range"));
     }
-    let lin = l.untile(data, m as usize);
+    if sl >= l.slices {
+        return Err(anyhow!("slice {sl} out of range ({} slices)", l.slices));
+    }
+    let lin = l.untile_slice(data, m as usize, sl);
     Ok((tx::to_rgba(fmt, &lin, mw, mh)?, mw, mh))
 }
 
@@ -304,24 +332,28 @@ impl TtpfTex {
     pub fn swizzle(&self) -> Option<crate::gfx10::Swizzle> {
         match self.tile_mode() {
             0 => Some(crate::gfx10::Swizzle::D64K),
-            1..=3 => Some(crate::gfx10::Swizzle::S4K),
+            1..=3 | 9..=12 => Some(crate::gfx10::Swizzle::S4K),
             _ => None,
         }
     }
     /// Mip-chain layout (`None` for unsupported tile modes or element sizes:
     /// only 8- and 16-byte BCn elements are mapped).
-    /// Descriptor d1 bit 10 (rare: under 0.2% of entries). Its data is laid out
-    /// differently (the normal layout gives a mosaic), so it is not decoded.
-    pub fn flag_bit10(&self) -> bool {
-        self.d1 & 0x400 != 0
+    /// Array size (d1 bits 10-19, plus 1). 1 for almost all textures; 6 on
+    /// cube maps; 2-64 on a few texture arrays.
+    pub fn slices(&self) -> u32 {
+        ((self.d1 >> 10) & 0x3FF) + 1
     }
     pub fn layout(&self) -> Option<crate::gfx10::Layout> {
         let fmt = crate::texture::Fmt::from_dxgi(self.dxgi_format);
-        if fmt == crate::texture::Fmt::Unknown || self.flag_bit10() {
+        if fmt == crate::texture::Fmt::Unknown {
             return None;
         }
         let bd = fmt.block_dim();
-        crate::gfx10::Layout::new(self.swizzle()?, self.width.div_ceil(bd), self.height.div_ceil(bd), self.mips(), fmt.bytes_per_elem())
+        let l = crate::gfx10::Layout::new(self.swizzle()?, self.width.div_ceil(bd), self.height.div_ceil(bd), self.mips(), fmt.bytes_per_elem())?;
+        match self.tile_mode() {
+            9..=12 => l.with_cube_copies(self.slices(), self.tile_mode() - 8, self.cube_base),
+            _ => Some(l.with_slices(self.slices())),
+        }
     }
     pub fn decodable(&self) -> bool {
         self.layout().is_some()
@@ -380,7 +412,7 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
         }
     }
     if !t.decodable() {
-        return Err(anyhow!("tile mode {} / format {}{} not supported", t.tile_mode(), t.dxgi_format, if t.flag_bit10() { " / descriptor bit 10" } else { "" }));
+        return Err(anyhow!("tile mode {} / format {} not supported", t.tile_mode(), t.dxgi_format));
     }
     let (data, skipped) = store.data_ex(t)?;
     // Top mips in BCPack chunks: fall back to the largest mip stored as zlib.

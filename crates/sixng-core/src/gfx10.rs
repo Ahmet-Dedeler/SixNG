@@ -53,7 +53,17 @@ pub struct Layout {
     pub block_h: u32,
     pub block_bytes: u64,
     pub mips: Vec<MipPlace>,
-    /// Bytes of the whole mip chain.
+    /// Array slices (1 for a plain 2D texture).
+    pub slices: u32,
+    /// Slices stored one after another, each with its whole mip chain
+    /// (`slice_bytes` apart), instead of level by level.
+    pub slice_major: bool,
+    /// Bytes of one slice's mip chain.
+    pub slice_bytes: u64,
+    /// Byte offset of slice 0 (slice-major layouts that follow lower-resolution
+    /// copies; see `with_cube_copies`).
+    pub base: u64,
+    /// Bytes of the whole texture (all mips, all slices).
     pub total: u64,
 }
 
@@ -89,7 +99,77 @@ impl Layout {
             p.offset = 0;
             p.tail = Some((mx * b256.0, my * b256.1));
         }
-        Some(Layout { eq, bpe, block_w: bw, block_h: bh, block_bytes: bs, mips: place, total: off })
+        Some(Layout { eq, bpe, block_w: bw, block_h: bh, block_bytes: bs, mips: place, slices: 1, slice_major: false, slice_bytes: off, base: 0, total: off })
+    }
+
+    /// The same layout for an array of `n` slices. Arrays are stored level by
+    /// level, smallest first, with each level's slices back to back: the tail
+    /// block of every slice, then mip k of every slice, ... then mip 0 of every
+    /// slice. (Decoding slice 0 with the single-slice layout gives a mosaic of
+    /// other slices' mip tails.)
+    pub fn with_slices(mut self, n: u32) -> Layout {
+        let n = n.max(1);
+        self.total = self.slice_bytes * n as u64;
+        self.slices = n;
+        self
+    }
+
+    /// Layout of the ttpf cube maps (tile modes 9-12): `copies` complete
+    /// copies of the array, smallest first, each stored slice by slice with
+    /// every slice's mip chain back to back. Copy `c` holds the smallest
+    /// `units - copies + 1 + c` "units" of the chain, where a unit is the
+    /// mip-tail block or one mip above it; the last copy is the full texture,
+    /// and that is the one this layout addresses. Each copy is its own
+    /// chunk in the store; one larger than 128 KiB is padded to a multiple of
+    /// 64 KiB. `base` overrides the computed offset of the last copy.
+    /// `None` if `copies` is more than the chain has units.
+    pub fn with_cube_copies(mut self, slices: u32, copies: u32, base: Option<u64>) -> Option<Layout> {
+        let first = self.mips.iter().position(|p| p.tail.is_some()).unwrap_or(self.mips.len());
+        let tail = first < self.mips.len();
+        let units = first + tail as usize;
+        let n = copies as usize;
+        if n == 0 || n > units {
+            return None;
+        }
+        // bytes of one slice's chain up to and including unit j
+        let chain = |j: usize| -> u64 {
+            if tail && j == 0 {
+                self.block_bytes
+            } else {
+                let m = first - (j + 1 - tail as usize);
+                self.mips[m].offset + self.level_bytes(m)
+            }
+        };
+        let s = slices.max(1) as u64;
+        let pad = |b: u64| if b > 128 << 10 { b.div_ceil(64 << 10) * (64 << 10) } else { b };
+        let base = base.unwrap_or_else(|| (0..n - 1).map(|c| pad(s * chain(units - n + c))).sum());
+        self.slices = slices.max(1);
+        self.slice_major = true;
+        self.base = base;
+        self.total = base + s * self.slice_bytes;
+        Some(self)
+    }
+
+    /// Bytes of one slice of mip `m` (the tail block for tail mips).
+    fn level_bytes(&self, m: usize) -> u64 {
+        let p = &self.mips[m];
+        match p.tail {
+            Some(_) => self.block_bytes,
+            None => (p.w.div_ceil(self.block_w) * self.block_w) as u64 * (p.h.div_ceil(self.block_h) * self.block_h) as u64 * self.bpe as u64,
+        }
+    }
+
+    /// Start of slice `s` of mip `m`.
+    fn level_start(&self, m: usize, s: u32) -> u64 {
+        if self.slice_major {
+            let off = if self.mips[m].tail.is_some() { 0 } else { self.mips[m].offset };
+            return self.base + s as u64 * self.slice_bytes + off;
+        }
+        let base = match self.mips[m].tail {
+            Some(_) => 0,
+            None => self.mips[m].offset * self.slices as u64,
+        };
+        base + s as u64 * self.level_bytes(m)
     }
 
     fn inblock(&self, x: u32, y: u32) -> u64 {
@@ -101,37 +181,41 @@ impl Layout {
         a
     }
 
-    /// Byte range [start, end) that mip `m` occupies (the whole tail block
-    /// for tail mips).
+    /// Byte range [start, end) that slice 0 of mip `m` occupies (the whole
+    /// tail block for tail mips).
     pub fn mip_span(&self, m: usize) -> (u64, u64) {
-        let p = &self.mips[m];
-        match p.tail {
-            Some(_) => (0, self.block_bytes),
-            None => (p.offset, p.offset + (p.w.div_ceil(self.block_w) * self.block_w) as u64 * (p.h.div_ceil(self.block_h) * self.block_h) as u64 * self.bpe as u64),
-        }
+        let a = self.level_start(m, 0);
+        (a, a + self.level_bytes(m))
     }
 
-    /// Byte address of element (x, y) of mip `m`.
-    pub fn addr(&self, m: usize, x: u32, y: u32) -> u64 {
+    /// Byte address of element (x, y) of slice `s` of mip `m`.
+    pub fn addr(&self, m: usize, s: u32, x: u32, y: u32) -> u64 {
         let p = &self.mips[m];
+        let base = self.level_start(m, s);
         match p.tail {
-            Some((cx, cy)) => self.inblock(x + cx, y + cy) * self.bpe as u64,
+            Some((cx, cy)) => base + self.inblock(x + cx, y + cy) * self.bpe as u64,
             None => {
                 let pitch = p.w.div_ceil(self.block_w) as u64;
                 let blk = (y / self.block_h) as u64 * pitch + (x / self.block_w) as u64;
-                p.offset + blk * self.block_bytes + self.inblock(x % self.block_w, y % self.block_h) * self.bpe as u64
+                base + blk * self.block_bytes + self.inblock(x % self.block_w, y % self.block_h) * self.bpe as u64
             }
         }
     }
 
-    /// Linear (row-major) elements of mip `m`. Missing source bytes stay zero.
+    /// Linear (row-major) elements of slice 0 of mip `m`. Missing source
+    /// bytes stay zero.
     pub fn untile(&self, src: &[u8], m: usize) -> Vec<u8> {
+        self.untile_slice(src, m, 0)
+    }
+
+    /// Linear elements of slice `s` of mip `m`.
+    pub fn untile_slice(&self, src: &[u8], m: usize, sl: u32) -> Vec<u8> {
         let p = &self.mips[m];
         let b = self.bpe as usize;
         let mut out = vec![0u8; (p.w * p.h) as usize * b];
         for y in 0..p.h {
             for x in 0..p.w {
-                let s = self.addr(m, x, y) as usize;
+                let s = self.addr(m, sl, x, y) as usize;
                 if let Some(e) = src.get(s..s + b) {
                     let d = (y * p.w + x) as usize * b;
                     out[d..d + b].copy_from_slice(e);
@@ -156,5 +240,22 @@ mod tests {
         assert_eq!(l.mips[1].tail, Some((16, 0)));
         // 128x64 BC7, 6 mips.
         assert_eq!(Layout::new(Swizzle::S4K, 32, 16, 6, 16).unwrap().total, 16384);
+    }
+
+    #[test]
+    fn arrays_and_cube_copies_match_store_spacing() {
+        // 256x256 BC5, 9 mips, 8 slices (SW_64KB_D): level by level.
+        let l = Layout::new(Swizzle::D64K, 64, 64, 9, 16).unwrap().with_slices(8);
+        assert_eq!(l.total, 1 << 20);
+        assert_eq!(l.mip_span(0), (8 * 65536, 9 * 65536));
+        assert_eq!(l.addr(0, 3, 0, 0), 11 * 65536);
+        // 128x128 BC7 cube, 6 mips, 3 copies: 6 + 12 pages, then the full copy.
+        let l = Layout::new(Swizzle::S4K, 32, 32, 6, 16).unwrap().with_cube_copies(6, 3, None).unwrap();
+        assert_eq!(l.base, 18 * 4096);
+        assert_eq!(l.total, (18 + 36) * 4096);
+        // 512x512 BC1 cube, 7 mips, 4 copies: 6 + 18 + 66 (padded to 80) pages.
+        let l = Layout::new(Swizzle::S4K, 128, 128, 7, 8).unwrap().with_cube_copies(6, 4, None).unwrap();
+        assert_eq!(l.base, 104 * 4096);
+        assert_eq!(l.total, (104 + 258) * 4096);
     }
 }

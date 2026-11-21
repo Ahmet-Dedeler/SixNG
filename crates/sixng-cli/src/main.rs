@@ -381,6 +381,9 @@ enum Cmd {
         /// Mip level to decode.
         #[arg(long, default_value_t = 0)]
         mip: u32,
+        /// Decode every slice of array textures and cube maps (<hash>_m<mip>_s<slice>.png); default is slice 0 only.
+        #[arg(long)]
+        all_slices: bool,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -549,7 +552,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"ok": true, "category": category, "results": all}));
         }
-        Cmd::Ttpf { store, hash, first, mip, out: tout } => {
+        Cmd::Ttpf { store, hash, first, mip, all_slices, out: tout } => {
             let a = ws.resolve(store)?;
             let st = sixng_core::ttpf::Ttpf::open(&a.path)?;
             let mut sel: Vec<&sixng_core::ttpf::TtpfTex> = Vec::new();
@@ -568,13 +571,19 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let mut res = Vec::new();
                 for t in sel {
                     let (data, skipped) = st.data_ex(t)?;
-                    let p = dir.join(format!("{:016x}_m{mip}.png", t.hash));
-                    match sixng_core::ttpf::decode_rgba(t, &data, *mip) {
-                        Ok((rgba, w, h)) => {
-                            sixng_core::texture::save_png(&p, &rgba, w, h)?;
-                            res.push(json!({"hash": format!("{:016x}", t.hash), "png": p, "w": w, "h": h, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "undecoded_bytes": skipped}));
+                    let n = if *all_slices { t.slices() } else { 1 };
+                    for sl in 0..n {
+                        let p = if *all_slices && t.slices() > 1 { dir.join(format!("{:016x}_m{mip}_s{sl}.png", t.hash)) } else { dir.join(format!("{:016x}_m{mip}.png", t.hash)) };
+                        match sixng_core::ttpf::decode_rgba_slice(t, &data, *mip, sl) {
+                            Ok((rgba, w, h)) => {
+                                sixng_core::texture::save_png(&p, &rgba, w, h)?;
+                                res.push(json!({"hash": format!("{:016x}", t.hash), "slice": sl, "slices": t.slices(), "png": p, "w": w, "h": h, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "undecoded_bytes": skipped}));
+                            }
+                            Err(e) => {
+                                res.push(json!({"hash": format!("{:016x}", t.hash), "slices": t.slices(), "error": e.to_string()}));
+                                break;
+                            }
                         }
-                        Err(e) => res.push(json!({"hash": format!("{:016x}", t.hash), "error": e.to_string()})),
                     }
                 }
                 out.print(&json!(res));
