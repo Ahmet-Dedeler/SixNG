@@ -442,7 +442,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], model_dir
                 (false, "normal", _) => ([128.0, 128.0, 255.0, 255.0], "flat normal".to_string()),
                 _ => ([128.0, 128.0, 128.0, 255.0], "neutral mid value (linear data map)".to_string()),
             };
-            let fb = serde_json::json!({"reason": "BCPack: no mip outside BCPack chunks (Xbox hardware texture codec, no public decoder)", "role": role, "rgba": rgba, "source": source});
+            let fb = serde_json::json!({"reason": "BCPack: no mip outside BCPack chunks (Xbox hardware texture codec; only BC1 decodes so far)", "role": role, "rgba": rgba, "source": source});
             e["texture_fallback"] = fb.clone();
             if role == "base_color" && base_fb.is_none() {
                 base_fb = Some((rgba, fb));
