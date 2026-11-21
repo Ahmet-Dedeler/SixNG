@@ -18,6 +18,7 @@ pub mod resource;
 pub mod texture;
 pub mod ttpf;
 pub mod gaps;
+pub mod lodlinks;
 pub mod rpf9;
 pub mod scan;
 pub mod surface;

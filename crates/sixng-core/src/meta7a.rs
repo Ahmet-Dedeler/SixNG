@@ -338,17 +338,20 @@ pub fn render_hint(name: Option<&str>, has_model: bool) -> Option<&'static str> 
     None
 }
 
-/// LOD fields of an entity (GTA V `CEntityDef` equivalents, identified
-/// statistically over all of levels.rpf):
-/// `6c8f1715` lodLevel, `d89231bd` parentIndex, `a687ac89` numChildren,
-/// `bf74dfa7` lodDist, `ca974bcd` childLodDist, `84799847` priorityLevel.
-/// `parentIndex` indexes the entities of the map file whose `name_hash`
-/// equals this file's `parent_hash`; it is only valid when field
-/// `e74c3c23` is -1 (otherwise the entity is linked another way, not
-/// decoded, and `d89231bd` means something else).
+/// LOD fields of an entity (GTA V `CEntityDef` member names, confirmed by
+/// their case-sensitive joaat): `6c8f1715` lodLevel, `d89231bd`
+/// parentIndex, `e74c3c23` parentInstance, `a687ac89` numChildren,
+/// `bf74dfa7` lodDist (-1 = the archetype's lodDist), `ca974bcd`
+/// childLodDist, `2691f019` priorityLevel.
+/// With `parentInstance` = -1, `parentIndex` indexes the entities of the
+/// parent map file (named by `parent_hash` when set). With
+/// `parentInstance` >= 0 the parent is that instance of a prop batch in
+/// another map file (LOD slot = entity count + batch index). `sixng
+/// lod-links` resolves both; placements then carry `lod.parent`.
 pub fn entity_lod(f: &BTreeMap<String, serde_json::Value>) -> serde_json::Value {
-    let i = |k: &str| f.get(k).and_then(|v| v.as_i64());
-    let level = i("6c8f1715");
+    let g = |h: u32| f.get(&field_name(h)).or_else(|| f.get(&format!("{h:08x}")));
+    let i = |h: u32| g(h).and_then(|v| v.as_i64());
+    let level = i(0x6c8f_1715);
     let level_name = match level {
         Some(0) => "HD",
         Some(1) => "LOD",
@@ -359,16 +362,18 @@ pub fn entity_lod(f: &BTreeMap<String, serde_json::Value>) -> serde_json::Value 
         Some(6) => "SLOD4",
         _ => "unknown",
     };
-    let linked = i("e74c3c23") == Some(-1);
-    let parent = if linked { i("d89231bd").filter(|&v| v >= 0) } else { None };
+    let instance = i(0xe74c_3c23).filter(|&v| v >= 0);
+    let linked = i(0xe74c_3c23) == Some(-1);
+    let parent = if linked { i(0xd892_31bd).filter(|&v| v >= 0) } else { None };
     serde_json::json!({
         "level": level_name,
         "parent_index": parent,
-        "parent_link": if linked { "parent_file" } else { "other (field e74c3c23 >= 0, not decoded)" },
-        "num_children": i("a687ac89"),
-        "lod_dist": f.get("bf74dfa7"),
-        "child_lod_dist": f.get("ca974bcd"),
-        "priority": i("84799847"),
+        "parent_instance": instance,
+        "parent_link": if instance.is_some() { "batch_instance" } else { "parent_file" },
+        "num_children": i(0xa687_ac89),
+        "lod_dist": g(0xbf74_dfa7),
+        "child_lod_dist": g(0xca97_4bcd),
+        "priority": i(0x2691_f019),
     })
 }
 

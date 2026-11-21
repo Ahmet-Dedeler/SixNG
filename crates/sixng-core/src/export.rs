@@ -891,6 +891,9 @@ pub struct PlacementSummary {
 /// `<out>/placements/<archive>/index.jsonl`. Non-placement resources are skipped.
 pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: &Path, progress: Progress) -> Result<Vec<PlacementSummary>> {
     let names = model_names(ws);
+    // from `sixng lod-links` (empty when not run)
+    let arch_lod = crate::lodlinks::load_archetype_lod(ws);
+    let parents = crate::lodlinks::load_parents(ws);
     let dir = out.join("placements").join(a.id.trim_end_matches(".rpf"));
     fs::create_dir_all(&dir)?;
     let total = entries.len() as u64;
@@ -908,6 +911,21 @@ pub fn export_placements(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], ou
             let p = dir.join(format!("{:x}.json", e.off));
             let mut doc = serde_json::to_value(&mf).ok()?;
             doc["id"] = serde_json::json!(e.id);
+            if let Some(ents) = doc["entities"].as_array_mut() {
+                let ps = parents.get(&e.id);
+                for (i, (j, en)) in ents.iter_mut().zip(&mf.entities).enumerate() {
+                    let lod = &mut j["lod"];
+                    if let Some(al) = arch_lod.get(&en.archetype) {
+                        let own = lod["lod_dist"].as_f64().unwrap_or(-1.0);
+                        lod["archetype_lod_dist"] = serde_json::json!(al.lod_dist);
+                        lod["hd_texture_dist"] = serde_json::json!(al.hd_texture_dist);
+                        lod["effective_lod_dist"] = serde_json::json!(if own > 0.0 { own as f32 } else { al.lod_dist });
+                    }
+                    if let Some(p) = ps.and_then(|m| m.get(&(i as u64))) {
+                        lod["parent"] = p.clone();
+                    }
+                }
+            }
             doc["coordinate_system"] = serde_json::json!("position: RAGE world space, Z-up, right-handed, metres. rotation: quaternion (x, y, z, w) as stored = inverse of the entity rotation (rotation_world is the entity rotation). gltf: node transform to place this entity's model.glb in a Y-up glTF scene (translation = (x, z, -y)). Checked visually on two map files.");
             fs::write(&p, serde_json::to_vec(&doc).ok()?).ok()?;
             let mut lo = [f32::MAX; 3];

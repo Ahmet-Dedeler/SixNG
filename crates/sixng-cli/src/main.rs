@@ -329,6 +329,12 @@ enum Cmd {
         #[arg(default_value = "levels")]
         archive: String,
     },
+    /// Archetype LOD distances and resolved LOD parents of every placement (batch instance or LOD entity): <work>/index/archetype_lod.jsonl and lod_parents.jsonl, merged into placements from then on.
+    LodLinks {
+        /// Archive (default levels).
+        #[arg(default_value = "levels")]
+        archive: String,
+    },
     /// Audio banks (ADAT) in an archive: scan once (index in <work>/index/audio_<archive>.json), then list banks and streams. Stream ids are hashes; names are not recovered.
     Audio {
         /// Archive (default audio).
@@ -827,6 +833,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = export::link_archetypes(&ws, &a, &metas, &unnamed, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64(), "out": ws.index_dir().join("archetype_links.json")}));
+        }
+        Cmd::LodLinks { archive } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let metas: Vec<_> = ix.entries.iter().filter(|e| e.kind == Kind::Resource && e.sub == "7a").collect();
+            let t = Instant::now();
+            let v = sixng_core::lodlinks::build(&ws, &a, &metas, pr)?;
+            out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::Audio { archive, rescan, min_seconds, limit } => {
             use sixng_core::audio;
