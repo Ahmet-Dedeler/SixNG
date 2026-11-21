@@ -368,6 +368,14 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Name dictionary for shader, parameter and meta field hashes (joaat of
+    /// the lower-case name). Without --lookup: build `<work>/names/names.json`
+    /// from the install (common.rpf text/XML and shaders.rpf strings).
+    Names {
+        /// Hashes (hex) to look up instead of building.
+        #[arg(long, value_delimiter = ',')]
+        lookup: Vec<String>,
+    },
     /// Inspect a ttpf texture store: list its textures, or decode some to PNG.
     Ttpf {
         /// Store id or substring (e.g. vehicles/ttdb_vehicles.ttpf).
@@ -551,6 +559,22 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 all.push(do_export_collect(&a, &sel, oa, pr.clone())?);
             }
             out.print(&json!({"ok": true, "category": category, "results": all}));
+        }
+        Cmd::Names { lookup } => {
+            if lookup.is_empty() {
+                let t = Instant::now();
+                let mut r = sixng_core::names::build(&ws.game, &ws.index_dir(), &ws.work)?;
+                r["seconds"] = json!(t.elapsed().as_secs_f64());
+                r["ok"] = json!(true);
+                out.print(&r);
+            } else {
+                let v: Vec<_> = lookup
+                    .iter()
+                    .filter_map(|h| u32::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
+                    .map(|h| json!({"hash": format!("{h:08x}"), "names": sixng_core::names::all(h).into_iter().map(|(n, s)| json!({"name": n, "source": s})).collect::<Vec<_>>()}))
+                    .collect();
+                out.print(&json!({"ok": true, "results": v}));
+            }
         }
         Cmd::Ttpf { store, hash, first, mip, all_slices, out: tout } => {
             let a = ws.resolve(store)?;

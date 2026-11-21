@@ -11,6 +11,7 @@ pub mod export;
 pub mod game;
 pub mod gltf;
 pub mod meta7a;
+pub mod names;
 pub mod material;
 pub mod gfx10;
 pub mod resource;

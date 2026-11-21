@@ -78,7 +78,7 @@ const FIELD_NAMES: &[&str] = &["name", "position", "rotation", "flags", "extensi
 pub fn field_name(h: u32) -> String {
     static M: std::sync::OnceLock<HashMap<u32, &'static str>> = std::sync::OnceLock::new();
     let m = M.get_or_init(|| FIELD_NAMES.iter().map(|n| (joaat(n), *n)).collect());
-    m.get(&h).map(|s| s.to_string()).unwrap_or_else(|| format!("{h:08x}"))
+    m.get(&h).map(|s| s.to_string()).or_else(|| crate::names::lookup(h, crate::names::Ctx::Field)).unwrap_or_else(|| format!("{h:08x}"))
 }
 
 impl<'a> Meta<'a> {

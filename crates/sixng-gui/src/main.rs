@@ -250,6 +250,20 @@ impl App {
         let game = default_game();
         let work = default_work();
         let _ = std::fs::create_dir_all(&work);
+        // shader / parameter / meta field names (<work>/names/names.json)
+        sixng_core::names::set_work_dir(Path::new(&work));
+        if !sixng_core::names::dict_path(Path::new(&work)).exists() && Path::new(game.trim()).is_dir() {
+            // built once in the background (needs the common.rpf index; ~2 s)
+            let (g, w) = (game.trim().to_string(), work.clone());
+            std::thread::spawn(move || {
+                let w = Path::new(&w);
+                let r = sixng_core::names::build(Path::new(&g), &w.join("index"), w);
+                let _ = std::fs::OpenOptions::new().create(true).append(true).open(w.join("gui.log")).and_then(|mut f| {
+                    use std::io::Write;
+                    writeln!(f, "[names] {}", match r { Ok(v) => v.to_string(), Err(e) => format!("not built: {e:#}") })
+                });
+            });
+        }
         let _ = std::fs::OpenOptions::new().create(true).append(true).open(std::path::Path::new(&work).join("gui.log")).and_then(|mut f| { use std::io::Write; writeln!(f, "[start] work = {work} (SIXNG_WORK {}, settings {:?}, file {:?}: {})", std::env::var("SIXNG_WORK").is_ok(), load_settings().work, settings_path(), settings_path().map(|p| match std::fs::read(&p) { Ok(b) => match serde_json::from_slice::<AppSettings>(&b) { Ok(_) => "ok".to_string(), Err(e) => format!("parse error {e}") }, Err(e) => format!("read error {e}") }).unwrap_or_default()) });
         let st = load_settings();
         let thumb_budget_mb = st.thumb_budget_mb.unwrap_or(512);

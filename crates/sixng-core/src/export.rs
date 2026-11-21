@@ -27,7 +27,9 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(game: impl Into<PathBuf>, work: impl Into<PathBuf>) -> Self {
-        Workspace { game: game.into(), work: work.into() }
+        let work = work.into();
+        crate::names::set_work_dir(&work);
+        Workspace { game: game.into(), work }
     }
     pub fn index_dir(&self) -> PathBuf {
         self.work.join("index")
@@ -317,7 +319,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], model_dir
             let mut normal_fallback = None;
             for t in &s.textures {
                 let h = u64::from_str_radix(&t.hash64, 16).unwrap_or(0);
-                let mut e = serde_json::json!({"param": t.param, "param_hash": t.param_hash, "hash64": t.hash64, "hash32": t.hash32});
+                let mut e = serde_json::json!({"param": t.param, "param_hash": t.param_hash, "param_name": crate::names::param(&t.param_hash), "hash64": t.hash64, "hash32": t.hash32});
                 let Some((store, tx)) = set.get(h) else {
                     e["status"] = "not in any ttpf store".into();
                     st.entries.push(e);
@@ -646,7 +648,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         }
                         g
                     },
-                    extras: serde_json::json!({"shader_name_hash": s.name_hash, "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback}),
+                    extras: serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback}),
                 }).collect();
                 for (lod, groups) in lod_groups.iter().enumerate() {
                     if groups.iter().all(|g| g.prims.is_empty()) {
@@ -721,7 +723,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "materials": info.shaders.iter().zip(shader_tex.iter()).map(|(s, st)| {
                     let c = classify_shader(s, st);
                     let mut m = serde_json::json!({
-                        "shader": s.index, "shader_name_hash": s.name_hash, "classification": c,
+                        "shader": s.index, "shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": c,
                         "base_color": if crate::material::is_paint(&s.name_hash) { None } else { st.base.clone() }, "normal": st.normal, "normal_green": "directx (+Y down); invert G for glTF/OpenGL",
                         "textures": st.entries,
                     });
@@ -736,7 +738,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     }
                     m
                 }).collect::<Vec<_>>(),
-                "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families (names are unresolved hashes). slot_role names the PBR map a known parameter slot holds.",
+                "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
             fs::write(&marker, serde_json::to_vec_pretty(&j)?)?;
             item.files.push(rel(&o.out, &marker));
@@ -1155,9 +1157,10 @@ pub fn shader_census(a: &ArchiveInfo, entries: &[&Entry], progress: Progress) ->
     let g = agg.into_inner().unwrap();
     let mut out = serde_json::Map::new();
     for (h, x) in g {
+        let param_names: std::collections::BTreeMap<String, String> = x.params.keys().flat_map(|k| k.split(' ')).filter_map(|p| Some((p.to_string(), crate::names::param(p)?))).collect();
         out.insert(
-            h,
-            serde_json::json!({"count": x.count, "models": x.models, "params": x.params, "formats": x.fmts, "sizes": x.sizes, "record_38": x.rec, "cbuffer_head": x.cb}),
+            h.clone(),
+            serde_json::json!({"name": crate::names::shader(&h), "param_names": param_names, "count": x.count, "models": x.models, "params": x.params, "formats": x.fmts, "sizes": x.sizes, "record_38": x.rec, "cbuffer_head": x.cb}),
         );
     }
     Ok(serde_json::Value::Object(out))

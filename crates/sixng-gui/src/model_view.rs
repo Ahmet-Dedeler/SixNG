@@ -766,16 +766,21 @@ impl ModelView {
                     }
                 }
                 let sel = self.material_sel == Some(k);
-                if ui.selectable_label(sel, egui::RichText::new(format!("{} · {} · {}{}", m.name, m.class, m.alpha_mode, if m.gap == "no colour texture" { " · no colour texture (shown white)" } else { "" })).color(col)).clicked() {
+                // "shader07_<hash>" -> "shader07 standard_vehicle" when the name is known
+                let shown = match sixng_core::names::shader(&m.shader_hash) {
+                    Some(n) => format!("{} {n}", m.name.split('_').next().unwrap_or("")),
+                    None => m.name.clone(),
+                };
+                if ui.selectable_label(sel, egui::RichText::new(format!("{} · {} · {}{}", shown, m.class, m.alpha_mode, if m.gap == "no colour texture" { " · no colour texture (shown white)" } else { "" })).color(col)).clicked() {
                     self.material_sel = if sel { None } else { Some(k) };
                 }
             });
             if self.material_sel == Some(k) {
                 ui.indent(k, |ui| {
-                    ui.label(format!("shader {} · gaps: {}", m.shader_hash, m.gap));
+                    ui.label(format!("shader {} ({}) · gaps: {}", sixng_core::names::shader(&m.shader_hash).unwrap_or_else(|| "name unknown".into()), m.shader_hash, m.gap));
                     for s in &m.slots {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(format!("{} {} {}x{} {} — {}{}", s.role, s.param_hash, s.size[0], s.size[1], s.format, s.status, if s.mip > 0 { format!(" (mip {})", s.mip) } else { String::new() })).small());
+                            ui.label(egui::RichText::new(format!("{} {} {}x{} {} — {}{}", s.role, sixng_core::names::param(&s.param_hash).unwrap_or_else(|| s.param_hash.clone()), s.size[0], s.size[1], s.format, s.status, if s.mip > 0 { format!(" (mip {})", s.mip) } else { String::new() })).small()).on_hover_text(format!("parameter hash {}", s.param_hash));
                             if let Ok(h) = u64::from_str_radix(&s.hash, 16) {
                                 if ui.small_button("view").on_hover_text(format!("open texture {} in the Textures tab", s.hash)).clicked() {
                                     view_tex = Some(h);
