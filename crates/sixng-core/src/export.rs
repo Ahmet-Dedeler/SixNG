@@ -544,12 +544,33 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
                 &r.gfx[(b.gfx_off as usize).min(end)..end]
             };
+            let skin = ped_skin(a, e, &info, &mut item);
             // Triangle meshes: one primitive per geometry, grouped by model.
             let mut mesh_meta = Vec::new();
             let prims_of = |gi: usize, material: Option<usize>, mesh_meta: &mut Vec<serde_json::Value>| -> Option<crate::gltf::TriPrim> {
                 let g = &info.geometries[gi];
                 let h = info.buffers[g.vertex_buffer].mesh_blob.as_ref()?;
-                let m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
+                let mut m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
+                // Ped clothing: joint index -> bone palette -> joint list.
+                if let Some(map) = skin.geometry_map.get(&gi) {
+                    let remap = |js: &mut Vec<[u16; 4]>| js.iter_mut().flatten().for_each(|j| *j = map.get(*j as usize).copied().unwrap_or(u16::MAX));
+                    m.joints.as_mut().map(remap);
+                    m.joints1.as_mut().map(remap);
+                }
+                // Bone indices with non-zero weight in either influence set.
+                let skin_used: Option<Vec<u16>> = m.joints.as_ref().map(|js| {
+                    let w0 = m.weights.as_ref().unwrap();
+                    let mut u: Vec<u16> = Vec::new();
+                    for (i, j) in js.iter().enumerate() {
+                        u.extend((0..4).filter(|&k| w0[i][k] > 0).map(|k| j[k]));
+                        if let (Some(j1), Some(w1)) = (&m.joints1, &m.weights1) {
+                            u.extend((0..4).filter(|&k| w1[i][k] > 0).map(|k| j1[i][k]));
+                        }
+                    }
+                    u.sort();
+                    u.dedup();
+                    u
+                });
                 let name = format!("geom{:02}_{:x}", gi, info.buffers[g.vertex_buffer].gfx_off);
                 let mut bb = [[f32::MAX; 3], [f32::MIN; 3]];
                 for p in &m.positions {
@@ -568,12 +589,16 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     "normals": m.normals.is_some(), "vertex_colors_raw": m.colors.is_some(),
                     "triangles_flipped_to_match_normals": m.flipped, "triangles_dropped": m.dropped, "normals_rebuilt_from_faces": m.rebuilt_normals,
                     "position_axis_order": m.axis_order, "skinned": m.joints.is_some(),
-                    "skin_influences": m.joints.as_ref().map(|j| j.iter().zip(m.weights.as_ref().unwrap()).map(|(a, w)| w.iter().filter(|&&x| x > 0).count().max(1).min(a.len())).max().unwrap_or(1)),
-                    "bones": m.joints.as_ref().map(|b| { let mut u: Vec<u16> = b.iter().zip(m.weights.as_ref().unwrap()).flat_map(|(j, w)| (0..4).filter(|&k| w[k] > 0).map(|k| j[k]).collect::<Vec<_>>()).collect(); u.sort(); u.dedup(); u.iter().filter_map(|&i| info.skeleton.get(i as usize).map(|x| x.name.clone())).collect::<Vec<_>>() }),
+                    "skin_influences": m.joints.as_ref().map(|j| j.iter().zip(m.weights.as_ref().unwrap()).enumerate().map(|(i, (a, w))| w.iter().filter(|&&x| x > 0).count().max(1).min(a.len()) + m.weights1.as_ref().map_or(0, |w1| w1[i].iter().filter(|&&x| x > 0).count())).max().unwrap_or(1)),
+                    "bones": skin_used.as_ref().map(|u| u.iter().filter_map(|&i| skin.joints.get(i as usize).map(|x| x.name.clone())).collect::<Vec<_>>()),
+                    // Joint indices with no bone (out of range, or a palette
+                    // bone that is in neither skeleton); their weight is moved
+                    // to the largest kept influence in the GLB.
+                    "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
                 }));
                 Some(crate::gltf::TriPrim {
                     name, positions: m.positions, normals: m.normals, tangents: m.tangents, uvs: m.uvs.into_iter().map(|u| u.1).collect(),
-                    colors: m.colors, indices: m.indices, material, joints: m.joints, weights: m.weights,
+                    colors: m.colors, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
                 })
             };
             let nlod = info.models.iter().filter(|m| !m.part).map(|m| m.lod + 1).max().unwrap_or(1);
@@ -614,11 +639,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "source_id": e.id, "type": e.rtype, "coordinate_system": COORDS,
                 "surface_hint": e.name.as_deref().and_then(surface_hint),
             });
-            let joints: Vec<crate::gltf::Joint> = if info.skeleton.iter().all(|b| b.bind_matrix.is_some()) {
-                info.skeleton.iter().map(|b| crate::gltf::Joint { name: b.name.clone(), parent: b.parent.map(|p| p as usize), bind: b.bind_matrix.unwrap() }).collect()
-            } else {
-                Vec::new()
-            };
+            let joints = skin.joints;
             let mut glb_file = None;
             let mut lod_files = Vec::new();
             let mut parts_file = None;
@@ -766,6 +787,71 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
         item.files.push(rel(&o.out, &p));
     }
     Ok(item)
+}
+
+/// Joint list of a drawable's GLB skin, and for ped clothing the joint
+/// index remap of each geometry.
+struct SkinSetup {
+    joints: Vec<crate::gltf::Joint>,
+    /// geometry index -> (vertex joint index -> joint list index; u16::MAX = none)
+    geometry_map: std::collections::HashMap<usize, Vec<u16>>,
+}
+
+/// Skin joints for a drawable. Normally the drawable's own skeleton, bone k =
+/// joint k. Ped clothing (models with a bone palette that names the
+/// drawable's own bones) indexes the palette instead; the joint list is then
+/// the shared ped skeleton followed by the drawable's own bones. The own
+/// `GM_U01_*` helper bones store a parent-relative bind (their parent in the
+/// shared skeleton is not known), so their joint positions are not in model
+/// space; the rest pose is unaffected.
+fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, item: &mut ExportedItem) -> SkinSetup {
+    use crate::gltf::Joint;
+    let joint = |b: &crate::drawable::Bone, off: usize| Joint { name: b.name.clone(), parent: b.parent.map(|p| p as usize + off), bind: b.bind_matrix.unwrap() };
+    let own_ok = info.skeleton.iter().all(|b| b.bind_matrix.is_some());
+    let own: Vec<Joint> = if own_ok { info.skeleton.iter().map(|b| joint(b, 0)).collect() } else { Vec::new() };
+    let mut out = SkinSetup { joints: own, geometry_map: Default::default() };
+    let own_hash: std::collections::HashMap<u32, usize> = info.skeleton.iter().enumerate().map(|(i, b)| (crate::meta7a::joaat(&b.name), i)).collect();
+    let cand: Vec<(&crate::drawable::Model, &Vec<u32>)> = info.models.iter().filter_map(|m| m.bone_palette.as_ref().map(|p| (m, p))).collect();
+    // A ped drawable: some palette names one of the drawable's own bones
+    // (the ascending check alone is not proof).
+    if !own_ok || !cand.iter().any(|(_, p)| p.iter().any(|h| own_hash.contains_key(h))) {
+        return out;
+    }
+    let female = crate::pedskel::is_female_name(e.name.as_deref().unwrap_or(""));
+    let ped = crate::pedskel::get(&game_root(a), female);
+    let n_ped = ped.map_or(0, |p| p.bones.len());
+    // Each model's palette is used when most of its bones resolve (lower LODs
+    // may name only shared-skeleton bones).
+    let known = |h: &u32| own_hash.contains_key(h) || ped.is_some_and(|p| p.by_hash.contains_key(h));
+    let pal: Vec<_> = cand.into_iter().filter(|(_, p)| p.iter().filter(|h| known(h)).count() * 10 >= p.len() * 9 || (ped.is_none() && p.iter().any(|h| own_hash.contains_key(h)))).collect();
+    if let Some(p) = ped {
+        let mut j: Vec<Joint> = p.bones.iter().map(|b| joint(b, 0)).collect();
+        j.extend(info.skeleton.iter().map(|b| joint(b, n_ped)));
+        out.joints = j;
+    } else {
+        item.warnings.push(format!("ped clothing skin: shared ped skeleton ({}) not found in the packs index; only the drawable's own bones are bound", crate::pedskel::source_name(female)));
+    }
+    let resolve = |h: &u32| -> u16 {
+        if let Some(&i) = ped.and_then(|p| p.by_hash.get(h)) {
+            return i as u16;
+        }
+        own_hash.get(h).map_or(u16::MAX, |&i| (i + n_ped) as u16)
+    };
+    let mut missing: Vec<u32> = Vec::new();
+    for (m, p) in pal {
+        let map: Vec<u16> = p.iter().map(resolve).collect();
+        missing.extend(p.iter().zip(&map).filter(|(_, &x)| x == u16::MAX).map(|(h, _)| *h));
+        for &g in &m.geometries {
+            out.geometry_map.insert(g, map.clone());
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    if !missing.is_empty() && ped.is_some() {
+        let hx: Vec<String> = missing.iter().map(|h| format!("{h:08x}")).collect();
+        item.warnings.push(format!("ped clothing skin: {} palette bones are in neither skeleton (joaat {}); their weight goes to other influences", missing.len(), hx.join(" ")));
+    }
+    out
 }
 
 fn export_texture(r: &Resource, t: &texture::TexInfo, dir: &Path, o: &ExportOptions, item: &mut ExportedItem) -> Result<Vec<String>> {

@@ -397,6 +397,11 @@ pub struct Mesh {
     /// Skin weights per vertex (u8, sum 255). Stream 6 (format 0x26) when
     /// stream 8 has 4 indices; otherwise (255, 0, 0, 0).
     pub weights: Option<Vec<[u8; 4]>>,
+    /// Second influence set (influences 5-8): stream 9 (format 0x25, 4 x u8
+    /// joint indices) and stream 7 (format 0x26, weights). Seen on ped
+    /// meshes; the 8 weights together sum to 255 and are sorted descending.
+    pub joints1: Option<Vec<[u16; 4]>>,
+    pub weights1: Option<Vec<[u8; 4]>>,
     /// Tangents (x, y, z, w), model space like the normals: stream 11,
     /// format 0x27 = R10G10B10A2 (xyz = v / 1023 * 2 - 1, A2 = 3 when the
     /// bitangent is flipped, so w = -1). Orthonormalised against the normal.
@@ -577,6 +582,12 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
             vec![[255, 0, 0, 0]; j.len()]
         }
     });
+    // Influences 5-8 (peds): only next to a 4-index blend set.
+    let quad = |slot: u32, fmt: u32| stream(slot).filter(|s| s.1 == fmt).and_then(|s| blob.get(s.0..s.0 + 4 * v)).map(|b| b.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect::<Vec<[u8; 4]>>());
+    let (joints1, weights1) = match (blend && matches!(stream(8).map(|s| s.1), Some(0x25)), quad(9, 0x25), quad(7, 0x26)) {
+        (true, Some(j), Some(w)) if w.iter().any(|x| x.iter().any(|&y| y > 0)) => (Some(j.iter().map(|c| c.map(|x| x as u16)).collect::<Vec<_>>()), Some(w)),
+        _ => (None, None),
+    };
     if std::env::var_os("SIXNG_DEBUG_SKIN").is_some() {
         eprintln!("skin: v={v} stream8 fmt={:?} width={jw} max={:?}", stream(8).map(|s| s.1), joints.as_ref().map(|j| j.iter().flatten().max().copied()));
     }
@@ -624,7 +635,7 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
                 for k in 0..n0 { let x = indices[k] + v as u32; indices.push(x); }
                 for u in uvs.iter_mut() { let c = u.1.clone(); u.1.extend(c); }
                 let colors: Option<Vec<[u8; 4]>> = colors.map(|c: Vec<[u8; 4]>| { let mut d = c.clone(); d.extend(c); d });
-                return Mesh { positions: pos2, normals: Some(nrm2), uvs, colors, indices, flipped: 0, dropped, axis_order: [0, 1, 2], joints: None, weights: None, tangents: None, rebuilt_normals: 0 };
+                return Mesh { positions: pos2, normals: Some(nrm2), uvs, colors, indices, flipped: 0, dropped, axis_order: [0, 1, 2], joints: None, weights: None, joints1: None, weights1: None, tangents: None, rebuilt_normals: 0 };
             }
         }
     }
@@ -733,7 +744,7 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
             .map(|(i, c)| tangent_decode(u32::from_le_bytes(c.try_into().unwrap()), normals.as_ref().map(|n| n[i])))
             .collect::<Vec<_>>()
     });
-    Mesh { positions, normals, uvs, colors, indices, flipped, dropped, axis_order, joints, weights, tangents, rebuilt_normals }
+    Mesh { positions, normals, uvs, colors, indices, flipped, dropped, axis_order, joints, weights, joints1, weights1, tangents, rebuilt_normals }
 }
 
 /// A geometry: a mesh blob paired with its meshlet index buffer.
@@ -790,6 +801,29 @@ pub struct Model {
     /// (fragment child, nested sub-drawable). `lod` is then 0.
     #[serde(default)]
     pub part: bool,
+    /// Skinning palette (peds): the vertex joint indices of this model's
+    /// geometries index this list of bone name hashes (joaat, sorted
+    /// ascending), not the drawable's own bone order. The bones are the
+    /// drawable's own (`GM_U01_*` girth helpers) and bones of the shared ped
+    /// skeleton, which is not in the file. Model record: +0x0C u16 count,
+    /// +0x20 pointer. Vehicle models use these fields for something else
+    /// (the list is not ascending), so only an ascending list is taken.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bone_palette: Option<Vec<u32>>,
+}
+
+/// Bone palette of a model record (see `Model::bone_palette`).
+fn model_palette(r: &Resource, o: usize) -> Option<Vec<u32>> {
+    let n = r.u16(o + 12) as usize;
+    if !(2..=1024).contains(&n) {
+        return None;
+    }
+    let p = r.sys_off(r.u64(o + 0x20))?;
+    if p + 4 * n > r.sys.len() {
+        return None;
+    }
+    let v: Vec<u32> = (0..n).map(|k| r.u32(p + 4 * k)).collect();
+    v.windows(2).all(|w| w[0] < w[1]).then_some(v)
 }
 
 /// One shader instance (64-byte record tagged "atem"): +0x00 u32 shader
@@ -876,7 +910,7 @@ pub fn find_models(r: &Resource, geoms: &[Geometry]) -> Vec<Model> {
             if let (Some(a), Some(m)) = (r.sys_off(r.u64(o)), r.sys_off(r.u64(o + 0x18))) {
                 let g: Option<Vec<usize>> = (0..n).map(|k| r.sys_off(r.u64(a + 8 * k)).and_then(|x| by_rec.get(&x).copied())).collect();
                 if let Some(g) = g {
-                    out.push(Model { struct_off: o as u64, geometries: g, shader_indices: (0..n).map(|k| r.u16(m + 2 * k)).collect(), lod: 0, part: false });
+                    out.push(Model { struct_off: o as u64, geometries: g, shader_indices: (0..n).map(|k| r.u16(m + 2 * k)).collect(), lod: 0, part: false, bone_palette: model_palette(r, o) });
                 }
             }
         }

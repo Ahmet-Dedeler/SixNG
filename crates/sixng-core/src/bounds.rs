@@ -352,6 +352,8 @@ impl Collision {
                 material: Some(mats.len() - 1),
                 joints: None,
                 weights: None,
+                joints1: None,
+                weights1: None,
             });
         }
         mesh_glb(name, &[NodeGroup { name: name.to_string(), prims }], &mats, &[], extras)

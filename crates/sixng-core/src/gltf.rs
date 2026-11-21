@@ -32,6 +32,10 @@ pub struct TriPrim {
     /// (sum 255), written as JOINTS_0 / WEIGHTS_0 when a skeleton is given.
     pub joints: Option<Vec<[u16; 4]>>,
     pub weights: Option<Vec<[u8; 4]>>,
+    /// Influences 5-8, written as JOINTS_1 / WEIGHTS_1. The 8 weights
+    /// together sum to 255.
+    pub joints1: Option<Vec<[u16; 4]>>,
+    pub weights1: Option<Vec<[u8; 4]>>,
 }
 
 /// A skeleton joint: name, parent index, bind pose (bone -> model,
@@ -269,29 +273,52 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
             if let (true, Some(js)) = (skinned, &p.joints) {
                 let n = skeleton.len();
                 let ws = p.weights.clone().unwrap_or_else(|| vec![[255, 0, 0, 0]; js.len()]);
-                let wide = js.iter().flatten().any(|&j| j > 255 && (j as usize) < n);
-                let mut jb: Vec<u8> = Vec::with_capacity(js.len() * 8);
-                let mut wb = Vec::with_capacity(js.len() * 4);
-                for (j, w) in js.iter().zip(ws.iter()) {
-                    for k in 0..4 {
-                        let ok = (j[k] as usize) < n;
-                        let id = if ok { j[k] } else { 0 };
-                        if wide { jb.extend_from_slice(&id.to_le_bytes()) } else { jb.push(id as u8) }
-                        wb.push(if ok { w[k] } else { 0 });
+                // Influences 5-8 when present (both sets together sum to 255).
+                let second = match (&p.joints1, &p.weights1) {
+                    (Some(j1), Some(w1)) if j1.len() == js.len() && w1.len() == js.len() => Some((j1, w1)),
+                    _ => None,
+                };
+                let sets = if second.is_some() { 2 } else { 1 };
+                let wide = js.iter().chain(second.iter().flat_map(|s| s.0.iter())).flatten().any(|&j| j > 255 && (j as usize) < n);
+                let mut jb: Vec<Vec<u8>> = vec![Vec::with_capacity(js.len() * 8); sets];
+                let mut wb: Vec<Vec<u8>> = vec![Vec::with_capacity(js.len() * 4); sets];
+                for i in 0..js.len() {
+                    let mut jj = [0u16; 8];
+                    let mut ww = [0u8; 8];
+                    jj[..4].copy_from_slice(&js[i]);
+                    ww[..4].copy_from_slice(&ws[i]);
+                    if let Some((j1, w1)) = second {
+                        jj[4..].copy_from_slice(&j1[i]);
+                        ww[4..].copy_from_slice(&w1[i]);
                     }
-                    // keep weights summing to 255 if an index was dropped
-                    let l = wb.len();
-                    let sum: u32 = wb[l - 4..].iter().map(|&x| x as u32).sum();
+                    for k in 0..4 * sets {
+                        if (jj[k] as usize) >= n {
+                            jj[k] = 0;
+                            ww[k] = 0;
+                        }
+                    }
+                    // keep weights summing to 255 if an index was dropped:
+                    // the remainder goes to the largest kept weight
+                    let sum: u32 = ww.iter().map(|&x| x as u32).sum();
                     if sum != 255 {
-                        wb[l - 4] = (wb[l - 4] as u32 + 255u32.saturating_sub(sum)).min(255) as u8;
+                        let top = (0..4 * sets).max_by_key(|&k| ww[k]).unwrap_or(0);
+                        ww[top] = (ww[top] as u32 + 255u32.saturating_sub(sum)).min(255) as u8;
+                    }
+                    for s in 0..sets {
+                        for k in 4 * s..4 * s + 4 {
+                            if wide { jb[s].extend_from_slice(&jj[k].to_le_bytes()) } else { jb[s].push(jj[k] as u8) }
+                            wb[s].push(ww[k]);
+                        }
                     }
                 }
-                let bv = b.view(&jb, Some(34962));
-                b.accessors.push(json!({"bufferView": bv, "componentType": if wide { 5123 } else { 5121 }, "count": js.len(), "type": "VEC4"}));
-                attrs["JOINTS_0"] = json!(b.accessors.len() - 1);
-                let bv = b.view(&wb, Some(34962));
-                b.accessors.push(json!({"bufferView": bv, "componentType": 5121, "normalized": true, "count": js.len(), "type": "VEC4"}));
-                attrs["WEIGHTS_0"] = json!(b.accessors.len() - 1);
+                for s in 0..sets {
+                    let bv = b.view(&jb[s], Some(34962));
+                    b.accessors.push(json!({"bufferView": bv, "componentType": if wide { 5123 } else { 5121 }, "count": js.len(), "type": "VEC4"}));
+                    attrs[format!("JOINTS_{s}")] = json!(b.accessors.len() - 1);
+                    let bv = b.view(&wb[s], Some(34962));
+                    b.accessors.push(json!({"bufferView": bv, "componentType": 5121, "normalized": true, "count": js.len(), "type": "VEC4"}));
+                    attrs[format!("WEIGHTS_{s}")] = json!(b.accessors.len() - 1);
+                }
             }
             let mut prim = json!({"attributes": attrs, "indices": b.indices(&p.indices), "mode": 4});
             if let Some(m) = p.material.filter(|&m| m < mats.len()) {

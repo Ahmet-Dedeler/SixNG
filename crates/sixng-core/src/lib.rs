@@ -5,6 +5,7 @@ pub mod classify;
 pub mod navmesh;
 pub mod lights;
 pub mod paths;
+pub mod pedskel;
 pub mod batches;
 pub mod drawable;
 pub mod export;

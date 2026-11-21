@@ -104,6 +104,11 @@ pub fn set_work_dir(work: &Path) {
     let _ = WORK.set(work.to_path_buf());
 }
 
+/// The work directory set by `set_work_dir` (via `export::Workspace::new`).
+pub fn work_dir() -> Option<PathBuf> {
+    WORK.get().cloned()
+}
+
 pub fn dict_path(work: &Path) -> PathBuf {
     work.join("names").join("names.json")
 }
