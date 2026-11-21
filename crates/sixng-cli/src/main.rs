@@ -364,6 +364,21 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Bink videos in movies.rpf (stored uncompressed, so the stream index has none): lists every video with size, resolution, frame rate, duration and audio tracks in <out>/movies/movies.json. With --extract, writes the .bk2 files as they are (playable in any Bink 2 player); all of them take about 8.8 GB, so --only picks some.
+    Movies {
+        /// Archive (default movies).
+        #[arg(default_value = "movies")]
+        archive: String,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+        /// Write the .bk2 files (all, or those given with --only).
+        #[arg(long)]
+        extract: bool,
+        /// Comma-separated hex offsets (from movies.json) to extract.
+        #[arg(long)]
+        only: Option<String>,
+    },
     /// Interior membership of every placement: per map file its space (world, interior-local, group-local) and per entity its interior, room and entity set: <work>/index/interior_entities.jsonl. Placements carry the same fields.
     InteriorEntities {
         /// Archive (default levels).
@@ -433,6 +448,9 @@ enum Cmd {
         /// Decode every slice of array textures and cube maps (<hash>_m<mip>_s<slice>.png); default is slice 0 only.
         #[arg(long)]
         all_slices: bool,
+        /// Decode every texture in the store (in parallel) and write <out>/index.json; prints a summary instead of every result.
+        #[arg(long)]
+        all: bool,
         #[arg(long)]
         out: Option<PathBuf>,
     },
@@ -617,7 +635,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 out.print(&json!({"ok": true, "results": v}));
             }
         }
-        Cmd::Ttpf { store, hash, first, mip, all_slices, out: tout } => {
+        Cmd::Ttpf { store, hash, first, mip, all_slices, all, out: tout } => {
             let a = ws.resolve(store)?;
             let st = sixng_core::ttpf::Ttpf::open(&a.path)?;
             let mut sel: Vec<&sixng_core::ttpf::TtpfTex> = Vec::new();
@@ -628,30 +646,53 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if let Some(n) = first {
                 sel.extend(st.textures.iter().take(*n));
             }
+            if *all {
+                sel = st.textures.iter().collect();
+            }
             if sel.is_empty() {
                 out.print(&json!({"store": a.id, "virt_size": st.virt_size, "textures": st.textures}));
             } else {
                 let dir = tout.clone().unwrap_or_else(|| PathBuf::from("work/ttpf"));
                 std::fs::create_dir_all(&dir)?;
-                let mut res = Vec::new();
-                for t in sel {
-                    let (data, skipped) = st.data_ex(t)?;
+                use rayon::prelude::*;
+                let one = |t: &sixng_core::ttpf::TtpfTex| -> Vec<serde_json::Value> {
+                    let mut res = Vec::new();
+                    let (data, skipped) = match st.data_ex(t) {
+                        Ok(x) => x,
+                        Err(e) => return vec![json!({"hash": format!("{:016x}", t.hash), "slices": t.slices(), "error": e.to_string()})],
+                    };
+                    // Data entirely in BCPack chunks (no decoder yet): the PNG
+                    // would be blank, so --all writes nothing for it.
+                    if *all && skipped >= t.size as u64 {
+                        return vec![json!({"hash": format!("{:016x}", t.hash), "w": t.width, "h": t.height, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "error": "all data in BCPack chunks (not decodable yet)", "bcpack_only": true})];
+                    }
                     let n = if *all_slices { t.slices() } else { 1 };
                     for sl in 0..n {
                         let p = if *all_slices && t.slices() > 1 { dir.join(format!("{:016x}_m{mip}_s{sl}.png", t.hash)) } else { dir.join(format!("{:016x}_m{mip}.png", t.hash)) };
-                        match sixng_core::ttpf::decode_rgba_slice(t, &data, *mip, sl) {
-                            Ok((rgba, w, h)) => {
-                                sixng_core::texture::save_png(&p, &rgba, w, h)?;
-                                res.push(json!({"hash": format!("{:016x}", t.hash), "slice": sl, "slices": t.slices(), "png": p, "w": w, "h": h, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "undecoded_bytes": skipped}));
-                            }
+                        let r = sixng_core::ttpf::decode_rgba_slice(t, &data, *mip, sl).and_then(|(rgba, w, h)| sixng_core::texture::save_png(&p, &rgba, w, h).map(|_| (w, h)));
+                        match r {
+                            Ok((w, h)) => res.push(json!({"hash": format!("{:016x}", t.hash), "slice": sl, "slices": t.slices(), "png": p, "w": w, "h": h, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "undecoded_bytes": skipped, "partial": skipped > 0})),
                             Err(e) => {
                                 res.push(json!({"hash": format!("{:016x}", t.hash), "slices": t.slices(), "error": e.to_string()}));
                                 break;
                             }
                         }
                     }
+                    res
+                };
+                let res: Vec<serde_json::Value> = if *all { sel.par_iter().flat_map(|t| one(t)).collect() } else { sel.iter().flat_map(|t| one(t)).collect() };
+                if *all {
+                    let ok = res.iter().filter(|r| r.get("png").is_some()).count();
+                    let partial = res.iter().filter(|r| r["partial"] == true).count();
+                    let bcpack = res.iter().filter(|r| r["bcpack_only"] == true).count();
+                    let failed = res.len() - ok - bcpack;
+                    let idx = dir.join("index.json");
+                    let note = "One PNG per texture (<hash>_m<mip>.png). partial = some of the data is in BCPack chunks, so part of the image is blank or noise; bcpack_only = nothing decodable yet, no PNG written. Names are not recovered (64-bit hashes).";
+                    std::fs::write(&idx, serde_json::to_vec_pretty(&json!({"note": note, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "results": res}))?)?;
+                    out.print(&json!({"ok": true, "store": a.id, "textures": st.textures.len(), "written": ok, "complete": ok - partial, "partial": partial, "bcpack_only": bcpack, "failed": failed, "index": idx}));
+                } else {
+                    out.print(&json!(res));
                 }
-                out.print(&json!(res));
             }
         }
         Cmd::Placements { archive, filter, out: po, batches, batches_only } => {
@@ -898,6 +939,34 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = sixng_core::vehicles::export(&a, &metas, &names, po)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+        }
+        Cmd::Movies { archive, out: po, extract, only } => {
+            let a = ws.resolve(archive)?;
+            let t = Instant::now();
+            let movies = sixng_core::bink::scan(&a.path, &pr)?;
+            let dir = po.join("movies");
+            std::fs::create_dir_all(&dir)?;
+            let pick: Option<Vec<String>> = only.as_ref().map(|s| s.split(',').map(|x| x.trim().trim_start_matches("0x").to_ascii_lowercase()).filter(|x| !x.is_empty()).collect());
+            let mut written = Vec::new();
+            if *extract {
+                for m in &movies {
+                    if pick.as_ref().is_some_and(|p| !p.contains(&m.offset_hex)) {
+                        continue;
+                    }
+                    let dest = dir.join(format!("{}_{}x{}.bk2", m.offset_hex, m.width, m.height));
+                    sixng_core::bink::extract(&a.path, m, &dest)?;
+                    written.push(dest);
+                }
+            }
+            let total: u64 = movies.iter().map(|m| m.size).sum();
+            let secs: f64 = movies.iter().map(|m| m.seconds).sum();
+            let file = dir.join("movies.json");
+            std::fs::write(&file, serde_json::to_vec_pretty(&json!({
+                "note": "Bink videos carved from the archive by their headers (4 KiB aligned; names are not recovered, so each is named by its offset). Frames are not decoded; the .bk2 files play in any Bink 2 player.",
+                "archive": a.id, "count": movies.len(), "bytes": total, "seconds": secs, "movies": movies,
+            }))?)?;
+            let bad = movies.iter().filter(|m| !m.frame_table_ok).count();
+            out.print(&json!({"ok": true, "archive": a.id, "movies": movies.len(), "frame_table_not_checked": bad, "bytes": total, "minutes": secs / 60.0, "extracted": written.len(), "file": file, "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::InteriorEntities { archive } => {
             let a = ws.resolve(archive)?;

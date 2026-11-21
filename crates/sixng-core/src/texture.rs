@@ -272,6 +272,22 @@ pub fn mip0_linear(r: &Resource, t: &TexInfo, linear_input: bool) -> Result<(Fmt
     let ew = t.width.div_ceil(bd);
     let eh = t.height.div_ceil(bd);
     let bpe = fmt.bytes_per_elem();
+    // Small textures with mips (e.g. 32x32 BC3 HUD icons) keep their whole
+    // chain in one 4 KiB mip-tail block, mip 0 included: there is no
+    // separate mip-0 page after the tail. Untile mip 0 from the tail block
+    // (Gfx10 SW_4KB_S tail layout).
+    if !linear_input && t.mips > 1 {
+        if let Some(l) = crate::gfx10::Layout::new(crate::gfx10::Swizzle::S4K, ew, eh, t.mips, bpe) {
+            if l.mips[0].tail.is_some() {
+                let start = t.data_off as usize;
+                if start >= r.gfx.len() {
+                    return Err(anyhow!("texture data out of range"));
+                }
+                let end = (start + l.block_bytes as usize).min(r.gfx.len());
+                return Ok((fmt, l.untile(&r.gfx[start..end], 0)));
+            }
+        }
+    }
     let padded = (ew.div_ceil(16) * 16 * eh.div_ceil(16) * 16 * bpe) as u64;
     let start = (t.data_off + mip0_off) as usize;
     let len = if linear_input { (ew * eh * bpe) as usize } else { padded as usize };
