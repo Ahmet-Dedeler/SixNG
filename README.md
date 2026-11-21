@@ -1,0 +1,574 @@
+<p align="center"><img src="assets/logo/sixng_banner.png" alt="SixNG" width="640"></p>
+
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
+
+# SixNG Extractor
+
+An asset extractor for your own GTA VI install (Xbox Series build, RPF9
+archives). It is meant for personal modding.
+
+There is one Rust core library with two front ends:
+
+- `sixng`: a CLI with JSON output, filters, categories and resumable runs.
+- `sixng-gui`: a desktop app to open an install, browse and search it,
+  preview items and extract a selection.
+
+> **Game data never goes in git.** Indexes, extracted output and scratch
+> files all go under `work/` (or any `--out` you choose). `work/` and every
+> `*.png/*.dds/*.glb` file are in `.gitignore`.
+
+| Shaded | UV checker + wireframe |
+|---|---|
+| ![Model viewer, shaded](docs/images/model_viewer.png) | ![Model viewer, UV checker](docs/images/model_viewer_uv.png) |
+
+*Screenshots show the app with a generated demo scene (crates, a barrel and a ground plane), not game content.*
+
+> **BCPack textures are not decoded, and support is not planned soon.**
+> BCPack is the Xbox Series hardware texture compression. There is no
+> public decoder or specification, and SixNG does not include one. About
+> 12 % of the game's textures have their full-size image stored in
+> BCPack. SixNG uses the largest smaller mip that is stored normally when
+> there is one (about 4 % of textures). The rest (about 8 %) get a flat
+> fallback colour, flagged as `texture_fallback` in `model.json`. Please
+> don't open issues asking for BCPack support: it is a known gap, and
+> requests won't speed it up.
+
+## Status
+
+| Area | State |
+|------|-------|
+| RPF9 header | **works**: parsed and shown by `sixng info` |
+| RPF9 TOC / file names | **not read**: the TOC is encrypted and SixNG does not decrypt it. Contents are found by carving the zlib streams instead, with names recovered from inside resources. |
+| Listing / search | **works**: carving index plus name recovery. On `levels.rpf`: 523,552 entries (1.12 M zlib streams, 98.3 % byte coverage), 227,766 named (drawables, fragments, texture dictionaries). A full index takes about 3 min. |
+| Textures in texture dictionaries and models | **works** for BC1/BC2/BC3/BC4/BC5/BC6H/BC7: Xbox tiling removed, PNG and DDS output, checked visually. RGBA8 tiling is unverified. Only slice 0 of arrays is exported. BCPack-only textures get a flat fallback colour, flagged `texture_fallback` in `model.json`. Which materials are affected, and how much of the map they cover: `sixng texture-gaps` → `work/texture_gaps.json`. |
+| Bulk texture stores (`data/ttdb/*.ttpf`) | **works for 84.6 % of all 352 K textures** (vehicles 96.7 %, maps 91.8 %, props/peds/interiors ~90 %, terrain 66 %, ui 57 %). The layout is AMD Gfx10: tile mode 0 = `SW_64KB_D`, modes 1–3 = `SW_4KB_S`, with the addrlib mip tail. That covers all sizes, including the car body/detail textures and the small ones. Each mip was checked against the next one downsampled, and the results were viewed on UI images, atlases, billboards, vehicle detail maps and normal atlases. **BCPack** (the Xbox Series hardware texture codec, one codec id per BC format; no public decoder, no zlib copies; rounds 6-8 mapped the stream layout (a 48-byte header of 8 lane records: a block-mode lane, a constant lane, six endpoint channel planes; indices in a shared stream after it) and matched the coder exactly for the constant lanes (byte-wise rANS, 16-bit probabilities, L = 2^24), but there is no decoder yet): 12.4 % of textures have mip 0 in BCPack chunks. 4.1 % are **exported at a lower mip** (1–3) that sits in zlib chunks (`mip_used` in `model.json`); **8.3 % stay undecoded** and 4-/2-byte formats (1 %). `sixng ttpf <store>` lists a store or decodes textures by hash. |
+| Models (drawables `.#dr`, fragments/vehicles `.#ft`) | **works (geometry, LODs, skeleton, skinning); partial (materials)**: one GLB per LOD (`model.glb`, `model_lodN.glb`), with triangle meshes, normals and every UV set (UV0–UV3), one node per geometry, Y-up, metres. Fragments carry their **skeleton as glTF joints with correct pivots** and a **skin** (JOINTS_0/WEIGHTS_0 from the game's bone streams; u16 joints for skeletons over 255 bones, fixed 2026-11-20: earlier vehicle exports have wrong bones on interior, lamp, window and bumper geometries and should be re-exported). Checked in a glTF viewer (three.js) on `phoenix_mid` and three map pieces: shaded, normals, UV checker, joint markers, textured. **Materials link `ttpf` textures** (base colour and normal map, picked from the parameter hash and format) where they decode: on the map samples about half the materials get a base colour and a normal map. Material and texture **names** are still hashes (`shaderNN_<hash>`). **Tangents** (`TANGENT`, decoded from the game's tangent stream) are written where the mesh has one. Vertex colours are raw. Both models that had no geometry in the placement test now decode: a second small system stream is now detected, which recovered geometry for about 10 % of multi-stream models that had none. **Cables and pool/fountain water** (float-position vertex blobs) decode since 2026-11-20; cables are widened into crossed 2 cm ribbons because the game widens them in a shader. Since the same date, a stricter system-stream rule recovers **fragment props** and some **64 m `_hd` ground tiles** whose graphics page was being read as system data. In a BeamNG test box this took the models with no geometry from 74 to 0. Fragments get a real bbox in `model.json` (`drawable.bounds`; `bounds_raw` is meaningless on fragments). Occluder and water-vegetation LOD buffers are still not decoded. **LOD levels** come from the main drawable's LOD group since 2026-11-20. Earlier exports ranked every model array, so fragment props (streetlights, signs) got a small base plate or bracket as `model.glb` and buildings got trim strips as `model_lodN.glb`; re-export those. Embedded-drawable models now go to `model_parts.glb`. **Two-layer blend materials** (walls, ground pieces) get a `multilayer` block: base/layer-2 colour, normal and data textures, UV set and weight channel (COLOR0.a). |
+| Vehicles | **partial**: the body exports with pivots, skin and LODs; `^phoenix` gives 248 parts with 0 errors, including the `_dmg_mod_*` damage parts and mod-kit parts. **Wheels are shared models** (`rim_*`, `tyre_*`) placed at `model.json` → `wheel_mounts`. A test fit in all four arches looks right, but the per-vehicle wheel size and which rim the car uses are not decoded yet. **Textures**: 33 of `phoenix_mid`'s texture hashes now decode: interior, lights, trim, the shared detail masks (dirt, grime, scratches, decals) and normal atlases. **Paint**: the body's colour slot is an engine-default white texture; the colour is applied at runtime and the vehicle colour tables are **not decoded** (the vehicle/mod-kit table is a PSO with 64-bit field hashes). Handling data has not been located. |
+| Textures in unusual formats (R16/R32 float, …) | **skipped with a warning**. The texture JSON is still written; DDS export works where the format is known. |
+| Map placements | **works**: `sixng placements` decodes the map files (self-describing `0x7a` resources, the GTA V `.ymap` equivalent): **2,249,490 entities in 30,785 files** in `levels.rpf`, 95 % resolved to a named, exportable model. The count rose from 1.47 M after the resource stream-split fix. Position, rotation, scale, flags and GUID are decoded. **LOD hierarchy**: each entity has `lod {level (HD/LOD/SLOD1–4/ORPHAN_HD), parent_index, num_children, lod_dist, child_lod_dist, priority}`. `index.jsonl` gives each file's `parent_id`, the file that `parent_index` points into. Checked: every link goes one level up, and the median parent distance is 0.47 m. A second grouping linkage (field `e74c3c23` ≥ 0) is not decoded; other fields are kept by hash. `data.rpf` and `packs.rpf` contain no map files. Checked visually: two map files (a tower block with its base, walkway and planting, and an industrial site) rendered from their exported models line up. |
+| Collision (physics bounds) | **works (geometry); partial (surface names)**: `sixng collision [levels]` decodes the unnamed bound resources in `levels.rpf` (the GTA V `.ybn` equivalent: composite → geometry bounds with triangles, boxes, spheres, capsules, cylinders) to one GLB per file in world coordinates, **split into one primitive per surface id**, plus `index.jsonl` (bbox, polygon counts, materials, primitive list) and `surfaces.json`. Surface ids are 15-bit hashes of the names in the game's material list (`ROAD_TARMAC`, `TRACK_GRASS_SHORT`, `METAL_RAILING` …); the hash function is unknown, so names are not attached yet. Checked visually: a building with window openings, a car park with railings and pillars, and terrain with coherent surface patches. A sample of 400 entries gave 353 bounds; the whole archive is about 87 K files, ~15 GB of GLB. |
+| Lights | **works (position, colour, direction); partial (other attributes)**: `sixng lights [levels]` follows the light extensions on archetypes and entities (GTA V `CExtensionDefLightEffect` / `CLightAttrDef` equivalent) through the meta pool references and writes `lights/levels/sets.jsonl` (**136,466 light sets, 274,819 lights** with local position, RGB colour, direction/tangent and every other field by hash) and `world.jsonl` (**624,184 placed lights** in world space, transformed by each entity that uses the archetype). Checked visually: the whole-map plot reads like a night satellite view, and a 1 km city cell shows lamp rows along both edges of a bridge and the arterials, and grids over car parks. The light fields are now named from their own member hashes (case-sensitive joaat of the GTA V `CLightAttr` names): `intensity`, `falloff` (range), `falloffExponent`, cone angles, corona, volumetric and fade distances, `timeFlags`; 774,847 placed lights including interiors. ~1 min, ~0.7 GB. |
+| Navmesh, road surface | **works (navmesh, road polygons, lane graph)**: `sixng navmesh [--roads-only]` decodes the navmesh tiles in `navmeshes.rpf` (GTA V `.ynv` equivalent, 128 m tiles) to GLB in world coordinates, one primitive per polygon flag; **flag 0x2000 = road surface** (checked visually). `sixng paths levels` writes the road/path-node graph (GTA V `.ynd` equivalent): 63,808 nodes with speed limit, street hash, **named node flags** (34 of 51: NoGps, Junction, InTunnel, Highway slip / exit, Stop, Yield, Bridge, WaterNode …), road class and density; 145,518 links with length, lane counts per direction and named flags (GpsCanGoBothWays, LeadsToDeadEnd / LeadsFromDeadEnd from the game's names; unpaved / track, two-way and no-ambient-traffic (bit 6) inferred); and **1,546 junctions** with entrances, turn paths and, for 369 signalised ones, **traffic-light phases** (duration and the placed traffic-light props, matched by entity hash for 99.6 %). |
+| XML / text metadata | **works**: exported as is. |
+| PSO / RBF metadata | **raw only**: the field names are hashed. |
+
+## Setup and build
+
+You need Rust 1.80+ (stable) on Windows. There are no other dependencies.
+
+```powershell
+cd SixNG
+cargo build --release
+```
+
+This produces `target\release\sixng.exe` (CLI) and
+`target\release\sixng-gui.exe` (GUI).
+
+There is no default game folder; you set it once:
+
+- CLI: `--game <folder>` or the `SIXNG_GAME` environment variable, or the
+  folder saved by the GUI. Without one, the CLI stops with a message that
+  says how to set it.
+- GUI: on first start it asks for the game folder (the one with the
+  `.rpf` archives) and saves it to `sixng-settings.json` next to the exe (or
+  `%APPDATA%\SixNG\settings.json` if that folder is not writable).
+  Change it later on the Browser tab (**💾 Save**). `SIXNG_GAME` overrides
+  the saved folder.
+
+The work directory (indexes, output, caches) defaults to `./work` for the
+CLI and to a `work` folder next to the exe for the GUI; override it with
+`--work`, `SIXNG_WORK` or the saved setting. The GUI does not search parent
+folders, so it behaves the same wherever it is launched from. Restart
+after saving new folders.
+
+## Disk space
+
+The install is about 224 GB. Indexes are small: `levels.rpf` gives about
+95 MB of JSON. Output sizes depend on what you extract:
+
+| Extract | Items | Approximate output |
+|---------|-------|--------------------|
+| one vehicle (`vehicles --name '^phoenix'`) | 248 parts | about 100 MB (incl. GLBs) |
+| `textures` (every texture dictionary, PNG) | 2,486 | **about 5.4 GB** |
+| `map` (`levels.rpf` drawables + PSO/RBF/XML) | 183,200 | **about 93 GB** raw, plus GLBs; on the samples GLBs roughly double the output, so plan for **~180 GB** |
+| `vehicles` (every fragment not matching the prop/char prefix list) | 37,056 | **about 8 GB** raw; **~15 GB** with GLBs |
+| `meta` (XML/PSO/RBF/text from data and common) | 3,763 | about 0.2 GB |
+| all of `levels.rpf` decompressed | 523 K | **about 175 GB** |
+| `sixng placements levels` | 27,946 map files | **about 1.3 GB** JSON, ~1.5 min |
+| `sixng placements levels --batches-only` | 906,922 instanced batches: 24.9 M prop + 219 M grass instances | **about 5.8 GB** (0.3 GB `batches.jsonl`, 1.1 GB `batch_props.bin`, 4.4 GB `batch_grass.bin`), ~2.5 min |
+| `sixng collision levels` | ~77 K bounds files | **about 15 GB** GLB |
+| `sixng navmesh --roads-only` | 27,644 tiles | about 0.25 GB GLB (a full navmesh export is ~25 GB) |
+| `sixng lights levels` | 188 K meta files scanned | about 0.7 GB JSONL, ~1.5 min |
+| `sixng interiors levels` / `sixng paths levels` | 2,590 interiors / 63,808 nodes + 1,546 junctions | about 15 MB / 40 MB JSON |
+| any of collision, navmesh, placements, lights with `--bbox=minx,miny,maxx,maxy` | one region | e.g. a 500 m box: about 110 MB of collision |
+| `ttpf` textures linked by models (PNG, `--tex png`) | shared | about **0.6 MB per texture** (1–4 MB for the 2048 px vehicle maps). Each texture is written once per output folder: `phoenix_mid` writes 33 (≈ 60 MB). A full `map` extract references most of the ~200 K map/terrain store textures, about 85 % of which decode: plan for **~100 GB** of PNG on top of the figures above. `--tex dds` alone skips them. |
+
+These figures come from `--dry-run` on this install; the `map` and
+`vehicles` totals are decompressed sizes. The `vehicles` category is a
+name heuristic, so it also catches some non-vehicle fragments. Narrow it
+with `--name`.
+
+Always run with `--dry-run` first. It prints the selection count and the
+decompressed byte total without writing anything.
+
+## CLI
+
+All commands print one JSON document on stdout; add `--pretty` to indent
+it. Progress goes to stderr as NDJSON events:
+`{"event":"progress","stage":…,"done":…,"total":…,"pct":…}`. `--quiet`
+turns them off. On error the CLI prints `{"ok":false,"error":…}` and
+exits with code 1.
+
+```powershell
+# What is in the install, and what is indexed
+.\target\release\sixng.exe info
+
+# Build indexes (resumable: re-running continues from checkpoints).
+# Takes about 6 min for levels.rpf on NVMe. With no arguments, indexes every RPF9 archive.
+.\target\release\sixng.exe index levels textures packs data common
+
+# List entries (filters: --kind, --rtype, --name <regex>, --exclude-name, --id, --id-file, --min-size, --limit)
+.\target\release\sixng.exe list levels --rtype txd --limit 20 --pretty
+.\target\release\sixng.exe list levels --rtype ft --name '^phoenix' --ndjson
+
+# Search names across all indexed archives
+.\target\release\sixng.exe search 'elegy|buffalo' --archive levels
+
+# Describe one entry without writing files
+.\target\release\sixng.exe inspect 'levels.rpf@10f2d2d010' --pretty
+
+# Extract by filter
+.\target\release\sixng.exe extract levels --rtype txd --name '^island' -o work\out --tex both
+
+# Map placements (entity lists: model, position, rotation, scale) for all of levels.rpf, ~1.5 min, ~1.3 GB JSON
+.\target\release\sixng.exe placements levels -o work\out
+# Instanced grass / prop batches (instance transforms; binary, ~5.8 GB, ~2.5 min). --batches adds them to the normal run
+.\target\release\sixng.exe placements levels -o work\out --batches-only
+# Collision GLBs split by surface id (~15 GB), road polygons from the navmesh, placed lights
+.\target\release\sixng.exe collision levels -o work\out
+.\target\release\sixng.exe navmesh --roads-only -o work\out
+.\target\release\sixng.exe lights levels -o work\out
+# Interior instances (world transform, entities, matched collision) and the road/lane graph
+.\target\release\sixng.exe interiors levels -o work\out
+.\target\release\sixng.exe paths levels -o work\out
+# Inferred collision surface categories (after collision, paths, placements --batches; ~3 min)
+.\target\release\sixng.exe surfaces levels -o work\out
+# Link archetypes whose drawable has no recovered name (bbox + archive-order match; ~9 min, once after indexing).
+# Writes work\index\archetype_links.json; placements / lights pick it up automatically
+.\target\release\sixng.exe link-archetypes levels
+# BCPack texture gaps: every material with flat / low-mip textures, slot roles, class, terrain-layer
+# surface guesses and placement weight (~6 min; uses placements, batches, collision, surfaces)
+.\target\release\sixng.exe texture-gaps levels -o work\out --file work\texture_gaps.json --placements work\out\placements\levels
+# Or every world-data step in order (placements, batches, collision, navmesh, paths, lights, interiors, surfaces)
+.\target\release\sixng.exe world all -o work\out
+# Restrict the big exports to one region (RAGE metres; use "=" so negative values parse)
+.\target\release\sixng.exe collision levels -o work\out --bbox=-1500,-1500,-1000,-1000
+
+# Schema index of every self-describing meta resource (0x7a) in an archive; --dump adds JSON
+.\target\release\sixng.exe meta data -o work\out
+
+# Built-in categories: textures | map | vehicles | meta
+.\target\release\sixng.exe extract-category vehicles --name '^phoenix' -o work\out
+.\target\release\sixng.exe extract-category map --limit 200 -o work\out --dry-run
+```
+
+Output options: `--tex png|dds|both|none` (DDS = original BCn with a mip chain; `none` writes no texture files, which is useful for geometry-only re-exports), `--raw` (also write the decompressed
+bytes), `--force` (redo items already done), `--no-embedded-textures`,
+`--dry-run`.
+
+**Resumable runs:** every item writes a marker file when it finishes, and
+items that already have outputs are skipped. To continue a stopped
+`extract`, run the same command again. Each run appends one line per item
+to `<out>/manifest.jsonl`.
+
+The summary JSON gives `exported`, `skipped`, `error_count` and `errors`
+(item failures), plus `warning_count` and `warnings` (non-fatal problems,
+for example one texture in an unsupported format). Each list shows at
+most 50 items; the manifest has everything.
+
+## GUI
+
+```powershell
+.\target\release\sixng-gui.exe
+```
+
+1. **Game** and **Work** are set from the same defaults as the CLI. Use
+   **Browse…** to choose another install.
+2. The left panel lists the archives. Click **Index** on any that are not
+   indexed yet; a progress bar shows while it runs.
+3. The middle panel shows the entries of the selected archive. Filter
+   them with a regex search and the kind and type drop-downs. Tick rows,
+   then use **Extract selected** or **Extract all N filtered** to export
+   into **Output**. The **PNG** and **DDS** check boxes set the texture
+   formats.
+4. The right panel previews the selected entry:
+   - texture dictionaries: pick a texture and see it decoded;
+   - models: their JSON description;
+   - text and binary: a text or hex view.
+5. The **World data** row runs the whole-map exports into **Output**, with
+   the same default selection as the CLI (`sixng world <step>`):
+   Placements, Batches, Collision, Road navmesh, Lane graph, Lights,
+   Interiors (with the collision second pass) and Surfaces. Run them left
+   to right; Interiors needs Collision, and Surfaces needs Collision, Lane
+   graph and Batches.
+
+The GUI renders with wgpu (Direct3D 12 / Vulkan). Its tabs are
+**Browser** (above), **Model viewer**, **Map 2D** and **Map 3D**.
+
+### Model viewer
+
+Pick a model from the **Models** list on the left. It holds every
+drawable and fragment in `levels.rpf` and `packs.rpf` (about 254 K), in
+these categories: Vehicles (about 240, plus their `_hi` copies), Vehicle
+parts, Wheels, Weapons, Props, Vegetation, Interiors, Buildings & map, and
+Unnamed.
+- Search box: words match names and ids.
+- **hide LOD copies** (on by default) hides `_lod`/`_slod`/batch-LOD/`_mid`
+  copies.
+- ☆ marks favourites; there's a **favourites only** filter and a
+  **Recent** list. Both are saved in `<work>/gui_models.json`.
+- Click to load. **Up / Down** (or ◀ ▶) step through the list.
+- **☰ Models** hides the panel.
+
+You can also open by entry id (`levels.rpf@10f266d010`), by name regex
+(`^phoenix_hi$`, searched in `levels`; `data:^w_pi` for another
+archive), from an exported `.glb`, or with **Open in model viewer** in
+the Browser. Entries are exported on the fly into `<work>/gui_cache_v2`
+(models plus PNG textures; v2 since the 2026-11-20 LOD fix).
+
+- Shading: base colour, normal map (DirectX green), packed
+  roughness/metal/AO with a channel-order switch, alpha / cutout / decal /
+  glass classes (blended back to front), emissive.
+- Car paint: primary, secondary (per material **2nd**; rims use it),
+  pearl colour and amount, finish (metallic, matte, chrome, gloss).
+- **LOD** buttons switch between `model.glb` and `model_lodN.glb`.
+- Debug views: albedo, normals, UV checker, single texture slot (base,
+  normal, packed, emissive), **BCPack gaps** (green ok, amber low-mip,
+  red flat, from the export's texture status), vertex colour, lighting
+  only; wireframe overlay, normal lines.
+- Skeleton with joint axes and labels. The **Rig** sliders spin the
+  wheels and open the four doors. Cars with `wheel_mounts` get the shared
+  rim and tyre (default `rim_muscle_001_hi` / `tyre_muscle_001_hi` at
+  scale 0.37; the real wheel size is not decoded yet).
+- Orbit camera (drag, right-drag pan, wheel zoom, double-click to frame),
+  or fly camera (WASD/QE, Shift); time of day, exposure, ambient, emissive
+  strength and a wet look.
+- Per-material list: class, alpha mode, gap status, every texture slot
+  with size, format and status; show/hide and solo.
+- **Screenshot** saves the 3D view and the whole window to
+  `<work>/screenshots/`.
+
+### Map 2D
+
+First bake the map from the world exports (`sixng world all` output in
+`work/out`, plus full placements in `work/placements_full`).
+
+**🍞 Bake map** (or **🔄 Re-bake map**) at the top of the Map 2D and Map
+3D tabs does this in the app:
+- It runs in a separate process, with progress from the log, a
+  **Cancel** button and the elapsed time. Both map tabs reload when it
+  finishes; it takes about 2 minutes.
+- It lists missing world data. Placements are required; the other layers
+  are optional, and the button says which Browser → World data steps to
+  run.
+
+From the command line:
+
+```powershell
+.\target\release\sixng-gui.exe --bake-map
+```
+
+This writes `work/map/` (log in `work/map/bake.log`):
+
+- **Raster tile pyramid**: `tiles/<layer>/<z>/<x>_<y>.png`, 256 px tiles,
+  2 m per pixel at the top level. Layers:
+  - terrain: hill-shaded top collision surface;
+  - collision surface categories;
+  - building footprints;
+  - navmesh;
+  - vegetation/prop density;
+  - texture-gap heatmap;
+  - LOD regions;
+  - water / no collision.
+- **Vector data**: `roads.json`, `junctions.json`, `lights.bin`,
+  `entities.bin`, `strings.json`, `interiors.json`, and the 8 m height
+  grid `heights_8m.bin`.
+
+The **Map 2D** tab shows it:
+
+- Pan with drag; zoom with the wheel, around the cursor.
+- Pick a base layer (terrain, surfaces or water). Every other raster
+  layer is an overlay with its own opacity.
+- Lane graph: coloured by speed limit, lane count or road class. Width
+  follows the lane count; one-way links get arrows.
+- Junctions: signalised ones cycle through their phase durations; stop
+  and yield entrances are marked.
+- Lights: exterior/interior toggles, and an hour slider that applies
+  each light's on/off-hours mask (`time_flags`).
+- Interiors are drawn as outlines.
+- **Inspect**: hover shows the footprint under the cursor; click opens
+  the placement (model id, archetype, kind, LOD level, position in game
+  and glTF axes, size, map file, lights inside). **Open in model viewer**
+  goes to the model.
+- **Search**: by name, model id or archetype hash; all hits are circled
+  and listed.
+- **Measure**: click points; right-click clears.
+- **Box select**: shows the `--bbox` for region exports.
+- The readout gives game x/y/z and the glTF/BeamNG (x, z, −y) position.
+
+Map screenshots: `--tab map2d --center X,Y --mpp M --base N --overlays
+2,3 [--lights --hour H] [--search name] --screenshot out.png --exit`.
+
+### Map 3D
+
+The **Map 3D** tab is a fly-through of the placed models, streamed from the
+baked map (`entities.bin`; bake first with `--bake-map`):
+
+- Fly: drag to look, WASD/arrows to move, Q/E down/up, Shift faster. The
+  speed scales with height above ground.
+- Models are exported on demand into `<work>/gui_cache_v2` (the model
+  viewer's cache) by background workers, nearest first, and drawn
+  instanced: one GPU model per model id, all its placements as instances.
+  Textures are shared between models and sized by distance (full size in
+  the HD band, then 1/2, 1/4, 1/8).
+- **Detail** slider: sets the LOD distance bands (HD, LOD, SLOD1–4), prop
+  and vegetation density and the minimum screen size. Each can be tuned
+  on its own, together with the drawable LOD file and the texture cap.
+- **HD fallback** (on by default): most LOD-level placements have no linked
+  model yet (unresolved archetype hashes; about 88 % around downtown), so
+  large HD models stay visible out to 1.75× the HD distance and the LOD
+  level is skipped. SLOD placements mostly carry a placeholder unit-cube
+  bbox, so they are never culled by screen size.
+- Terrain: a 7 km mesh from the 8 m heights. The bake stores the top
+  collision surface (roofs included), so the mesh is a morphological
+  opening of it (min then max over about 100 m), which removes buildings
+  but keeps hills.
+- Overlays: roads (by speed) and exterior lights (by hour) as lines; a
+  draggable **Minimap** window (click to move there) and a **Stream**
+  window (entities, models wanted/loaded, queue, instances, triangles,
+  textures, per-band counts, memory). Click a model to inspect it (bbox
+  outline, name, model id, LOD level, kind, position) and **Open in model
+  viewer**.
+- **LOD hand-off**: the bake keeps each placement's resolved LOD parent,
+  `lod_dist` and `child_lod_dist`. A parent LOD/SLOD stays drawn until the
+  camera is inside its `child_lod_dist` *and* every child has loaded; then
+  the children replace it, so the two are never drawn together. A child
+  whose parent has no model stays out to the parent's distance. Unlinked
+  placements use the distance bands. Distances scale with the detail
+  slider.
+- **Proxies hidden**: interior-shell, shadow, light and VFX proxies,
+  placements without a model and degenerate (< 1 cm) models are not drawn;
+  **show proxies / placeholders** draws them (`--show-proxies`). The same
+  rule writes `render: false` + `render_reason` into the placements.
+- **Decals and depth**: decal-bucket materials (markings, grime, signage,
+  terrain blend layers) are drawn after opaque geometry, by layer order,
+  with a small depth bias; the depth buffer is reversed-Z 32-bit float.
+  **decal depth bias** (`--no-decal-bias`) turns the decal pass off for
+  comparison; the model viewer has the same toggle.
+- **Memory**: the limits scale with the installed RAM. Above 20 % of RAM
+  (the soft cap) the streamer loads only nearby models at 64 px and drops
+  everything off screen; above 30 % (the hard cap) it also drops the
+  farthest visible models. The texture budget is RAM/16 (0.5–3 GB) and the
+  model cap is 120 per GB (800–8,000). The **Memory** panel shows usage
+  against the caps; untick **automatic** to set your own limit with the
+  slider. It is saved in `<work>/gui_settings.json`.
+
+- **Lighting**: ambient light comes from a mostly desaturated sky, and the
+  fog fades towards a half-desaturated sky, so surfaces keep their texture
+  colour instead of turning blue-white. **packed data** (Light panel)
+  picks how the packed material-data texture is read; the default
+  **ignore packed** is used because its channel order is unverified and
+  the common maps (R = G = 0, B ≈ 0.5) read as "R = roughness" made every
+  surface a mirror. The model viewer's default is the same (`--rma 3`).
+- **Placeholder textures**: textures of 8 px or less (engine defaults such
+  as a 4×4 all-zero data map or a flat-black normal map) are ignored in
+  the normal and packed slots (they made walls black). Opaque materials
+  whose every decoded texture is such a placeholder are hidden on the map
+  (they showed as floating black boxes); the model viewer still shows them.
+
+Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
+DEG --detail 0-1 [--tod H] [--lights] [--roads] [--no-terrain] [--fog F]
+[--max-tex PX] [--no-textures] [--no-hd-fallback] [--kinds a,b]
+[--lods a,b] [--ram-cap GB] [--no-windows] [--no-decal-bias]
+[--show-proxies] --screenshot out.png --exit`.
+The shot waits until every wanted model is loaded (15-minute limit) and
+also saves `out_ui.png` with the panels.
+
+Screenshots from the command line (for checks and docs):
+
+```powershell
+.\target\release\sixng-gui.exe --model levels.rpf@10f266d010 --mode 5 --yaw 2.4 --pitch 0.25 --screenshot car.png --exit
+```
+
+Options: `--lod N`, `--mode 0-7` (shaded, albedo, normals, UV, slot,
+gaps, vertex colour, lighting), `--slot 0-3`, `--rma 0-3`, `--wire`,
+`--skeleton`, `--normals`, `--tod H`, `--paint r,g,b`, `--finish 0-3`,
+`--pearl A`, `--wet A`, `--exposure E`, `--spin R`, `--door R`, `--yaw R`,
+`--pitch R`, `--zoom F`, `--size WxH`.
+
+### Textures
+
+The **🖼 Textures** tab lists every texture in the game's texture stores
+(`data/ttdb/*.ttpf`, about 352 K), filtered by store, format, minimum size
+and hash. Pick one to see a decoded mip (the largest one that is not
+BCPack-compressed, at most 2048 px, by default; any mip from the list),
+as RGBA, RGB or a single channel, zoomed to fit or 0–8×. **Export PNG**
+saves the shown mip to `<work>/out/textures/<hash>_m<mip>.png`, and
+**Show in Explorer** opens it. Textures have no names, only their 64-bit
+hash, the same `hash64` that `model.json` lists for each material slot:
+in the Model viewer, open a material and click **view** on a slot to jump
+here. From the command line: `--texture <hash>` (or `--tab textures`)
+with `--window-screenshot out.png --exit`.
+
+## Output layout
+
+```
+<out>/
+  manifest.jsonl                       one line per exported item
+  textures/<archive>/<name>_<off>/     a texture dictionary
+    dictionary.json
+    <texture>.png / .dds / .json       mip 0, plus per-texture metadata
+  models/<archive>/<name>_<off>/       a drawable or fragment
+    model.glb, model_lodN.glb          triangle meshes per LOD (glTF 2.0, Y-up, metres;
+                                       fragments: skeleton joints + skin):
+                                       root > modelN > geomNN_<off> nodes, POSITION,
+                                       NORMAL, TANGENT, TEXCOORD_0..3, _COLOR0 (raw), one
+                                       double-sided material per shader
+    model_parts.glb                    models of embedded drawables (fragment children,
+                                       building sub-drawables): parts, not LODs (2026-11-20)
+    points.glb                         only for mesh blobs with no index buffer
+    model.json                         name, type, source streams, vertex/triangle
+                                       counts, coordinate_system, surface_hint,
+                                       meshes[] (material, uv_sets, normals, ...),
+                                       drawable.models[] / shaders[] (hashes),
+                                       drawable.skeleton[] (node hierarchy),
+                                       buffers (+ mesh-blob headers),
+                                       embedded textures, strings (bones / attach points)
+    buffers/NN_<gfxoff>.bin            raw GPU buffers
+    sys.bin                            decompressed system page
+    textures/                          embedded textures (PNG/DDS)
+  textures/ttpf/<hash>.png / .json     textures from the data/ttdb stores, shared by
+                                       all models (written once; .json = size, mean
+                                       colour, normal-map test). GLB materials link
+                                       them as ../../../textures/ttpf/<hash>.png
+  raw/<archive>/<name>_<off>.<ext>     anything else (xml, pso, rbf, bin…)
+  placements/<archive>/<off>.json      one map file (`sixng placements`): entities[] with
+                                       archetype (joaat), name + model_id when the model
+                                       is indexed, position (RAGE Z-up), rotation (as
+                                       stored = inverse), rotation_world, scale_xy/scale_z,
+                                       flags, guid, gltf {translation, rotation, scale}
+                                       ready for placing model.glb in a Y-up scene, and
+                                       every other scalar field by hash; render: false +
+                                       render_reason for proxies/placeholders; plus the map
+                                       file's own fields (extents, parent hash)
+  placements/<archive>/index.jsonl     one line per map file: id, entity count, resolved
+                                       count, position bounding box
+```
+
+Entry ids are `<archive>@<hex offset>` (for example `levels.rpf@10f2d2d010`).
+They are stable for a given install, so you can use them in scripts and
+with `--id`.
+
+## Using the output downstream (game engines, BeamNG.drive, Assetto Corsa)
+
+The extractor's output is meant as an intermediate format for mods, for
+example in a custom game engine, BeamNG.drive or Assetto Corsa. This table says what each
+of them needs and what the output provides today.
+
+| Need | Status in the output |
+|------|----------------------|
+| **Scale and axes** | **Done.** 1 unit = 1 m. Source data is RAGE Z-up, right-handed. `model.glb` (and `points.glb`) are glTF Y-up, with `glb(x, y, z) = rage(x, z, −y)`. Blender's glTF importer converts back to Z-up. The same note is in every `model.json` (`coordinate_system`) and in the GLB scene `extras`. |
+| **Meshes → FBX (Blender/assimp → ksEditor → KN5)** | **Usable.** `model.glb` holds real triangle meshes. Each geometry is its own named node and mesh (`geomNN_<offset>`) with one material, grouped under `modelN` nodes. Blender's glTF importer, followed by FBX export, keeps the split. `phoenix_mid` models 0–2 are the intact car; 3–5 are an alternate set (probably damage) with the same layout, so delete or hide them. Small bone-space parts (hubs, rods) are offset until pivots are solved. About 3 % of triangles were re-wound to match the stored normals; all materials are double-sided. |
+| **Per-mesh material names** | **Partial: stable but hashed.** Every geometry has a material named `shaderNN_<shader-name-hash>`, for example `shader03_77d8ab27`. Geometries that share a shader share a material. The hashes (shader, parameters, texture references) are kept in the material `extras` and in `model.json` → `materials[]` / `drawable.shaders[]`. Texture hashes now resolve to `ttpf` textures (see below), but shader and parameter names do not: they are not joaat/FNV of any of ~238 K known names. |
+| **Vertex normals, UV sets (incl. UV2)** | **Done.** `NORMAL` (decoded from octahedral) and `TEXCOORD_0..3` (the second set, UV1, is `TEXCOORD_1`, which ksEditor's UV2 needs) are written wherever the mesh has them. `meshes[]` lists `uv_sets`, `uv_slots` and `normals` per geometry. `TANGENT` (x, y, z, w) is the game's own tangent where the geometry has one (most vehicle parts; about a sixth of map geometries); elsewhere let the importer generate it. |
+| **Textures as DDS** | **Done for texture dictionaries; PNG only for `ttpf`.** Use `--tex both` or `--tex dds`. The DDS keeps the **original BCn data** (untiled, not re-encoded), with a DX10 header and a mip chain down to 128 px. The smallest mips are left out because their packed layout is not solved; a partial chain is valid DDS. `ttpf` textures linked by models are written as PNG (mip 0) to `textures/ttpf/`. |
+| **Drivable surface split (`1ROAD`, `1GRASS`, `1KERB` …)** | **Partial.** The collision export (`sixng collision`) splits every collision mesh by surface id (one glTF primitive each), but the ids are not mapped to names (the hash is unknown). Inferred categories (road surface, dirt track, hard surface, paved ground, grass / vegetated soil, forest floor, wetland, walls, shore, seabed, generic) cover 98.3 % of collision area (90.8 % at high or medium confidence; `sixng surfaces`): `collision/<archive>/surface_categories.json`. Separately, `model.json` → `surface_hint` (`road`, `kerb`, `sidewalk`, `grass`, `dirt`, `vegetation` or null) is guessed from the model name, e.g. `ap_road_upper_a` → `road`. |
+| **Vehicle node hierarchy and pivots** | **Done.** `model.json` → `drawable.skeleton[]` gives every node with its parent and its model-space `pivot` / `bind_matrix` (from the game's inverse bind matrices). In the GLB, the skeleton is a glTF joint hierarchy with matching local transforms. Verified on `phoenix_mid`: wheels at (±0.79, 1.37) / (±0.76, −1.36), bonnet and boot hinges, door hinges and lamps all symmetric and in place. glTF forward is −Z (RAGE +Y). |
+| **Handling / physics metadata** | **Not found yet.** It is probably in PSO/RBF metadata (exported raw by the `meta` category) with hashed field names. |
+| **AI lines, pit/start positions** | **Partial.** The lane graph (`sixng paths`: node positions, links, lane counts, speed limits) gives road centrelines to derive an AI line from; road polygons come from the navmesh. No start positions found. |
+
+Recommended flags for these consumers:
+
+```powershell
+# Car: every part, DDS + PNG, metadata incl. skeleton
+.\target\release\sixng.exe extract-category vehicles --name '^phoenix' -o work\out --tex both
+# Track pieces whose names look like roads, with surface hints
+.\target\release\sixng.exe extract levels --rtype dr --name 'road|_rd_|kerb|carpark' -o work\out --tex both --dry-run
+```
+
+### Custom Shaders Patch (CSP) needs
+
+For Assetto Corsa mods that target CSP, this table tracks what the extractor
+provides for each one and steers what gets decoded next.
+
+Status key:
+- **now**: exported.
+- **partial**: exported, but incomplete or unverified.
+- **raw**: the data is exported but not decoded.
+- **unknown**: not located yet.
+
+#### Format limits
+
+| CSP need | Status | Notes |
+|----------|--------|-------|
+| KN5 16-bit indices (≤ 65,535 vertices per mesh) | **now** | `meshes[].vertex_count` and `meshes[].exceeds_kn5_16bit_limit` per geometry. The game's own remap is u16, so a single geometry never exceeds the limit, but merging meshes in the converter can. |
+| Normals | **now** | `NORMAL`. |
+| Tangents | **done** | Stream slot 11 (format 0x27) is R10G10B10A2: xyz in model space, A2 = bitangent sign. Written as glTF `TANGENT` (w = ±1), orthonormalised against the normal. Checked against tangents computed from UV0 (mean \|dot\| 1.000, sign agreement 0.999) and rendered with normal maps. Geometries without the stream have no tangents; let the importer generate them there. Normal maps are DirectX convention (green down). |
+| UV2 (`.uv2`: scenery AO, car stickers) | **now** | Every UV set is written. `TEXCOORD_1` is the game's second set. Values are as stored, so they are not guaranteed to be in 0..1; check before using half precision. |
+| Vertex colours (tint, AO bake source) | **partial** | `_COLOR0` holds the raw RGBA8 of stream 1. Its meaning is unverified. Streams 12 and 13 (also RGBA8) are not exported. |
+
+#### Materials
+
+| CSP need | Status | Notes |
+|----------|--------|-------|
+| Stable, readable mesh and material names | **partial** | The names are stable (`geomNN_<offset>`, `shaderNN_<hash>`, `textures/ttpf/<hash>.png`) but not readable: shader, parameter and texture names are hashed and unresolved. |
+| The game shader or material class per material | **partial (classified)** | Shader names are unresolved hashes (unknown hash function). Each material in `model.json` has a `classification`: `class` (opaque / alpha / cutout / decal / glass / window / emissive / water / terrain_multilayer / car_paint), `render_bucket` from the shader record flags, `alpha_mode` (glTF OPAQUE/MASK/BLEND, also set in the GLB), `instanced_or_batch_lod`, the shader `family` where known, and for decal-bucket materials `decal {bias_m, order, order_source, depth_write}`: draw after opaque geometry in ascending `order` (terrain blend layers 0, other decals 1; no per-material priority is known), offset by `bias_m` toward the camera. Buckets come from flags measured over 254 K drawables. Glass, window, emissive and terrain classes come from a list of known shader families. Emissive has no flag, so unknown emissive shaders show as opaque. |
+| PBR maps (albedo, normal, roughness, metal, AO) and channel layout | **partial** | Base colour and normal map are linked in the GLB when they decode. `model.json` → `materials[]` lists every slot with its parameter hash, format, size, tile mode, `role_guess`, `slot_role` (what a known slot holds), and the PNG path or why it is missing. **Normal maps are DirectX (green down)**: invert G for glTF/Blender/OpenGL. Engines that use the DirectX convention take them as they are; check each converter. Roughness/metal/AO sit in packed linear slots (`739e3d0d`, `c6f46e79`). They are exported as PNG but not mapped. Channel statistics and a visual sheet suggest `c6f46e79` = R binary mask (metal?), G roughness or gloss, B AO/cavity, A unused; this is not confirmed. |
+| Emissive flag and emissive textures | **unknown** | This needs parameter names or a known emissive shader hash. |
+| Transparency / alpha-blend flag (glass) | **unknown** | It is probably in the shader record's +0x38 bytes or the draw bucket, which is not decoded. |
+| RainFX classes (asphalt, lines, grass, glass, cloth) | **partial** | `surface_hint` from model names only. |
+| Terrain RGBA blend masks, multilayer layers | **unknown** | |
+| Window, water, screen and horizon tagging | **unknown** | This needs shader names. Water type (sea, lake, pond, pool) is not located. |
+
+#### Map
+
+| CSP need | Status | Notes |
+|----------|--------|-------|
+| Instancing and placements (archetype, transform, LODs) | **works (transform); partial (LODs)** | `sixng placements` writes every entity with its model name, entry id and a ready-made glTF transform. Models are still exported once per archetype, never baked. LOD parent/child links are in the per-entity fields but not interpreted. Interiors: `sixng interiors` gives each of the 2,590 interior instances a world transform and its entity list. **Instanced batches** (grass, weeds, debris, fences, reflectors, `*_batch_slod` LODs): `--batches[-only]` writes `batches.jsonl` (one line per batch: archetype, model name, bbox, LOD distance, `first` / `count` into the binary) plus `batch_props.bin` (44 B per instance: position f32×3, quaternion xyzw f32×4, scale f32×3, tint RGBA u8×4) and `batch_grass.bin` (20 B per instance: position f32×3, normal x/y u8, colour u8×3, scale u8, AO u8, pad). All 906,922 batches decode, 99.76 % with model names. |
+| Trees and bushes separately, with LODs and placements | **works (placements); partial (LODs)** | Tree and plant models export like any drawable, and their instances (e.g. `veg_pot_hedge_lrg_02` × 25 in one sample) come out of `sixng placements` with scale. |
+| Light emitters (position, colour, range, cone, night flag) | **works** | `sixng lights`: 774,847 placed lights in world space, interiors included. Intensity, falloff (range), falloff exponent, cone, corona, volumetric and fade fields are named from the game's own field hashes. |
+| Collision split by surface type; walls identifiable | **works (split); partial (names)** | `sixng collision`: one GLB per bounds file, one primitive per surface id, in world coordinates. Surface ids are unnamed hashes; inferred categories (`sixng surfaces`) cover 98.3 % of area, each with a confidence (90.8 % high or medium), from plants and props standing on each surface, path-link density, slope and height. Interior collision: `sixng interiors` links 70.7 % of interior archetypes (`collision_linked`, ~91 % precision on the ordered links); its second pass links the rest by fitting the interior's entities onto candidate collision floors, for 97.8 % in all, 79.3 % at high or medium confidence. |
+| Dynamic props: mass, centre of gravity, collider primitives | **unknown** | Fragment physics data is not decoded yet. |
+| Animated props, rail and tram paths | **unknown** | `anim.rpf` and path data are not decoded. |
+| Tunnel and bridge extents; billboard, TV and skyline meshes | **unknown** | |
+| Road/lane graph, traffic lights, pit and start positions | **works (lane graph, junctions, traffic lights, road surface); unknown (pit/start)** | `sixng paths`: node graph with lanes, speed limits and named node flags (tunnel, highway slip/exit, no-GPS, stop, yield …); junctions with turn paths and traffic-light phases linked to the placed signal props; `sixng navmesh --roads-only`: road polygons per 128 m tile. Link flags: 4 of 11 names recovered, 2 inferred (unpaved / track, two-way). Start positions not found. |
+
+#### Cars
+
+| CSP need | Status | Notes |
+|----------|--------|-------|
+| Node hierarchy with pivots | **now** | Skeleton joints with model-space pivots, in `model.json` and as glTF joints. |
+| Bonnet and boot as their own parent nodes | **partial** | `bonnet` and `boot` are joints with correct hinge pivots, and their vertices are skinned to them (slot 8). They are not split into separate mesh nodes: a converter can split by joint (most parts use one bone per vertex). Separate `_dmg_mod_bonnet_*` / `_boot_*` fragments also exist. |
+| Skinning (bones and weights) | **now** | glTF skin: one joint per vertex for car bodies (slot 8, format 0x00), and up to 4 joints and weights for wheels and tyres (slot 8 format 0x25 + slot 6). The bind pose is model space. |
+| Damage or deformation variants | **partial** | Damage parts are separate fragments (`<car>_dmg_mod_<part>_NNN`, with `_hi`/`_mid`) and are exported. How the game swaps them in is not decoded. (`phoenix_mid` models 3–5 are LOD1, not damage.) |
+| Light meshes by function, or light IDs | **unknown** | |
+| Car paint (`smCarPaint`: colour, flakes, clear coat; liveries) | **partial** | What is known: the body uses the vehicle shader family (`4aa38282`); its colour slot is an engine-default white texture, so the paint is a runtime colour. The shared detail masks (dirt, grime, scratches/flakes, decal layer) and the normal atlases decode and are listed per material in `model.json`. **Not decoded**: the per-vehicle colour tables and the liveries. The candidate tables are a PSO with 64-bit field hashes and a pool of 17,632 ARGB colours in the game-data resource. Until they are decoded, the converter must take the paint colour from the user. **Export**: paint materials have `classification.class = "car_paint"` and a `paint` block in `model.json` (mask slot hashes, a neutral default colour, CSP/BeamNG hints). In the GLB they get no albedo texture, a grey `baseColorFactor`, metallic 0.6 and roughness 0.25, so the body renders painted rather than black. Checked on `phoenix_mid`. |
+| Tyre, rim, disc and caliper per corner, with widths and radii | **partial** | Rims and tyres are shared models, exported separately, at unit scale for the left-front corner. Wheel centres are in `wheel_mounts`. The per-vehicle wheel radius and width, the rim choice, and the disc/caliper meshes are not located yet. |
+| Animated parts and clips (spoiler, roof, doors, pop-ups) | **unknown** | |
+| Handling: mass, centre of mass, inertia, gearing, torque, hardpoints, springs, anti-roll bars, tyres, aero | **unknown** | It is probably in PSO/RBF metadata (exported raw) with hashed field names. |
+
+## Layout of this repo
+
+```
+crates/sixng-core   library: rpf9, scan (carving index), classify, resource,
+                    texture (decode + deswizzle), drawable, export, game
+crates/sixng-cli    `sixng` binary
+crates/sixng-gui    `sixng-gui` binary (eframe/egui)
+docs/images/        README screenshots
+work/               indexes and output (git-ignored)
+```
+
+## Licence
+
+SixNG is free software under the [GNU General Public License v3.0 only](LICENSE).
+Third-party notices (AMD addrlib, MIT): [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

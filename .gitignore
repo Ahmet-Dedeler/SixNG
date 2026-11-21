@@ -1,0 +1,25 @@
+# build output
+/target
+# indexes, extracted game data, scratch, logs (never commit game data)
+/work
+*.log
+# extracted assets anywhere else
+*.glb
+*.dds
+*.png
+*.ttpf
+*.rpf
+*.bin
+!assets/logo/*.png
+!docs/images/*.png
+# keys or secrets of any kind
+*.key
+*.pem
+.env
+# documentation stays out of the repo, except the README screenshots
+/docs/*
+!/docs/images/
+# documentation for the logo files stays out too
+/assets/logo/README.md
+# per-machine settings (contain local folder paths)
+sixng-settings.json

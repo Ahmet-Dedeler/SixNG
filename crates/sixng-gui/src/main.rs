@@ -1,0 +1,1108 @@
+//! sixng-gui: manual browser / extractor over sixng-core.
+#![windows_subsystem = "windows"]
+use eframe::egui;
+use sixng_core::classify::Kind;
+use sixng_core::export::{self, ExportOptions, Filter, Progress, Workspace};
+use sixng_core::game::ArchiveInfo;
+use sixng_core::resource::Resource;
+use sixng_core::scan::{ArchiveIndex, Entry};
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+mod glb;
+mod map2d;
+mod map3d;
+mod mem;
+
+/// Export cache for the viewers. Bumped when the export layout changes
+/// (v2, 2026-11-20: LOD levels from the main LOD group; parts split out).
+pub const GUI_CACHE: &str = "gui_cache_v2";
+mod bakejob;
+mod model_picker;
+mod mapbake;
+mod model_view;
+mod texture_view;
+mod render3d;
+
+/// Command-line automation (verification screenshots):
+/// `sixng-gui --model <id|regex|glb> [--lod N] [--mode N] [--slot N] [--rma N] [--wire] [--skeleton]
+///  [--tod H] [--paint r,g,b] [--finish N] [--pearl A] [--spin R] [--door R] [--yaw R] [--pitch R] [--zoom F]
+///  [--size WxH] --screenshot out.png --exit`
+#[derive(Default, Clone)]
+struct Cli {
+    args: std::collections::HashMap<String, String>,
+}
+impl Cli {
+    fn parse() -> Self {
+        let mut args = std::collections::HashMap::new();
+        let v: Vec<String> = std::env::args().skip(1).collect();
+        let mut i = 0;
+        while i < v.len() {
+            if let Some(k) = v[i].strip_prefix("--") {
+                if i + 1 < v.len() && !v[i + 1].starts_with("--") {
+                    args.insert(k.to_string(), v[i + 1].clone());
+                    i += 2;
+                    continue;
+                }
+                args.insert(k.to_string(), String::new());
+            }
+            i += 1;
+        }
+        Cli { args }
+    }
+    fn get(&self, k: &str) -> Option<&str> {
+        self.args.get(k).map(|s| s.as_str())
+    }
+    fn f(&self, k: &str) -> Option<f32> {
+        self.get(k).and_then(|s| s.parse().ok())
+    }
+    fn u(&self, k: &str) -> Option<u32> {
+        self.get(k).and_then(|s| s.parse().ok())
+    }
+    fn has(&self, k: &str) -> bool {
+        self.args.contains_key(k)
+    }
+}
+
+/// App settings (game and work folders); see `settings_path`.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct AppSettings {
+    game: Option<String>,
+    work: Option<String>,
+}
+
+/// `sixng-settings.json` next to the exe (portable installs), else in %APPDATA%\SixNG.
+fn settings_path() -> Option<PathBuf> {
+    let local = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("sixng-settings.json")));
+    if let Some(l) = &local {
+        if l.exists() {
+            return local;
+        }
+    }
+    std::env::var_os("APPDATA").map(|a| PathBuf::from(a).join("SixNG").join("settings.json")).filter(|p| p.exists()).or(local)
+}
+
+fn load_settings() -> AppSettings {
+    settings_path().and_then(|p| std::fs::read(p).ok()).and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_settings(s: &AppSettings) -> std::io::Result<()> {
+    let p = settings_path().ok_or_else(|| std::io::Error::other("no settings location"))?;
+    let data = serde_json::to_vec_pretty(s).unwrap();
+    match std::fs::write(&p, &data) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // exe folder not writable: use %APPDATA%\SixNG
+            let a = std::env::var_os("APPDATA").ok_or_else(|| std::io::Error::other("APPDATA not set"))?;
+            let p = PathBuf::from(a).join("SixNG").join("settings.json");
+            std::fs::create_dir_all(p.parent().unwrap())?;
+            std::fs::write(p, data)
+        }
+    }
+}
+
+/// Work folder: $SIXNG_WORK, else the saved setting, else `work` next to the exe.
+fn default_work() -> String {
+    if let Ok(w) = std::env::var("SIXNG_WORK") {
+        return w;
+    }
+    if let Some(w) = load_settings().work {
+        return w;
+    }
+    std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("work").display().to_string())).unwrap_or_else(|| "work".into())
+}
+
+/// Game folder: $SIXNG_GAME, else the saved setting, else empty (the app
+/// then asks for it on start).
+fn default_game() -> String {
+    std::env::var("SIXNG_GAME").ok().filter(|s| !s.is_empty()).or_else(|| load_settings().game).unwrap_or_default()
+}
+
+fn main() -> eframe::Result<()> {
+    let cli = Cli::parse();
+    if cli.has("bake-map") {
+        let game = default_game();
+        let work = default_work();
+        let only: Vec<String> = cli.get("bake-map").unwrap_or("").split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+        let b = mapbake::Baker::new(&game, &work);
+        if let Err(e) = b.run(&only) {
+            mapbake::log(std::path::Path::new(&work), &format!("bake failed: {e:#}"));
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    let size = cli
+        .get("size")
+        .and_then(|s| s.split_once('x'))
+        .and_then(|(w, h)| Some([w.parse::<f32>().ok()?, h.parse::<f32>().ok()?]))
+        .unwrap_or([1400.0, 860.0]);
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size(size).with_title("SixNG Extractor").with_icon(app_icon()),
+        renderer: eframe::Renderer::Wgpu,
+        ..Default::default()
+    };
+    eframe::run_native("SixNG Extractor", opts, Box::new(move |_cc| Ok(Box::new(App::new(cli)))))
+}
+
+/// Window / taskbar icon (the exe icon itself is embedded by build.rs).
+fn app_icon() -> egui::IconData {
+    let png = include_bytes!("../../../assets/logo/sixng_icon_256.png");
+    match image::load_from_memory(png) {
+        Ok(img) => {
+            let img = img.to_rgba8();
+            let (w, h) = img.dimensions();
+            egui::IconData { rgba: img.into_raw(), width: w, height: h }
+        }
+        Err(_) => egui::IconData::default(),
+    }
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Browser,
+    Model,
+    Map2D,
+    Map3D,
+    Textures,
+}
+
+#[derive(Default)]
+struct Task {
+    label: String,
+    done: u64,
+    total: u64,
+    running: bool,
+    message: Option<String>,
+}
+
+enum Preview {
+    None,
+    Text(String),
+    Json(String),
+    Textures { list: Vec<sixng_core::texture::TexInfo>, res: Arc<Resource>, json: String },
+}
+
+struct App {
+    game: String,
+    work: String,
+    out: String,
+    archives: Vec<ArchiveInfo>,
+    sel_archive: Option<usize>,
+    index: Option<Arc<ArchiveIndex>>,
+    filter_text: String,
+    filter_kind: String,
+    filter_rtype: String,
+    filtered: Vec<usize>,
+    filter_dirty: bool,
+    selected: BTreeSet<usize>,
+    focus: Option<usize>,
+    preview: Preview,
+    tex_sel: usize,
+    tex_handle: Option<(String, egui::TextureHandle)>,
+    tex_pending: Arc<Mutex<Option<(String, Result<(u32, u32, Vec<u8>), String>)>>>,
+    task: Arc<Mutex<Task>>,
+    loaded_index: Arc<Mutex<Option<ArchiveIndex>>>,
+    tex_png: bool,
+    tex_dds: bool,
+    tab: Tab,
+    model: model_view::ModelView,
+    cli: Cli,
+    cli_started: bool,
+    map2d: map2d::Map2D,
+    map3d: map3d::Map3D,
+    textures: texture_view::TextureView,
+    shot: Option<(PathBuf, u32, bool)>,
+    map3d_start: Option<[f32; 3]>,
+    bake: bakejob::BakeJob,
+    settings_msg: String,
+}
+
+impl App {
+    fn new(cli: Cli) -> Self {
+        let game = default_game();
+        let work = default_work();
+        let _ = std::fs::create_dir_all(&work);
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(std::path::Path::new(&work).join("gui.log")).and_then(|mut f| { use std::io::Write; writeln!(f, "[start] work = {work} (SIXNG_WORK {}, settings {:?}, file {:?}: {})", std::env::var("SIXNG_WORK").is_ok(), load_settings().work, settings_path(), settings_path().map(|p| match std::fs::read(&p) { Ok(b) => match serde_json::from_slice::<AppSettings>(&b) { Ok(_) => "ok".to_string(), Err(e) => format!("parse error {e}") }, Err(e) => format!("read error {e}") }).unwrap_or_default()) });
+        let mut a = App {
+            model: model_view::ModelView::new(&game, &work),
+            map2d: map2d::Map2D::new(&work),
+            map3d: map3d::Map3D::new(&game, &work),
+            textures: texture_view::TextureView::new(&game, &work),
+            shot: None,
+            map3d_start: None,
+            bake: bakejob::BakeJob::default(),
+            settings_msg: String::new(),
+            tab: Tab::Browser,
+            cli,
+            cli_started: false,
+            game,
+            work,
+            out: "work/out".into(),
+            archives: vec![],
+            sel_archive: None,
+            index: None,
+            filter_text: String::new(),
+            filter_kind: String::new(),
+            filter_rtype: String::new(),
+            filtered: vec![],
+            filter_dirty: true,
+            selected: BTreeSet::new(),
+            focus: None,
+            preview: Preview::None,
+            tex_sel: 0,
+            tex_handle: None,
+            tex_pending: Arc::new(Mutex::new(None)),
+            task: Arc::new(Mutex::new(Task::default())),
+            loaded_index: Arc::new(Mutex::new(None)),
+            tex_png: true,
+            tex_dds: false,
+        };
+        a.map3d.load_settings();
+        a.refresh();
+        a
+    }
+
+    /// Bar above the map tabs: bake / re-bake the map, progress, result.
+    fn bake_bar(&mut self, ctx: &egui::Context) {
+        if let Some(ok) = self.bake.poll(&self.work) {
+            if ok {
+                self.map2d.reload();
+                self.map3d.reset_data();
+            }
+        }
+        let baked = Path::new(&self.work).join("map").join("meta.json").exists();
+        let (req, opt) = bakejob::BakeJob::missing_inputs(&self.work);
+        egui::TopBottomPanel::top("bake_bar").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                if self.bake.running() {
+                    ui.spinner();
+                    ui.label(format!("Baking map ({}:{:02}) · {}", self.bake.elapsed() / 60, self.bake.elapsed() % 60, self.bake.last_line));
+                    if ui.button("Cancel").clicked() {
+                        self.bake.cancel();
+                    }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                    return;
+                }
+                let label = if baked { "🔄 Re-bake map" } else { "🍞 Bake map" };
+                let can = req.is_empty();
+                let hover = if can {
+                    format!(
+                        "Build the map files in {}/map from the exported world data (about 2 minutes, a few GB of RAM). Runs in a separate process; the map tabs reload when it is done.{}",
+                        self.work,
+                        if opt.is_empty() { String::new() } else { format!("
+
+Optional layers not exported yet (the map works without them): {}.", opt.join(", ")) }
+                    )
+                } else {
+                    format!("Export the world data first: Browse tab → World data → {}.", req.join(", "))
+                };
+                if ui.add_enabled(can, egui::Button::new(label)).on_hover_text(&hover).on_disabled_hover_text(&hover).clicked() {
+                    if let Err(e) = self.bake.start(&self.game, &self.work) {
+                        self.bake.result = Some(e);
+                    }
+                }
+                if !can {
+                    ui.colored_label(egui::Color32::from_rgb(230, 180, 80), format!("Needs world data first: Browse tab → World data → {}", req.join(", ")));
+                } else if !baked {
+                    ui.label("No baked map yet.");
+                } else if !opt.is_empty() {
+                    ui.weak(format!("missing optional layers: {}", opt.join(", "))).on_hover_text("Export them from Browse → World data, then re-bake to add them.");
+                }
+                if let Some(r) = &self.bake.result {
+                    ui.separator();
+                    ui.label(r);
+                }
+            });
+        });
+    }
+
+    fn ws(&self) -> Workspace {
+        Workspace::new(&self.game, &self.work)
+    }
+
+    fn refresh(&mut self) {
+        self.archives = self.ws().archives();
+    }
+
+    fn busy(&self) -> bool {
+        self.task.lock().unwrap().running
+    }
+
+    fn start_task<F>(&self, label: &str, ctx: &egui::Context, f: F)
+    where
+        F: FnOnce(Progress) -> Result<String, String> + Send + 'static,
+    {
+        {
+            let mut t = self.task.lock().unwrap();
+            *t = Task { label: label.into(), running: true, ..Default::default() };
+        }
+        let task = self.task.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let t2 = task.clone();
+            let c2 = ctx.clone();
+            let pr: Progress = Arc::new(move |stage, d, tot| {
+                let mut t = t2.lock().unwrap();
+                t.done = d;
+                t.total = tot;
+                t.message = Some(stage.to_string());
+                c2.request_repaint();
+            });
+            let r = f(pr);
+            let mut t = task.lock().unwrap();
+            t.running = false;
+            t.message = Some(match r {
+                Ok(m) => m,
+                Err(e) => format!("error: {e}"),
+            });
+            ctx.request_repaint();
+        });
+    }
+
+    fn open_archive(&mut self, i: usize, ctx: &egui::Context) {
+        self.sel_archive = Some(i);
+        self.index = None;
+        self.selected.clear();
+        self.focus = None;
+        self.preview = Preview::None;
+        let a = self.archives[i].clone();
+        let ws = self.ws();
+        let slot = self.loaded_index.clone();
+        if ws.is_indexed(&a) {
+            self.start_task(&format!("Loading index {}", a.id), ctx, move |_| {
+                let ix = ws.load_index(&a).map_err(|e| e.to_string())?;
+                let n = ix.entries.len();
+                *slot.lock().unwrap() = Some(ix);
+                Ok(format!("{} entries", n))
+            });
+        }
+    }
+
+    fn index_archive(&mut self, i: usize, ctx: &egui::Context) {
+        let a = self.archives[i].clone();
+        let ws = self.ws();
+        let slot = self.loaded_index.clone();
+        self.sel_archive = Some(i);
+        self.start_task(&format!("Indexing {}", a.id), ctx, move |pr| {
+            let ix = ws.ensure_index(&a, false, true, pr).map_err(|e| e.to_string())?;
+            let msg = format!("{}: {} entries, {:.1}% coverage", a.id, ix.entries.len(), ix.stats.coverage * 100.0);
+            *slot.lock().unwrap() = Some(ix);
+            Ok(msg)
+        });
+    }
+
+    fn apply_filter(&mut self) {
+        self.filtered.clear();
+        let Some(ix) = &self.index else { return };
+        let re = regex::RegexBuilder::new(&self.filter_text).case_insensitive(true).build().ok();
+        for (i, e) in ix.entries.iter().enumerate() {
+            if !self.filter_kind.is_empty() && e.kind.name() != self.filter_kind {
+                continue;
+            }
+            if !self.filter_rtype.is_empty() && e.rtype.as_deref() != Some(self.filter_rtype.as_str()) {
+                continue;
+            }
+            if !self.filter_text.is_empty() {
+                let hay = format!("{} {}", e.name.as_deref().unwrap_or(""), e.id);
+                let ok = match &re {
+                    Some(r) => r.is_match(&hay),
+                    None => hay.to_lowercase().contains(&self.filter_text.to_lowercase()),
+                };
+                if !ok {
+                    continue;
+                }
+            }
+            self.filtered.push(i);
+        }
+        self.filter_dirty = false;
+    }
+
+    fn focus_entry(&mut self, i: usize) {
+        self.focus = Some(i);
+        self.tex_sel = 0;
+        self.tex_handle = None;
+        let (Some(ix), Some(ai)) = (&self.index, self.sel_archive) else { return };
+        let a = &self.archives[ai];
+        let e = &ix.entries[i];
+        self.preview = match (e.kind, e.rtype.as_deref()) {
+            (Kind::RageObj | Kind::Resource, Some("txd")) => match Resource::load(&a.path, e) {
+                Ok(r) => {
+                    let list = sixng_core::texture::find_textures(&r);
+                    let json = serde_json::to_string_pretty(&list).unwrap_or_default();
+                    Preview::Textures { list, res: Arc::new(r), json }
+                }
+                Err(err) => Preview::Text(format!("error: {err}")),
+            },
+            (Kind::RageObj | Kind::Resource, _) => match Resource::load(&a.path, e) {
+                Ok(r) => {
+                    let info = sixng_core::drawable::describe(&r);
+                    if !info.embedded_textures.is_empty() {
+                        let list = info.embedded_textures.clone();
+                        let json = serde_json::to_string_pretty(&info).unwrap_or_default();
+                        Preview::Textures { list, res: Arc::new(r), json }
+                    } else {
+                        Preview::Json(serde_json::to_string_pretty(&info).unwrap_or_default())
+                    }
+                }
+                Err(err) => Preview::Text(format!("error: {err}")),
+            },
+            _ => match sixng_core::scan::read_entry(&a.path, e) {
+                Ok(d) => {
+                    let n = d.len().min(256 * 1024);
+                    let printable = d[..n.min(4096)].iter().filter(|&&c| c >= 0x20 || c == b'\n' || c == b'\r' || c == b'\t').count();
+                    if printable * 10 > n.min(4096) * 9 {
+                        Preview::Text(String::from_utf8_lossy(&d[..n]).to_string())
+                    } else {
+                        let mut s = String::new();
+                        for (row, chunk) in d[..n.min(8192)].chunks(16).enumerate() {
+                            s += &format!("{:06x}  {}\n", row * 16, sixng_core::rpf9::hex(chunk));
+                        }
+                        Preview::Text(s)
+                    }
+                }
+                Err(err) => Preview::Text(format!("error: {err}")),
+            },
+        };
+    }
+
+    fn request_texture(&mut self, ctx: &egui::Context) {
+        let Preview::Textures { list, res, .. } = &self.preview else { return };
+        let Some(t) = list.get(self.tex_sel).cloned() else { return };
+        let res = res.clone();
+        let slot = self.tex_pending.clone();
+        let key = format!("{}#{}", t.struct_off, t.name);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = (|| -> anyhow::Result<(u32, u32, Vec<u8>)> {
+                let (fmt, lin) = sixng_core::texture::mip0_linear(&res, &t, false)?;
+                let rgba = sixng_core::texture::to_rgba(fmt, &lin, t.width, t.height)?;
+                Ok((t.width, t.height, rgba))
+            })();
+            *slot.lock().unwrap() = Some((key, r.map_err(|e| e.to_string())));
+            ctx.request_repaint();
+        });
+    }
+
+    fn extract(&mut self, ctx: &egui::Context, all_filtered: bool) {
+        let (Some(ix), Some(ai)) = (self.index.clone(), self.sel_archive) else { return };
+        let a = self.archives[ai].clone();
+        let idxs: Vec<usize> = if all_filtered { self.filtered.clone() } else { self.selected.iter().copied().collect() };
+        let opts = ExportOptions {
+            out: PathBuf::from(&self.out),
+            png: self.tex_png,
+            dds: self.tex_dds,
+            raw: false,
+            force: false,
+            skip_embedded_textures: false,
+        };
+        self.start_task(&format!("Extracting {} entries", idxs.len()), ctx, move |pr| {
+            let sel: Vec<&Entry> = idxs.iter().map(|&i| &ix.entries[i]).collect();
+            let items = export::export_many(&a, &sel, &opts, pr).map_err(|e| e.to_string())?;
+            let ok = items.iter().filter(|i| i.status == "ok").count();
+            let sk = items.iter().filter(|i| i.status == "skipped").count();
+            let er = items.iter().filter(|i| i.status == "error").count();
+            Ok(format!("extracted {ok}, skipped {sk}, errors {er} -> {}", opts.out.display()))
+        });
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        if self.game.trim().is_empty() || !Path::new(self.game.trim()).is_dir() {
+            self.ask_game_folder(ctx);
+            return;
+        }
+        if !self.cli_started {
+            self.cli_started = true;
+            self.apply_cli(ctx);
+        }
+        egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Browser, "📦 Browser");
+                ui.selectable_value(&mut self.tab, Tab::Model, "🧊 Model viewer");
+                ui.selectable_value(&mut self.tab, Tab::Map2D, "🗺 Map 2D");
+                ui.selectable_value(&mut self.tab, Tab::Map3D, "🌆 Map 3D");
+                ui.selectable_value(&mut self.tab, Tab::Textures, "🖼 Textures");
+            });
+        });
+        self.window_shot(ctx);
+        if self.tab == Tab::Model {
+            egui::CentralPanel::default().show(ctx, |ui| self.model.ui(ui, frame));
+            if let Some(h) = self.model.view_texture.take() {
+                self.textures.show_hash(h);
+                self.tab = Tab::Textures;
+            }
+            return;
+        }
+        if self.tab == Tab::Textures {
+            egui::CentralPanel::default().show(ctx, |ui| self.textures.ui(ui));
+            return;
+        }
+        if self.tab == Tab::Map2D || self.tab == Tab::Map3D {
+            self.bake_bar(ctx);
+        }
+        if self.tab == Tab::Map3D {
+            self.map2d.ensure_loaded(ctx);
+            if self.map3d.data.is_none() {
+                if let Some(d) = &self.map2d.data {
+                    self.map3d.data = Some(d.clone());
+                    if let Some([x, y, h]) = self.map3d_start.take() {
+                        self.map3d.place(x, y, h);
+                    }
+                }
+            }
+            egui::CentralPanel::default().frame(egui::Frame::NONE).show(ctx, |ui| self.map3d.ui(ui, frame));
+            if let Some(m) = self.map3d.open_model.take() {
+                self.tab = Tab::Model;
+                self.model.open(&m, 0, ctx);
+            }
+            return;
+        }
+        if self.tab == Tab::Map2D {
+            egui::CentralPanel::default().show(ctx, |ui| self.map2d.ui(ui));
+            if let Some(m) = self.map2d.open_model.take() {
+                self.tab = Tab::Model;
+                self.model.open(&m, 0, ctx);
+            }
+            return;
+        }
+        if let Some(ix) = self.loaded_index.lock().unwrap().take() {
+            self.index = Some(Arc::new(ix));
+            self.filter_dirty = true;
+        }
+        if self.filter_dirty {
+            self.apply_filter();
+        }
+        let pending = self.tex_pending.lock().unwrap().take();
+        if let Some((key, r)) = pending {
+            match r {
+                Ok((w, h, rgba)) => {
+                    let img = egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba);
+                    self.tex_handle = Some((key.clone(), ctx.load_texture(key, img, egui::TextureOptions::LINEAR)));
+                }
+                Err(e) => self.preview_error(e),
+            }
+        }
+
+        let mut world_req: Option<&'static str> = None;
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Game:");
+                ui.add(egui::TextEdit::singleline(&mut self.game).desired_width(220.0));
+                if ui.button("Browse…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        self.game = p.display().to_string();
+                        self.refresh();
+                    }
+                }
+                ui.label("Work:");
+                ui.add(egui::TextEdit::singleline(&mut self.work).desired_width(200.0)).on_hover_text("Folder for indexes, the map bake and the model cache");
+                if ui.button("Browse…").on_hover_text("Pick the work folder").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        self.work = p.display().to_string();
+                    }
+                }
+                if ui.button("💾 Save").on_hover_text("Remember these game and work folders (used from the next start, wherever the app is launched from)").clicked() {
+                    let st = AppSettings { game: Some(self.game.clone()), work: Some(self.work.clone()) };
+                    self.settings_msg = match save_settings(&st) {
+                        Ok(()) => "Saved. Restart the app to use the new folders everywhere.".into(),
+                        Err(e) => format!("Could not save settings: {e}"),
+                    };
+                }
+                if !self.settings_msg.is_empty() {
+                    ui.label(egui::RichText::new(&self.settings_msg).small());
+                }
+                if ui.button("Refresh").clicked() {
+                    self.refresh();
+                }
+                ui.separator();
+                ui.label("Output:");
+                ui.add(egui::TextEdit::singleline(&mut self.out).desired_width(200.0));
+                if ui.button("…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        self.out = p.display().to_string();
+                    }
+                }
+                ui.checkbox(&mut self.tex_png, "PNG");
+                ui.checkbox(&mut self.tex_dds, "DDS");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("World data (whole map → Output):");
+                for (id, label, help) in sixng_core::world::STEPS {
+                    if ui.add_enabled(!self.busy(), egui::Button::new(*label)).on_hover_text(*help).clicked() {
+                        world_req = Some(*id);
+                    }
+                }
+            });
+        });
+        if let Some(step) = world_req {
+            let ws = self.ws();
+            let out = PathBuf::from(&self.out);
+            self.start_task(&format!("World data: {step}"), ctx, move |pr| sixng_core::world::run_step(&ws, step, &out, pr).map_err(|e| e.to_string()));
+        }
+
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            let t = self.task.lock().unwrap();
+            ui.horizontal(|ui| {
+                if t.running {
+                    ui.spinner();
+                    ui.label(&t.label);
+                    if t.total > 0 {
+                        ui.add(egui::ProgressBar::new(t.done as f32 / t.total as f32).desired_width(300.0).show_percentage());
+                    }
+                } else if !t.label.is_empty() {
+                    ui.label(format!("{} — {}", t.label, t.message.clone().unwrap_or_default()));
+                } else {
+                    ui.label("Ready");
+                }
+            });
+        });
+
+        let mut open_req = None;
+        let mut index_req = None;
+        egui::SidePanel::left("archives").resizable(true).default_width(300.0).max_width(380.0).show(ctx, |ui| {
+            ui.heading("Archives");
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                let ws = self.ws();
+                for (i, a) in self.archives.iter().enumerate() {
+                    let indexed = ws.is_indexed(a);
+                    ui.horizontal(|ui| {
+                        let sel = self.sel_archive == Some(i);
+                        let label = format!("{} ({:.1} GB)", a.id, a.size as f64 / 1e9);
+                        let txt = if indexed { label.clone() } else { format!("○ {label}") };
+                        let r = ui.add(egui::SelectableLabel::new(sel, txt)).on_hover_text(&a.id);
+                        if r.clicked() {
+                            open_req = Some(i);
+                        }
+                        if !indexed && ui.small_button("Index").clicked() {
+                            index_req = Some(i);
+                        }
+                    });
+                }
+            });
+        });
+        if !self.busy() {
+            if let Some(i) = index_req {
+                self.index_archive(i, ctx);
+            } else if let Some(i) = open_req {
+                self.open_archive(i, ctx);
+            }
+        }
+
+        let mut focus_req = None;
+        let mut tex_req = false;
+        egui::SidePanel::right("preview").resizable(true).default_width(540.0).min_width(420.0).show(ctx, |ui| {
+            ui.heading("Preview");
+            match &self.preview {
+                Preview::None => {
+                    ui.label("Select an entry.");
+                }
+                Preview::Text(s) | Preview::Json(s) => {
+                    egui::ScrollArea::both().show(ui, |ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(s.as_str()).monospace()).extend());
+                    });
+                }
+                Preview::Textures { list, json, .. } => {
+                    let names: Vec<String> = list.iter().map(|t| format!("{} {}x{} {}", t.name, t.width, t.height, t.format)).collect();
+                    let cur = names.get(self.tex_sel).cloned().unwrap_or_default();
+                    egui::ComboBox::from_label("texture").selected_text(cur).width(380.0).show_ui(ui, |ui| {
+                        for (i, n) in names.iter().enumerate() {
+                            if ui.selectable_value(&mut self.tex_sel, i, n).clicked() {
+                                tex_req = true;
+                            }
+                        }
+                    });
+                    if self.tex_handle.is_none() {
+                        tex_req = true;
+                    }
+                    if let Some((_, h)) = &self.tex_handle {
+                        let size = h.size_vec2();
+                        let scale = (500.0 / size.x.max(size.y)).min(1.0);
+                        ui.image((h.id(), size * scale));
+                    } else {
+                        ui.spinner();
+                    }
+                    ui.collapsing("metadata", |ui| {
+                        egui::ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                            ui.add(egui::Label::new(egui::RichText::new(json.as_str()).monospace()).extend());
+                        });
+                    });
+                }
+            }
+        });
+        if tex_req && matches!(self.preview, Preview::Textures { .. }) {
+            self.tex_handle = None;
+            if self.tex_pending.lock().unwrap().is_none() {
+                self.request_texture(ctx);
+            }
+        }
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            let Some(ix) = self.index.clone() else {
+                ui.label("Pick an indexed archive on the left, or press Index (first scan of levels.rpf takes ~3 min).");
+                return;
+            };
+            ui.horizontal(|ui| {
+                ui.label("Search:");
+                if ui.add(egui::TextEdit::singleline(&mut self.filter_text).hint_text("regex on name / id").desired_width(220.0)).changed() {
+                    self.filter_dirty = true;
+                }
+                egui::ComboBox::from_label("kind").selected_text(if self.filter_kind.is_empty() { "any" } else { &self.filter_kind }).show_ui(ui, |ui| {
+                    if ui.selectable_value(&mut self.filter_kind, String::new(), "any").clicked() {
+                        self.filter_dirty = true;
+                    }
+                    for k in Kind::all() {
+                        if ui.selectable_value(&mut self.filter_kind, k.name(), k.name()).clicked() {
+                            self.filter_dirty = true;
+                        }
+                    }
+                });
+                egui::ComboBox::from_label("type").selected_text(if self.filter_rtype.is_empty() { "any" } else { &self.filter_rtype }).show_ui(ui, |ui| {
+                    for t in ["", "txd", "dr", "ft", "dd", "td"] {
+                        if ui.selectable_value(&mut self.filter_rtype, t.to_string(), if t.is_empty() { "any" } else { t }).clicked() {
+                            self.filter_dirty = true;
+                        }
+                    }
+                });
+                ui.label(format!("{} / {} entries, {} selected", self.filtered.len(), ix.entries.len(), self.selected.len()));
+            });
+            ui.horizontal(|ui| {
+                let busy = self.busy();
+                if ui.add_enabled(!busy && !self.selected.is_empty(), egui::Button::new("Extract selected")).clicked() {
+                    self.extract(ctx, false);
+                }
+                if ui.add_enabled(!busy && !self.filtered.is_empty(), egui::Button::new(format!("Extract all {} filtered", self.filtered.len()))).clicked() {
+                    self.extract(ctx, true);
+                }
+                if ui.button("Clear selection").clicked() {
+                    self.selected.clear();
+                }
+                if let (Some(f), Some(ai)) = (self.focus, self.sel_archive) {
+                    let e = &ix.entries[f];
+                    if matches!(e.rtype.as_deref(), Some("dr") | Some("ft") | None) && e.kind == Kind::RageObj && ui.button("🧊 Open in model viewer").clicked() {
+                        let _ = ai;
+                        let id = e.id.clone();
+                        self.tab = Tab::Model;
+                        self.model.open(&id, 0, ctx);
+                    }
+                }
+                if !ix.names_done {
+                    ui.label("(names not recovered yet: re-index to get names)");
+                }
+            });
+            ui.separator();
+            let row_h = 18.0;
+            egui::ScrollArea::vertical().auto_shrink(false).show_rows(ui, row_h, self.filtered.len(), |ui, range| {
+                for r in range {
+                    let i = self.filtered[r];
+                    let e = &ix.entries[i];
+                    ui.horizontal(|ui| {
+                        let mut checked = self.selected.contains(&i);
+                        if ui.checkbox(&mut checked, "").changed() {
+                            if checked {
+                                self.selected.insert(i);
+                            } else {
+                                self.selected.remove(&i);
+                            }
+                        }
+                        let text = format!(
+                            "{:>10x}  {:<8} {:<4} {:>10}  {}",
+                            e.off,
+                            e.kind.name(),
+                            e.rtype.as_deref().unwrap_or(""),
+                            human(e.usize),
+                            e.name.as_deref().unwrap_or("")
+                        );
+                        if ui.selectable_label(self.focus == Some(i), egui::RichText::new(text).monospace()).clicked() {
+                            focus_req = Some(i);
+                        }
+                    });
+                }
+            });
+        });
+        if let Some(i) = focus_req {
+            self.focus_entry(i);
+        }
+    }
+}
+
+impl App {
+    /// Full-window screenshot for --tab map2d automation: waits for the map
+    /// data and tiles, then saves and optionally exits.
+    fn window_shot(&mut self, ctx: &egui::Context) {
+        let Some((path, frames, exit)) = self.shot.clone() else { return };
+        let shot = ctx.input(|i| {
+            i.raw.events.iter().find_map(|e| match e {
+                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                _ => None,
+            })
+        });
+        if let Some(img) = shot {
+            let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+            let _ = render3d::save_png(&path, img.size[0] as u32, img.size[1] as u32, &rgba);
+            self.shot = None;
+            if exit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            return;
+        }
+        let ready = frames > 40 && !self.bake.running() && match self.tab { Tab::Model => self.model.idle(), Tab::Textures => self.textures.idle(), _ => self.map2d.data.is_some() };
+        if ready && frames < 100_000 {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            self.shot = Some((path, 100_000, exit));
+        } else if frames < 100_000 {
+            self.shot = Some((path, frames + 1, exit));
+        }
+        ctx.request_repaint();
+    }
+
+    /// First start (or the saved folder is gone): ask for the game folder,
+    /// save it, and rebuild the views that hold it.
+    fn ask_game_folder(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.vertical_centered(|ui| {
+                ui.add_space(ui.available_height() * 0.3);
+                ui.heading("Where is your GTA VI install?");
+                ui.label("Pick the game folder (the one that contains the .rpf archives). It is saved for next time.");
+                if !self.game.trim().is_empty() {
+                    ui.colored_label(egui::Color32::from_rgb(230, 150, 90), format!("The saved folder {} does not exist.", self.game));
+                }
+                ui.add_space(8.0);
+                if ui.button("Choose game folder…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                        self.game = p.display().to_string();
+                        let st = AppSettings { game: Some(self.game.clone()), work: Some(self.work.clone()) };
+                        if let Err(e) = save_settings(&st) {
+                            self.settings_msg = format!("Could not save settings: {e}");
+                        }
+                        self.model = model_view::ModelView::new(&self.game, &self.work);
+                        self.map3d = map3d::Map3D::new(&self.game, &self.work);
+                        self.textures = texture_view::TextureView::new(&self.game, &self.work);
+                        self.refresh();
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("You can also set SIXNG_GAME, or change it later on the Browser tab.").small());
+            });
+        });
+    }
+
+    fn apply_cli(&mut self, ctx: &egui::Context) {
+        let c = self.cli.clone();
+        if c.get("tab") == Some("textures") || c.get("texture").is_some() {
+            self.tab = Tab::Textures;
+            if let Some(h) = c.get("texture").and_then(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()) {
+                self.textures.show_hash(h);
+            }
+        }
+        if c.get("tab") == Some("map3d") {
+            self.tab = Tab::Map3D;
+            let m3 = &mut self.map3d;
+            let (mut x, mut y) = (-640.0, -60.0);
+            if let Some(v) = c.get("center") {
+                let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                if v.len() == 2 {
+                    (x, y) = (v[0], v[1]);
+                }
+            }
+            self.map3d_start = Some([x, y, c.f("height").unwrap_or(120.0)]);
+            if let Some(v) = c.f("yaw") {
+                m3.cam.yaw = v.to_radians();
+            }
+            if let Some(v) = c.f("pitch") {
+                m3.cam.pitch = v.to_radians();
+            }
+            if let Some(v) = c.get("pick") {
+                // "x,y;x,y" as fractions of the 3D view
+                m3.auto.picks = v.split(';').filter_map(|p| p.split_once(',')).filter_map(|(a, b)| Some([a.trim().parse().ok()?, b.trim().parse().ok()?])).collect();
+            }
+            if let Some(v) = c.f("detail") {
+                m3.detail_level = v;
+                m3.detail = map3d::Detail::from_level(v);
+            }
+            if let Some(v) = c.u("max-tex") {
+                m3.detail.max_tex = v as u32;
+            }
+            if c.has("no-textures") {
+                m3.detail.textures = false;
+            }
+            for (key, arr) in [("kinds", &mut m3.kinds), ("lods", &mut m3.lods)] {
+                if let Some(v) = c.get(key) {
+                    *arr = [false; 6];
+                    for k in v.split(',').filter_map(|x| x.parse::<usize>().ok()) {
+                        if k < 6 {
+                            arr[k] = true;
+                        }
+                    }
+                }
+            }
+            if let Some(v) = c.f("ram-cap") {
+                m3.set_ram_cap(Some(v), false);
+            }
+            m3.decal_bias = !c.has("no-decal-bias");
+            m3.show_proxies = c.has("show-proxies");
+            if c.has("no-hd-fallback") {
+                m3.detail.hd_fallback = false;
+            }
+            if let Some(h) = c.f("tod") {
+                m3.tod = h;
+                m3.look.set_time_of_day(h);
+            }
+            if let Some(v) = c.f("fog") {
+                m3.look.fog = v;
+            }
+            if let Some(v) = c.f("exposure") {
+                m3.look.exposure = v;
+            }
+            m3.show_roads = c.has("roads");
+            m3.show_lights = c.has("lights");
+            m3.show_terrain = !c.has("no-terrain");
+            if c.has("no-windows") {
+                m3.show_minimap = false;
+                m3.show_stats = false;
+            }
+            if let Some(p) = c.get("screenshot") {
+                m3.auto.screenshot = Some(PathBuf::from(p));
+                m3.auto.exit = c.has("exit");
+            }
+            return;
+        }
+        if c.get("tab") == Some("map2d") {
+            self.tab = Tab::Map2D;
+            let mp = &mut self.map2d;
+            if let Some(v) = c.get("center") {
+                let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                if v.len() == 2 {
+                    mp.cx = v[0];
+                    mp.cy = v[1];
+                }
+            }
+            if let Some(v) = c.f("mpp") {
+                mp.mpp = v;
+            }
+            if let Some(v) = c.u("base") {
+                mp.base = v as usize;
+            }
+            if let Some(v) = c.get("overlays") {
+                for o in mp.overlays.iter_mut() {
+                    o.0 = false;
+                }
+                for k in v.split(',').filter_map(|x| x.parse::<usize>().ok()) {
+                    if k < mp.overlays.len() {
+                        mp.overlays[k].0 = true;
+                    }
+                }
+            }
+            mp.show_roads = !c.has("no-roads");
+            mp.show_lights = c.has("lights");
+            mp.light_int = c.has("interior-lights");
+            mp.show_interiors = c.has("interiors");
+            if let Some(h) = c.f("hour") {
+                mp.hour = h;
+            }
+            if let Some(v) = c.u("road-colour") {
+                mp.road_colour = v as usize;
+            }
+            if let Some(q) = c.get("search") {
+                mp.search = q.to_string();
+                mp.pending_search = true;
+            }
+            if c.has("start-bake") {
+                // automation: same as the Bake map button; --screenshot waits for it
+                if let Err(e) = self.bake.start(&self.game, &self.work) {
+                    self.bake.result = Some(e);
+                }
+            }
+            if let Some(p) = c.get("screenshot") {
+                self.shot = Some((PathBuf::from(p), 0, c.has("exit")));
+            }
+            return;
+        }
+        let m = &mut self.model;
+        if let Some(h) = c.f("tod") {
+            m.tod = h;
+            m.look.set_time_of_day(h);
+        }
+        if let Some(v) = c.u("mode") {
+            m.look.mode = v.min(7);
+        }
+        if let Some(v) = c.u("slot") {
+            m.look.slot = v.min(3);
+        }
+        if let Some(v) = c.u("rma") {
+            m.look.rma_order = v.min(3);
+        }
+        if let Some(v) = c.u("finish") {
+            m.look.finish = v.min(3);
+        }
+        if let Some(v) = c.f("pearl") {
+            m.look.pearl_amount = v;
+        }
+        if let Some(v) = c.f("exposure") {
+            m.look.exposure = v;
+        }
+        if let Some(v) = c.f("wet") {
+            m.look.wet = v;
+        }
+        if let Some(p) = c.get("paint") {
+            let v: Vec<f32> = p.split(',').filter_map(|x| x.parse().ok()).collect();
+            if v.len() == 3 {
+                m.look.paint = [v[0], v[1], v[2]];
+            }
+        }
+        m.look.wire = c.has("wire");
+        m.show_skeleton = c.has("skeleton");
+        m.show_normals = c.has("normals");
+        m.decal_bias = !c.has("no-decal-bias");
+        m.wheel_spin = c.f("spin").unwrap_or(0.0);
+        m.door_open = c.f("door").unwrap_or(0.0);
+        if let Some(v) = c.f("yaw") {
+            m.cam.yaw = v;
+        }
+        if let Some(v) = c.f("pitch") {
+            m.cam.pitch = v;
+        }
+        m.zoom_after_load = c.f("zoom");
+        if let Some(q) = c.get("model") {
+            self.tab = Tab::Model;
+            let lod = c.u("lod").unwrap_or(0) as usize;
+            m.open(q, lod, ctx);
+        }
+        if c.has("no-picker") {
+            m.show_picker = false;
+        }
+        if let Some(s) = c.get("picker-search") {
+            m.picker.search = s.to_string();
+        }
+        if let Some(s) = c.get("picker-cat") {
+            m.picker.set_cat(s);
+        }
+        if let Some(p) = c.get("window-screenshot") {
+            // whole window (picker and panels), not just the 3D view
+            self.shot = Some((PathBuf::from(p), 0, c.has("exit")));
+        } else if let Some(p) = c.get("screenshot") {
+            m.auto.screenshot = Some(PathBuf::from(p));
+            m.auto.exit = c.has("exit");
+        }
+    }
+
+    fn preview_error(&mut self, e: String) {
+        if let Preview::Textures { json, .. } = &mut self.preview {
+            *json = format!("texture decode error: {e}\n\n{json}");
+        }
+    }
+}
+
+fn human(n: u64) -> String {
+    if n >= 1 << 20 {
+        format!("{:.1} MB", n as f64 / (1u64 << 20) as f64)
+    } else if n >= 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
+}
+
+#[allow(dead_code)]
+fn unused(_: Filter) {}

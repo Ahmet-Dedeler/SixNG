@@ -1,0 +1,21 @@
+[package]
+name = "sixng-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sixng"
+path = "src/main.rs"
+
+[dependencies]
+sixng-core = { path = "../sixng-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { workspace = true, features = ["derive", "env"] }
+rayon.workspace = true
+regex = "1.13.2"
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

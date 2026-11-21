@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#140a2e"/>
+      <stop offset="0.55" stop-color="#4a1260"/>
+      <stop offset="1" stop-color="#ff5e8a"/>
+    </linearGradient>
+    <linearGradient id="sun" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffe27a"/>
+      <stop offset="0.45" stop-color="#ff9a5a"/>
+      <stop offset="1" stop-color="#ff3f8e"/>
+    </linearGradient>
+    <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2a0f4a"/>
+      <stop offset="1" stop-color="#0c0620"/>
+    </linearGradient>
+    <clipPath id="badge"><rect x="0" y="0" width="512" height="512" rx="112"/></clipPath>
+    <mask id="stripes">
+      <rect x="0" y="0" width="512" height="512" fill="#fff"/>
+      <rect x="0" y="292" width="512" height="7" fill="#000"/>
+      <rect x="0" y="314" width="512" height="10" fill="#000"/>
+      <rect x="0" y="338" width="512" height="13" fill="#000"/>
+    </mask>
+    <filter id="glow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="10" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+  <g clip-path="url(#badge)">
+    <rect width="512" height="512" fill="url(#sky)"/>
+    <!-- sun -->
+    <circle cx="256" cy="250" r="150" fill="url(#sun)" mask="url(#stripes)" filter="url(#glow)"/>
+    <!-- sea -->
+    <rect x="0" y="366" width="512" height="146" fill="url(#sea)"/>
+    <g stroke="#ff7fb0" stroke-linecap="round" opacity="0.85">
+      <line x1="150" y1="384" x2="362" y2="384" stroke-width="6"/>
+      <line x1="186" y1="404" x2="326" y2="404" stroke-width="5" opacity="0.7"/>
+      <line x1="216" y1="422" x2="296" y2="422" stroke-width="4" opacity="0.5"/>
+    </g>
+    <line x1="0" y1="366" x2="512" y2="366" stroke="#3ef0ff" stroke-width="4" opacity="0.9"/>
+    <!-- palms -->
+    <g fill="#12061f">
+      <path d="M88 512 C92 440 100 380 118 318 L128 320 C112 382 106 444 104 512 Z"/>
+      <path d="M122 318 C90 300 58 304 30 326 C62 312 92 314 120 326 Z"/>
+      <path d="M122 318 C100 286 70 270 36 272 C70 282 96 298 118 324 Z"/>
+      <path d="M122 318 C132 282 156 262 188 258 C160 272 142 292 128 324 Z"/>
+      <path d="M122 318 C156 304 190 310 214 334 C186 322 156 320 126 326 Z"/>
+      <path d="M122 318 C120 286 128 258 148 238 C138 262 134 290 128 322 Z"/>
+      <path d="M436 512 C432 452 424 404 404 356 L394 358 C412 408 418 456 420 512 Z"/>
+      <path d="M400 356 C428 338 458 340 484 358 C456 348 428 350 402 362 Z"/>
+      <path d="M400 356 C384 330 358 318 330 320 C358 328 380 340 396 362 Z"/>
+      <path d="M400 356 C408 326 428 308 456 304 C432 316 418 334 404 362 Z"/>
+    </g>
+    <!-- the 6 -->
+    <g fill="none" stroke="#12061f" stroke-width="50">
+      <circle cx="256" cy="282" r="64"/>
+      <path d="M192 282 L192 236 Q192 150 296 146" stroke-linecap="butt"/>
+    </g>
+  </g>
+  <rect x="6" y="6" width="500" height="500" rx="108" fill="none" stroke="#ff5ec4" stroke-width="8" opacity="0.9"/>
+</svg>

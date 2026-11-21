@@ -1,0 +1,1387 @@
+#![allow(dead_code)]
+//! 3D map: a streamed fly-through of the placed models.
+//!
+//! Entities come from the baked map (`work/map/entities.bin`, see mapbake).
+//! Each frame the camera picks entities by LOD band (HD near, then LOD and
+//! SLOD1-4 further out), drops props/vegetation by the density setting and
+//! anything that would be smaller than a few pixels, and draws one GPU model
+//! per placed model id with all its instances. Models are exported on demand
+//! into `work/gui_cache` (same cache as the model viewer) by worker threads,
+//! nearest first, and evicted least-recently-used. Textures are shared
+//! between models and capped in size. A coarse terrain mesh from the baked
+//! 8 m heights fills the distance. Overlays: roads and lights as lines, and
+//! draggable minimap / stats / inspect windows.
+use crate::glb;
+use crate::map2d::{self, MapData};
+use crate::mapbake::{rflag_names, EntRec, KIND_NAMES, RF_BBOX_UNKNOWN, RF_HIDE};
+use crate::mem;
+use crate::model_view;
+use crate::render3d::{self, Camera, GpuModel, Instance, LineV, Look, Renderer3D};
+use eframe::egui::{self, Color32, Pos2, Stroke};
+use eframe::egui_wgpu::{self, wgpu};
+use glam::{Mat4, Vec3};
+use sixng_core::export::{ExportOptions, Workspace};
+use sixng_core::scan::ArchiveIndex;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::time::Instant;
+
+pub const LOD_NAMES: [&str; 6] = ["HD", "LOD", "SLOD1", "SLOD2", "SLOD3", "SLOD4"];
+
+/// RAGE (Z-up) -> glTF/renderer (Y-up).
+pub fn gl(p: [f32; 3]) -> Vec3 {
+    Vec3::new(p[0], p[2], -p[1])
+}
+/// Renderer (Y-up) -> RAGE (Z-up).
+pub fn rage(v: Vec3) -> [f32; 3] {
+    [v.x, -v.z, v.y]
+}
+
+enum Slot {
+    Ready { gm: GpuModel, used: u64, tris: usize },
+    Failed(String),
+}
+
+struct Req {
+    model: u32,
+    id: String,
+    prio: f32,
+}
+
+struct Shared {
+    queue: Mutex<Vec<Req>>,
+    cv: Condvar,
+    inflight: Mutex<HashSet<u32>>,
+    stop: AtomicBool,
+    /// Results sent by workers but not yet uploaded.
+    unread: AtomicUsize,
+    /// Texture budget used up or RAM over the soft cap: workers load 64 px.
+    tex_over: AtomicBool,
+    /// RAM over the hard cap: workers skip loads entirely.
+    hard: AtomicBool,
+}
+
+type LoadResult = (u32, Result<glb::Model, String>);
+
+/// Detail settings (the "detail" slider sets them all; each can be tuned).
+#[derive(Clone, PartialEq)]
+pub struct Detail {
+    /// Upper distance of each LOD band: HD, LOD, SLOD1..4 (m).
+    pub radii: [f32; 6],
+    /// Fraction of props / vegetation kept (0..1).
+    pub prop_density: f32,
+    pub veg_density: f32,
+    /// Skip entities whose bbox radius / distance is below this (screen-size cull).
+    pub min_size: f32,
+    /// Drawable LOD file used for every model (0 = model.glb).
+    pub drawable_lod: usize,
+    pub max_tex: u32,
+    pub textures: bool,
+    /// Most LOD-level placements have no linked model yet (unresolved
+    /// archetype hashes), so keep large HD models out to the LOD band and
+    /// skip the LOD level instead.
+    pub hd_fallback: bool,
+}
+
+impl Detail {
+    pub fn from_level(d: f32) -> Self {
+        let d = d.clamp(0.0, 1.0);
+        let hd = 150.0 + 450.0 * d;
+        Detail {
+            radii: [hd, hd * 3.5, hd * 8.0, hd * 14.0, hd * 20.0, hd * 28.0],
+            prop_density: 0.25 + 0.75 * d,
+            veg_density: 0.15 + 0.85 * d,
+            min_size: 0.012 - 0.009 * d,
+            drawable_lod: 0,
+            max_tex: if d > 0.7 { 512 } else { 256 },
+            textures: true,
+            hd_fallback: true,
+        }
+    }
+}
+
+pub struct Auto {
+    pub screenshot: Option<PathBuf>,
+    pub exit: bool,
+    pub frames: u32,
+    pub quiet_frames: u32,
+    pub ui_shot: Option<PathBuf>,
+    pub started: Option<Instant>,
+    /// Automation: viewport points (fractions 0..1) to pick and print when the shot is taken.
+    pub picks: Vec<[f32; 2]>,
+}
+
+pub struct Map3D {
+    pub game: String,
+    pub work: String,
+    pub data: Option<Arc<MapData>>,
+    pub cam: Camera,
+    pub look: Look,
+    pub tod: f32,
+    pub detail_level: f32,
+    pub detail: Detail,
+    pub show_terrain: bool,
+    pub show_roads: bool,
+    pub show_lights: bool,
+    pub show_minimap: bool,
+    pub show_stats: bool,
+    pub decal_bias: bool,
+    /// Debug: also draw proxies, placeholders and degenerate models.
+    pub show_proxies: bool,
+    pub kinds: [bool; 6],
+    pub lods: [bool; 6],
+    pub speed: f32,
+    pub auto: Auto,
+    pub open_model: Option<String>,
+    pub status: String,
+    renderer: Option<Renderer3D>,
+    cache: HashMap<u32, Slot>,
+    tex_cache: HashMap<String, wgpu::Texture>,
+    /// Estimated GPU bytes of the cached textures.
+    tex_bytes: usize,
+    children_start: Vec<u32>,
+    children_list: Vec<u32>,
+    /// Texture key -> (models using it, estimated bytes).
+    tex_refs: HashMap<String, (u32, usize)>,
+    /// Model -> texture keys it uses.
+    model_texs: HashMap<u32, Vec<String>>,
+    /// Nearest distance of each wanted model (m).
+    near_dist: HashMap<u32, f32>,
+    pub budget: mem::Budget,
+    /// User RAM limit in GB (None = automatic, from the installed RAM).
+    pub ram_cap_gb: Option<f32>,
+    mem: mem::MemInfo,
+    pressure: u8,
+    mem_checked: Option<Instant>,
+    tex_keys: Arc<Mutex<HashSet<String>>>,
+    shared: Arc<Shared>,
+    rx: Option<mpsc::Receiver<LoadResult>>,
+    workers_started: bool,
+    want: HashMap<u32, Vec<Instance>>,
+    visible: Vec<(u32, u32)>, // (entity, model)
+    last_eye: Vec3,
+    last_detail: Option<Detail>,
+    last_kinds: [bool; 6],
+    last_lods: [bool; 6],
+    last_proxies: bool,
+    frame: u64,
+    dirty: bool,
+    terrain: Option<(GpuModel, [f32; 2])>,
+    stats: Stats,
+    picked: Option<u32>,
+    lines_cache: Option<(Vec3, f32, bool, bool, Vec<LineV>, Vec<LineV>)>,
+    size: [u32; 2],
+    load_opts_lod: usize,
+}
+
+#[derive(Default, Clone)]
+struct Stats {
+    entities: usize,
+    models_wanted: usize,
+    models_ready: usize,
+    queued: usize,
+    inflight: usize,
+    failed: usize,
+    instances: usize,
+    tris: usize,
+    per_band: [usize; 6],
+    textures: usize,
+    upload_ms: f32,
+    handoffs: usize,
+    hidden: usize,
+    tex_gb: f32,
+    update_ms: f32,
+}
+
+impl Map3D {
+    pub fn new(game: &str, work: &str) -> Self {
+        let mut look = Look::default();
+        look.set_time_of_day(14.0);
+        look.fog = 0.00022;
+        let mut cam = Camera::default();
+        cam.fly = true;
+        cam.near = 0.5;
+        cam.far = 12000.0;
+        cam.fov = 55f32.to_radians();
+        cam.eye = gl([-600.0, -60.0, 120.0]);
+        cam.yaw = 0.0;
+        cam.pitch = 0.35;
+        let detail_level = 0.5;
+        Map3D {
+            game: game.into(),
+            work: work.into(),
+            data: None,
+            cam,
+            look,
+            tod: 14.0,
+            detail_level,
+            detail: Detail::from_level(detail_level),
+            show_terrain: true,
+            show_roads: false,
+            show_lights: false,
+            show_minimap: true,
+            show_stats: true,
+            decal_bias: true,
+            show_proxies: false,
+            children_start: Vec::new(),
+            children_list: Vec::new(),
+            kinds: [true; 6],
+            lods: [true; 6],
+            speed: 1.0,
+            auto: Auto { screenshot: None, exit: false, frames: 0, quiet_frames: 0, ui_shot: None, started: None, picks: Vec::new() },
+            open_model: None,
+            status: String::new(),
+            renderer: None,
+            cache: HashMap::new(),
+            tex_cache: HashMap::new(),
+            tex_bytes: 0,
+            tex_refs: HashMap::new(),
+            model_texs: HashMap::new(),
+            near_dist: HashMap::new(),
+            budget: mem::Budget::for_total(mem::query().total),
+            ram_cap_gb: None,
+            mem: mem::query(),
+            pressure: 0,
+            mem_checked: None,
+            tex_keys: Arc::new(Mutex::new(HashSet::new())),
+            shared: Arc::new(Shared { queue: Mutex::new(Vec::new()), cv: Condvar::new(), inflight: Mutex::new(HashSet::new()), stop: AtomicBool::new(false), unread: AtomicUsize::new(0), tex_over: AtomicBool::new(false), hard: AtomicBool::new(false) }),
+            rx: None,
+            workers_started: false,
+            want: HashMap::new(),
+            visible: Vec::new(),
+            last_eye: Vec3::splat(f32::MAX),
+            last_detail: None,
+            last_kinds: [true; 6],
+            last_lods: [true; 6],
+            last_proxies: false,
+            frame: 0,
+            dirty: true,
+            terrain: None,
+            stats: Stats::default(),
+            picked: None,
+            lines_cache: None,
+            size: [16, 16],
+            load_opts_lod: 0,
+        }
+    }
+
+    pub fn cache_dir(&self) -> PathBuf {
+        Path::new(&self.work).join(crate::GUI_CACHE)
+    }
+
+    /// Put the camera above (x, y) RAGE, `h` metres over the ground.
+    /// Forget the map data (after a re-bake); loaded models stay cached.
+    pub fn reset_data(&mut self) {
+        self.data = None;
+        self.children_start.clear();
+        self.children_list.clear();
+        self.last_eye = Vec3::splat(f32::MAX);
+    }
+
+    pub fn place(&mut self, x: f32, y: f32, h: f32) {
+        let g = self.data.as_ref().and_then(|d| d.height(x, y)).unwrap_or(0.0);
+        self.cam.eye = gl([x, y, g + h]);
+        self.dirty = true;
+    }
+
+    fn start_workers(&mut self) {
+        if self.workers_started {
+            return;
+        }
+        self.workers_started = true;
+        let (tx, rx) = mpsc::channel::<LoadResult>();
+        self.rx = Some(rx);
+        let idx: Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6);
+        for _ in 0..n {
+            let sh = self.shared.clone();
+            let tx = tx.clone();
+            let idx = idx.clone();
+            let game = self.game.clone();
+            let work = self.work.clone();
+            let keys = self.tex_keys.clone();
+            std::thread::spawn(move || {
+                let ws = Workspace::new(&game, &work);
+                loop {
+                    // backpressure: decoded models wait in the channel until the
+                    // UI uploads them; keep that backlog small.
+                    while sh.unread.load(Ordering::SeqCst) > 24 && !sh.stop.load(Ordering::Relaxed) {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    let req = {
+                        let mut q = sh.queue.lock().unwrap();
+                        loop {
+                            if sh.stop.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            if !q.is_empty() {
+                                // nearest first
+                                let (bi, _) = q.iter().enumerate().fold((0, f32::MAX), |a, (i, r)| if r.prio < a.1 { (i, r.prio) } else { a });
+                                let r = q.swap_remove(bi);
+                                sh.inflight.lock().unwrap().insert(r.model);
+                                break r;
+                            }
+                            q = sh.cv.wait(q).unwrap();
+                        }
+                    };
+                    let (lod, max_tex, textures) = {
+                        // encoded in prio's companion fields would be cleaner; read from the id suffix
+                        let mut it = req.id.split('|');
+                        let _ = it.next();
+                        let lod = it.next().and_then(|s| s.parse().ok()).unwrap_or(0usize);
+                        let mt = it.next().and_then(|s| s.parse().ok()).unwrap_or(256u32);
+                        let tx_on = it.next().map(|s| s == "1").unwrap_or(true);
+                        (lod, mt, tx_on)
+                    };
+                    let id = req.id.split('|').next().unwrap_or("").to_string();
+                    if sh.hard.load(Ordering::Relaxed) {
+                        sh.inflight.lock().unwrap().remove(&req.model);
+                        continue;
+                    }
+                    let max_tex = if sh.tex_over.load(Ordering::Relaxed) { max_tex.min(64) } else { max_tex };
+                    let opts = glb::LoadOpts { max_tex, skip_keys: Some(keys.clone()), no_textures: !textures, hide_placeholders: true };
+                    let res = load_model(&ws, &Path::new(&work).join(crate::GUI_CACHE), &id, lod, &opts, &idx);
+                    sh.unread.fetch_add(1, Ordering::SeqCst);
+                    sh.inflight.lock().unwrap().remove(&req.model);
+                    if tx.send((req.model, res.map_err(|e| format!("{e:#}")))).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    }
+
+    /// Parent -> children lists (CSR) from the baked LOD parent links.
+    fn build_children(&mut self, data: &MapData) {
+        let n = data.ents.len();
+        let mut count = vec![0u32; n + 1];
+        for e in data.ents.iter() {
+            if (e.parent as usize) < n {
+                count[e.parent as usize + 1] += 1;
+            }
+        }
+        for i in 0..n {
+            count[i + 1] += count[i];
+        }
+        let mut fill = count.clone();
+        let mut list = vec![0u32; count[n] as usize];
+        for (i, e) in data.ents.iter().enumerate() {
+            if (e.parent as usize) < n {
+                let p = e.parent as usize;
+                list[fill[p] as usize] = i as u32;
+                fill[p] += 1;
+            }
+        }
+        self.children_start = count;
+        self.children_list = list;
+    }
+
+    /// Recompute the visible entity set and the per-model instance lists.
+    fn update_visible(&mut self, data: &MapData) {
+        let t0 = Instant::now();
+        if self.children_start.is_empty() {
+            self.build_children(data);
+        }
+        let eye = rage(self.cam.eye());
+        let d = &self.detail;
+        let rmax = d.radii[5];
+        let mut want: HashMap<u32, Vec<Instance>> = HashMap::new();
+        let mut prio: HashMap<u32, f32> = HashMap::new();
+        let mut near: HashMap<u32, f32> = HashMap::new();
+        let mut visible = Vec::new();
+        let mut per_band = [0usize; 6];
+        let mut n_ent = 0usize;
+        // Game LOD distances scaled by the detail setting (1.0 at detail ~0.4).
+        let k = d.radii[0] / 330.0;
+        let show_proxies = self.show_proxies;
+        let kinds = self.kinds;
+        let lods = self.lods;
+        let centre_dist = |e: &EntRec| -> f32 {
+            let (s, c) = e.yaw.sin_cos();
+            let lc = [(e.lo[0] + e.hi[0]) * 0.5, (e.lo[1] + e.hi[1]) * 0.5, (e.lo[2] + e.hi[2]) * 0.5];
+            let wc = [e.pos[0] + lc[0] * c - lc[1] * s, e.pos[1] + lc[0] * s + lc[1] * c, e.pos[2] + lc[2]];
+            ((wc[0] - eye[0]).powi(2) + (wc[1] - eye[1]).powi(2) + (wc[2] - eye[2]).powi(2)).sqrt()
+        };
+        let drawable = |e: &EntRec| -> bool {
+            !data.name(e.model).is_empty() && (show_proxies || e.rflags & RF_HIDE == 0) && kinds[e.kind.min(5) as usize] && lods[e.lod.min(5) as usize]
+        };
+        let rad_of = |e: &EntRec| -> f32 {
+            if e.rflags & RF_BBOX_UNKNOWN != 0 && e.lod > 0 {
+                1.0e4 // size unknown: never size-cull
+            } else {
+                0.5 * ((e.hi[0] - e.lo[0]).powi(2) + (e.hi[1] - e.lo[1]).powi(2) + (e.hi[2] - e.lo[2]).powi(2)).sqrt()
+            }
+        };
+        // band limits for placements without usable LOD links
+        let band = |e: &EntRec, rad: f32| -> (f32, f32) {
+            let l = e.lod.min(5) as usize;
+            let lo_r = if l == 0 { 0.0 } else { d.radii[l - 1] * 0.92 };
+            let hi_r = if l == 0 && d.hd_fallback && rad >= 10.0 { d.radii[1].min(d.radii[0] * 1.75) } else { d.radii[l] };
+            (lo_r, hi_r)
+        };
+        let outer = |e: &EntRec, rad: f32| -> f32 { if e.lod_dist > 0.0 { (e.lod_dist * k).min(rmax) } else { band(e, rad).1 } };
+        // children of parent p are active (they take over) when the camera
+        // is within p's child_lod_dist
+        let children_active = |p: &EntRec| -> bool { p.child_lod_dist > 0.0 && centre_dist(p) < p.child_lod_dist * k };
+        let mut handoffs = 0usize;
+        let mut hidden = 0usize;
+        let cache = &self.cache;
+        let (cs, cl) = (&self.children_start, &self.children_list);
+        data.ent_grid.query(eye[0] - rmax, eye[1] - rmax, eye[0] + rmax, eye[1] + rmax, |i| {
+            let e: &EntRec = &data.ents[i as usize];
+            let kind = e.kind.min(5) as usize;
+            if !drawable(e) {
+                if e.rflags & RF_HIDE != 0 && !data.name(e.model).is_empty() {
+                    hidden += 1;
+                }
+                return;
+            }
+            let l = e.lod.min(5) as usize;
+            let dist = centre_dist(e);
+            let rad = rad_of(e);
+            let has_parent = e.parent != u32::MAX;
+            let has_children = cs[i as usize] < cs[i as usize + 1];
+            if has_parent || has_children {
+                // linked placements: game LOD hand-off
+                let mut lim = outer(e, rad);
+                if has_parent {
+                    let p = &data.ents[e.parent as usize];
+                    if drawable(p) {
+                        if !children_active(p) {
+                            return; // the parent is drawn instead
+                        }
+                    } else if d.hd_fallback {
+                        // parent has no model: stay out to the parent's distance
+                        lim = lim.max(outer(p, rad_of(p)));
+                    }
+                }
+                if dist >= lim {
+                    return;
+                }
+                if has_children && children_active(e) {
+                    // hand over only when every drawable child is loaded
+                    let ready = cl[cs[i as usize] as usize..cs[i as usize + 1] as usize].iter().all(|&c| {
+                        let ce = &data.ents[c as usize];
+                        !drawable(ce) || cache.contains_key(&ce.model)
+                    });
+                    if ready {
+                        handoffs += 1;
+                        return;
+                    }
+                }
+            } else {
+                let (lo_r, hi_r) = band(e, rad);
+                if d.hd_fallback && l == 1 {
+                    return;
+                }
+                if dist >= hi_r || dist < lo_r {
+                    return;
+                }
+            }
+            if dist > 1.0 && rad / dist < d.min_size {
+                return;
+            }
+            let dens = match kind {
+                2 => d.prop_density,
+                3 => d.veg_density,
+                _ => 1.0,
+            };
+            if dens < 1.0 && (hash32(i) as f32 / u32::MAX as f32) > dens {
+                return;
+            }
+            n_ent += 1;
+            per_band[l] += 1;
+            let m = Mat4::from_translation(gl(e.pos)) * Mat4::from_rotation_y(e.yaw);
+            want.entry(e.model).or_default().push(Instance::new(m, false));
+            let nd = near.entry(e.model).or_insert(f32::MAX);
+            *nd = nd.min(dist);
+            let p = prio.entry(e.model).or_insert(f32::MAX);
+            *p = p.min(dist / rad.clamp(1.0, 400.0).sqrt());
+            visible.push((i, e.model));
+        });
+        self.stats.handoffs = handoffs;
+        self.stats.hidden = hidden;
+        // requests: wanted models that are not cached or in flight, nearest first
+        let inflight = self.shared.inflight.lock().unwrap().clone();
+        // Texture size by distance (full size within the HD band, then 1/2,
+        // 1/4, 1/8) and a hard 64 px once the texture budget is used up.
+        let over = self.tex_bytes as u64 > self.budget.textures || self.pressure > 0;
+        let tex_for = |dist: f32| -> u32 {
+            if over {
+                return 64;
+            }
+            let r0 = d.radii[0].max(50.0);
+            let div = if dist < r0 { 1 } else if dist < 2.5 * r0 { 2 } else if dist < 6.0 * r0 { 4 } else { 8 };
+            (d.max_tex / div).max(64)
+        };
+        let tx_on = if d.textures { 1 } else { 0 };
+        let mut reqs: Vec<Req> = prio
+            .iter()
+            .filter(|(m, _)| !self.cache.contains_key(m) && !inflight.contains(m))
+            // Under memory pressure only the nearest models still load, and
+            // over the hard cap nothing does.
+            .filter(|(m, _)| match self.pressure {
+                0 => true,
+                1 => near.get(m).map_or(false, |&dd| dd < d.radii[0]),
+                _ => false,
+            })
+            .map(|(&m, &p)| Req { model: m, id: format!("{}|{}|{}|{}", data.name(m), d.drawable_lod, tex_for(near.get(&m).copied().unwrap_or(0.0)), tx_on), prio: p })
+            .collect();
+        reqs.sort_by(|a, b| a.prio.partial_cmp(&b.prio).unwrap_or(std::cmp::Ordering::Equal));
+        reqs.truncate(4000);
+        let nq = reqs.len();
+        *self.shared.queue.lock().unwrap() = reqs;
+        self.shared.cv.notify_all();
+        self.stats.entities = n_ent;
+        self.stats.models_wanted = want.len();
+        self.stats.queued = nq;
+        self.stats.per_band = per_band;
+        self.want = want;
+        self.near_dist = near;
+        self.visible = visible;
+        self.stats.update_ms = t0.elapsed().as_secs_f32() * 1000.0;
+    }
+
+    fn apply_instances(&mut self, rs: &egui_wgpu::RenderState) {
+        let ren = self.renderer.as_ref().unwrap();
+        let mut inst_total = 0;
+        let mut tris = 0;
+        for (m, slot) in self.cache.iter_mut() {
+            if let Slot::Ready { gm, used, tris: t } = slot {
+                match self.want.get(m) {
+                    Some(v) => {
+                        ren.set_instances(rs, gm, v);
+                        *used = self.frame;
+                        inst_total += v.len();
+                        tris += *t * v.len();
+                    }
+                    None => gm.n_instances = 0,
+                }
+            }
+        }
+        self.stats.instances = inst_total;
+        self.stats.tris = tris;
+    }
+
+    /// Over the hard cap: discard finished loads instead of uploading them.
+    fn drain_loads(&mut self) -> bool {
+        let Some(rx) = &self.rx else { return false };
+        let mut any = false;
+        while rx.try_recv().is_ok() {
+            self.shared.unread.fetch_sub(1, Ordering::SeqCst);
+            any = true;
+        }
+        any
+    }
+
+    /// Upload finished loads within a time budget.
+    fn poll_loads(&mut self, rs: &egui_wgpu::RenderState) -> bool {
+        let Some(rx) = &self.rx else { return false };
+        let t0 = Instant::now();
+        let mut any = false;
+        let ren = self.renderer.as_ref().unwrap();
+        while t0.elapsed().as_millis() < 12 {
+            let Ok((m, res)) = rx.try_recv() else { break };
+            self.shared.unread.fetch_sub(1, Ordering::SeqCst);
+            any = true;
+            match res {
+                Ok(model) => {
+                    let mut gm = ren.upload_shared(rs, &model, &[], Some(&mut self.tex_cache));
+                    {
+                        let mut k = self.tex_keys.lock().unwrap();
+                        let mut keys = Vec::new();
+                        for i in &model.images {
+                            let bytes: usize = i.mips.iter().map(|m| m.2.len()).sum();
+                            let r = self.tex_refs.entry(i.key.clone()).or_insert((0, 0));
+                            r.0 += 1;
+                            if bytes > 0 && r.1 == 0 {
+                                r.1 = bytes;
+                                self.tex_bytes += bytes;
+                                k.insert(i.key.clone());
+                            }
+                            keys.push(i.key.clone());
+                        }
+                        if let Some(old) = self.model_texs.insert(m, keys) {
+                            Self::release_keys(&mut self.tex_refs, &mut self.tex_cache, &mut k, &mut self.tex_bytes, old);
+                        }
+                    }
+                    if let Some(v) = self.want.get(&m) {
+                        ren.set_instances(rs, &mut gm, v);
+                    } else {
+                        gm.n_instances = 0;
+                    }
+                    self.cache.insert(m, Slot::Ready { gm, used: self.frame, tris: model.triangles });
+                }
+                Err(e) => {
+                    self.cache.insert(m, Slot::Failed(e));
+                }
+            }
+        }
+        self.stats.upload_ms = t0.elapsed().as_secs_f32() * 1000.0;
+        self.shared.tex_over.store(self.tex_bytes as u64 > self.budget.textures || self.pressure > 0, Ordering::Relaxed);
+        any
+    }
+
+    /// Drop one reference to each texture key; free textures nobody uses.
+    fn release_keys(refs: &mut HashMap<String, (u32, usize)>, cache: &mut HashMap<String, wgpu::Texture>, keys_set: &mut HashSet<String>, bytes: &mut usize, keys: Vec<String>) {
+        for k in keys {
+            if let Some(r) = refs.get_mut(&k) {
+                r.0 = r.0.saturating_sub(1);
+                if r.0 == 0 {
+                    *bytes = bytes.saturating_sub(r.1);
+                    refs.remove(&k);
+                    cache.remove(&k);
+                    keys_set.remove(&k);
+                }
+            }
+        }
+    }
+
+    fn remove_model(&mut self, m: u32) {
+        self.cache.remove(&m);
+        if let Some(keys) = self.model_texs.remove(&m) {
+            let mut k = self.tex_keys.lock().unwrap();
+            Self::release_keys(&mut self.tex_refs, &mut self.tex_cache, &mut k, &mut self.tex_bytes, keys);
+        }
+    }
+
+    fn ready_by_distance(&self) -> Vec<(f32, u32)> {
+        let mut v: Vec<(f32, u32)> = self
+            .cache
+            .iter()
+            .filter(|(_, s)| matches!(s, Slot::Ready { .. }))
+            .map(|(m, _)| (self.near_dist.get(m).copied().unwrap_or(f32::MAX), *m))
+            .collect();
+        v.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        v
+    }
+
+    /// Keep the resident set inside the RAM-derived budget: a model-count
+    /// cap (off-screen models first, then the farthest), everything off
+    /// screen dropped under pressure, and over the hard cap the farthest
+    /// fifth of the visible models on every check.
+    fn evict(&mut self) {
+        let ready = self.cache.values().filter(|s| matches!(s, Slot::Ready { .. })).count();
+        let cap = if self.pressure > 0 { 0 } else { self.budget.models };
+        if ready > cap {
+            let mut off: Vec<(u64, u32)> = self
+                .cache
+                .iter()
+                .filter_map(|(m, s)| match s {
+                    Slot::Ready { used, .. } if !self.want.contains_key(m) => Some((*used, *m)),
+                    _ => None,
+                })
+                .collect();
+            off.sort();
+            let n = (ready - cap).min(off.len());
+            for (_, m) in off.into_iter().take(n) {
+                self.remove_model(m);
+            }
+        }
+        if self.pressure >= 2 {
+            let vis = self.ready_by_distance();
+            let n = vis.len() / 5;
+            for (_, m) in vis.into_iter().take(n) {
+                self.remove_model(m);
+            }
+        }
+        let ready_now = self.cache.values().filter(|s| matches!(s, Slot::Ready { .. })).count();
+        if ready_now > self.budget.models {
+            let vis = self.ready_by_distance();
+            for (_, m) in vis.into_iter().take(ready_now - self.budget.models) {
+                self.remove_model(m);
+            }
+        }
+    }
+
+    /// Sample memory twice a second; refresh the stream when the pressure
+    /// level changes (and keep shedding while over the hard cap).
+    fn check_memory(&mut self) {
+        if self.mem_checked.map_or(false, |t| t.elapsed().as_millis() < 500) {
+            return;
+        }
+        self.mem_checked = Some(Instant::now());
+        self.mem = mem::query();
+        let p = self.budget.pressure(&self.mem);
+        self.shared.hard.store(p >= 2, Ordering::Relaxed);
+        self.shared.tex_over.store(self.tex_bytes as u64 > self.budget.textures || p > 0, Ordering::Relaxed);
+        if p != self.pressure || p >= 2 {
+            self.pressure = p;
+            self.dirty = true;
+        }
+    }
+
+    fn build_terrain(&mut self, rs: &egui_wgpu::RenderState, data: &MapData, centre: [f32; 2]) {
+        const STEP: f32 = 16.0;
+        const HALF: i32 = 220; // 2 x 220 x 16 m = 7 km
+        let n = (2 * HALF + 1) as usize;
+        let mut verts = Vec::with_capacity(n * n);
+        let mut hs = vec![f32::NAN; n * n];
+        let cx = (centre[0] / STEP).round() * STEP;
+        let cy = (centre[1] / STEP).round() * STEP;
+        for j in 0..n {
+            for i in 0..n {
+                let x = cx + (i as i32 - HALF) as f32 * STEP;
+                let y = cy + (j as i32 - HALF) as f32 * STEP;
+                hs[j * n + i] = data.height(x, y).unwrap_or(f32::NAN);
+            }
+        }
+        // The bake stores the top collision surface (roofs included). A
+        // morphological opening (min then max over ~100 m) removes buildings
+        // but keeps hills; a final 3x3 mean smooths the steps.
+        let hs = {
+            const R: i32 = 3;
+            let filt = |src: &Vec<f32>, take_min: bool| {
+                let mut out = vec![0.0f32; n * n];
+                for j in 0..n as i32 {
+                    for i in 0..n as i32 {
+                        let mut v = if take_min { f32::MAX } else { f32::MIN };
+                        for dj in -R..=R {
+                            for di in -R..=R {
+                                let (x, y) = ((i + di).clamp(0, n as i32 - 1), (j + dj).clamp(0, n as i32 - 1));
+                                let s = src[y as usize * n + x as usize];
+                                let s = if s.is_nan() { -2.0 } else { s };
+                                v = if take_min { v.min(s) } else { v.max(s) };
+                            }
+                        }
+                        out[j as usize * n + i as usize] = v;
+                    }
+                }
+                out
+            };
+            let water: Vec<bool> = hs.iter().map(|v| v.is_nan()).collect();
+            let opened = filt(&filt(&hs, true), false);
+            let mut sm = opened.clone();
+            for j in 1..n - 1 {
+                for i in 1..n - 1 {
+                    let mut s = 0.0;
+                    for dj in 0..3 {
+                        for di in 0..3 {
+                            s += opened[(j + dj - 1) * n + i + di - 1];
+                        }
+                    }
+                    sm[j * n + i] = s / 9.0;
+                }
+            }
+            sm.iter().zip(&water).map(|(v, w)| if *w { f32::NAN } else { *v }).collect::<Vec<f32>>()
+        };
+        let h = |i: usize, j: usize| hs[j.min(n - 1) * n + i.min(n - 1)];
+        for j in 0..n {
+            for i in 0..n {
+                let x = cx + (i as i32 - HALF) as f32 * STEP;
+                let y = cy + (j as i32 - HALF) as f32 * STEP;
+                let z = h(i, j);
+                let z = if z.is_nan() { -2.0 } else { z };
+                let zx = h(i + 1, j) - h(i.saturating_sub(1), j);
+                let zy = h(i, j + 1) - h(i, j.saturating_sub(1));
+                let nr = Vec3::new(-zx.nan_or(0.0), -zy.nan_or(0.0), 2.0 * STEP).normalize();
+                let p = gl([x, y, z - 1.5]);
+                let water = h(i, j).is_nan() || z < 0.5;
+                let col = if water { [60, 80, 95, 255] } else { [120, 124, 106, 255] };
+                verts.push(glb::Vertex { pos: p.into(), nrm: gl([nr.x, nr.y, nr.z]).into(), tan: [1.0, 0.0, 0.0, 1.0], uv0: [0.0, 0.0], uv1: [0.0, 0.0], col, joints: [0; 4], weights: [0; 4] });
+            }
+        }
+        let mut idx = Vec::with_capacity((n - 1) * (n - 1) * 6);
+        for j in 0..n - 1 {
+            for i in 0..n - 1 {
+                let a = (j * n + i) as u32;
+                let b = a + 1;
+                let c = a + n as u32;
+                let d = c + 1;
+                idx.extend_from_slice(&[a, b, c, b, d, c]);
+            }
+        }
+        let mesh = glb::Mesh { name: "terrain".into(), verts, indices: idx, material: Some(0), skinned: false, has_tangents: false, uv_sets: 1, centre: gl([cx, cy, 0.0]).into() };
+        let mat = glb::Material { name: "terrain".into(), class: "terrain".into(), alpha_mode: "OPAQUE".into(), base_factor: [0.20, 0.21, 0.16, 1.0], base: None, normal: None, packed: None, emissive: None, slots: vec![], gap: "ok".into(), shader_hash: String::new(), decal: None };
+        let model = glb::Model { path: PathBuf::new(), meshes: vec![mesh], materials: vec![mat], joints: vec![], images: vec![], bbox: [[0.0; 3]; 2], triangles: 0, vertices: 0, extras: Default::default() };
+        let ren = self.renderer.as_ref().unwrap();
+        let gm = ren.upload(rs, &model, &[]);
+        self.terrain = Some((gm, [cx, cy]));
+    }
+
+    fn overlay_lines(&mut self, data: &MapData) -> (Vec<LineV>, Vec<LineV>) {
+        let eye = self.cam.eye();
+        if let Some((e, h, r, l, a, b)) = &self.lines_cache {
+            if (*e - eye).length() < 40.0 && *h == self.tod && *r == self.show_roads && *l == self.show_lights {
+                return (a.clone(), b.clone());
+            }
+        }
+        let er = rage(eye);
+        let mut under = Vec::new();
+        let top = Vec::new();
+        if self.show_roads {
+            let rr = 1500.0;
+            data.road_grid.query(er[0] - rr, er[1] - rr, er[0] + rr, er[1] + rr, |i| {
+                let r = &data.roads[i as usize];
+                let c = map2d::ramp((r.speed / 35.0).clamp(0.0, 1.0));
+                let col = [c.r(), c.g(), c.b(), 255];
+                under.push(LineV { pos: (gl(r.a) + Vec3::Y * 0.4).into(), col });
+                under.push(LineV { pos: (gl(r.b) + Vec3::Y * 0.4).into(), col });
+            });
+        }
+        if self.show_lights {
+            let lr = 700.0;
+            let hour = (self.tod.floor() as u32).min(23);
+            data.light_grid.query(er[0] - lr, er[1] - lr, er[0] + lr, er[1] + lr, |i| {
+                let l = &data.lights[i as usize];
+                if l.flags & 1 != 0 || l.mask & (1 << hour) == 0 || (l.flags & 2 != 0 && (7..19).contains(&hour)) {
+                    return;
+                }
+                let col = [l.rgb_type[0], l.rgb_type[1], l.rgb_type[2], 255];
+                let p = gl(l.pos);
+                let s = 0.25 + l.range.min(40.0) * 0.02;
+                for d in [Vec3::X, Vec3::Y, Vec3::Z] {
+                    under.push(LineV { pos: (p - d * s).into(), col });
+                    under.push(LineV { pos: (p + d * s).into(), col });
+                }
+            });
+        }
+        self.lines_cache = Some((eye, self.tod, self.show_roads, self.show_lights, under.clone(), top.clone()));
+        (under, top)
+    }
+
+    /// Ray pick against the visible entities' bboxes.
+    fn pick(&self, data: &MapData, ray_o: Vec3, ray_d: Vec3) -> Option<u32> {
+        let o = rage(ray_o);
+        let dd = rage(ray_d);
+        let mut best: Option<(f32, u32)> = None;
+        for &(i, _) in &self.visible {
+            let e = &data.ents[i as usize];
+            // to entity-local (rotate by -yaw)
+            let (s, c) = (-e.yaw).sin_cos();
+            let px = o[0] - e.pos[0];
+            let py = o[1] - e.pos[1];
+            let lo = [px * c - py * s, px * s + py * c, o[2] - e.pos[2]];
+            let ld = [dd[0] * c - dd[1] * s, dd[0] * s + dd[1] * c, dd[2]];
+            let (mut t0, mut t1) = (0.0f32, f32::MAX);
+            let mut hit = true;
+            for k in 0..3 {
+                if ld[k].abs() < 1e-9 {
+                    if lo[k] < e.lo[k] || lo[k] > e.hi[k] {
+                        hit = false;
+                        break;
+                    }
+                } else {
+                    let a = (e.lo[k] - lo[k]) / ld[k];
+                    let b = (e.hi[k] - lo[k]) / ld[k];
+                    t0 = t0.max(a.min(b));
+                    t1 = t1.min(a.max(b));
+                }
+            }
+            if hit && t0 <= t1 {
+                // prefer small boxes on ties (a prop on a ground tile)
+                let vol = (e.hi[0] - e.lo[0]) * (e.hi[1] - e.lo[1]) * (e.hi[2] - e.lo[2]);
+                let key = t0 + vol.cbrt() * 0.05;
+                if best.map_or(true, |b| key < b.0) {
+                    best = Some((key, i));
+                }
+            }
+        }
+        best.map(|b| b.1)
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let Some(rs) = frame.wgpu_render_state() else {
+            ui.label("The 3D map needs the wgpu renderer.");
+            return;
+        };
+        let Some(data) = self.data.clone() else {
+            ui.label("Loading the baked map (work/map) …  Bake it first if this stays: sixng-gui --bake-map");
+            ctx.request_repaint();
+            return;
+        };
+        self.frame += 1;
+        self.start_workers();
+        if self.renderer.is_none() {
+            self.renderer = Some(Renderer3D::new(rs));
+        }
+        // side panel
+        egui::SidePanel::right("map3d_side").resizable(true).default_width(300.0).show_inside(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| self.side_ui(ui));
+        });
+        if self.detail_level_changed() {
+            self.dirty = true;
+        }
+        // uploads first, then visibility
+        self.check_memory();
+        let got = if self.pressure >= 2 { self.drain_loads() } else { self.poll_loads(rs) };
+        let eye = self.cam.eye();
+        let moved = (eye - self.last_eye).length();
+        if self.dirty || moved > 15.0 || self.last_kinds != self.kinds || self.last_lods != self.lods || self.last_proxies != self.show_proxies || self.last_detail.as_ref() != Some(&self.detail) {
+            let lod_changed = self.last_detail.as_ref().map_or(false, |d| d.drawable_lod != self.detail.drawable_lod || d.textures != self.detail.textures || d.max_tex != self.detail.max_tex);
+            if lod_changed {
+                self.cache.clear();
+                self.tex_cache.clear();
+                self.tex_bytes = 0;
+                self.tex_refs.clear();
+                self.model_texs.clear();
+                self.tex_keys.lock().unwrap().clear();
+            }
+            self.update_visible(&data);
+            self.last_eye = eye;
+            self.last_detail = Some(self.detail.clone());
+            self.last_kinds = self.kinds;
+            self.last_lods = self.lods;
+            self.last_proxies = self.show_proxies;
+            self.dirty = false;
+            self.apply_instances(rs);
+            self.evict();
+        } else if got {
+            self.apply_instances(rs);
+        }
+        let er = rage(eye);
+        if self.show_terrain {
+            let rebuild = self.terrain.as_ref().map_or(true, |(_, c)| (c[0] - er[0]).abs() > 1200.0 || (c[1] - er[1]).abs() > 1200.0);
+            if rebuild {
+                self.build_terrain(rs, &data, [er[0], er[1]]);
+            }
+        }
+        {
+            let inflight = self.shared.inflight.lock().unwrap().len();
+            let queued = self.shared.queue.lock().unwrap().len();
+            self.stats.inflight = inflight + self.shared.unread.load(Ordering::SeqCst);
+            self.stats.queued = queued;
+            self.stats.models_ready = self.cache.values().filter(|s| matches!(s, Slot::Ready { .. })).count();
+            self.stats.failed = self.cache.values().filter(|s| matches!(s, Slot::Failed(_))).count();
+            self.stats.textures = self.tex_cache.len();
+            self.stats.tex_gb = self.tex_bytes as f32 / (1u64 << 30) as f32;
+        }
+
+        // viewport
+        let avail = ui.available_size();
+        let (rect, resp) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        self.cam.near = 0.5;
+        self.cam.far = (self.detail.radii[5] * 1.3).max(3000.0);
+        self.cam.handle(ui, &resp);
+        // fly speed: the camera handler moves near*400 m/s; scale with height
+        if resp.hovered() {
+            let dt = ui.input(|i| i.stable_dt).min(0.1);
+            let ground = data.height(er[0], er[1]).unwrap_or(0.0);
+            let alt = (er[2] - ground).max(2.0);
+            let sp = (alt * 0.8).clamp(8.0, 600.0) * self.speed * dt * if ui.input(|i| i.modifiers.shift) { 4.0 } else { 1.0 };
+            let f = self.cam.forward();
+            let right = f.cross(Vec3::Y).normalize_or_zero();
+            ui.input(|i| {
+                if i.key_down(egui::Key::W) || i.key_down(egui::Key::ArrowUp) { self.cam.eye += f * sp; }
+                if i.key_down(egui::Key::S) || i.key_down(egui::Key::ArrowDown) { self.cam.eye -= f * sp; }
+                if i.key_down(egui::Key::A) || i.key_down(egui::Key::ArrowLeft) { self.cam.eye -= right * sp; }
+                if i.key_down(egui::Key::D) || i.key_down(egui::Key::ArrowRight) { self.cam.eye += right * sp; }
+                if i.key_down(egui::Key::E) || i.key_down(egui::Key::PageUp) { self.cam.eye += Vec3::Y * sp; }
+                if i.key_down(egui::Key::Q) || i.key_down(egui::Key::PageDown) { self.cam.eye -= Vec3::Y * sp; }
+            });
+        }
+        let ppp = ctx.pixels_per_point();
+        let px = [(rect.width() * ppp) as u32, (rect.height() * ppp) as u32];
+        self.size = px;
+        if resp.clicked() {
+            if let Some(p) = resp.interact_pointer_pos() {
+                let ndc_x = (p.x - rect.left()) / rect.width() * 2.0 - 1.0;
+                let ndc_y = 1.0 - (p.y - rect.top()) / rect.height() * 2.0;
+                let aspect = rect.width() / rect.height();
+                let inv = (self.cam.proj(aspect) * self.cam.view()).inverse();
+                // reversed Z: 1 = near plane
+                let a = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
+                let b = inv.project_point3(Vec3::new(ndc_x, ndc_y, 0.5));
+                self.picked = self.pick(&data, self.cam.eye(), (b - a).normalize());
+            }
+        }
+        let (under, top) = self.overlay_lines(&data);
+        let mut models: Vec<&GpuModel> = Vec::new();
+        if self.show_terrain {
+            if let Some((t, _)) = &self.terrain {
+                models.push(t);
+            }
+        }
+        for s in self.cache.values() {
+            if let Slot::Ready { gm, .. } = s {
+                if gm.n_instances > 0 {
+                    models.push(gm);
+                }
+            }
+        }
+        let ren = self.renderer.as_mut().unwrap();
+        ren.decal_bias = self.decal_bias;
+        let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
+        ui.painter().image(tid, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+        // picked entity outline (bbox corners projected)
+        if let Some(i) = self.picked {
+            let e = &data.ents[i as usize];
+            let (s, c) = e.yaw.sin_cos();
+            let corner = |k: usize| {
+                let lx = if k & 1 == 0 { e.lo[0] } else { e.hi[0] };
+                let ly = if k & 2 == 0 { e.lo[1] } else { e.hi[1] };
+                let lz = if k & 4 == 0 { e.lo[2] } else { e.hi[2] };
+                gl([e.pos[0] + lx * c - ly * s, e.pos[1] + lx * s + ly * c, e.pos[2] + lz])
+            };
+            let pts: Vec<Option<Pos2>> = (0..8).map(|k| Renderer3D::project(&self.cam, rect.size(), corner(k)).map(|p| p + rect.min.to_vec2())).collect();
+            for (a, b) in [(0, 1), (1, 3), (3, 2), (2, 0), (4, 5), (5, 7), (7, 6), (6, 4), (0, 4), (1, 5), (2, 6), (3, 7)] {
+                if let (Some(pa), Some(pb)) = (pts[a], pts[b]) {
+                    ui.painter().line_segment([pa, pb], Stroke::new(1.5, Color32::from_rgb(255, 220, 40)));
+                }
+            }
+        }
+        // hint
+        ui.painter().text(rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, "drag: look · WASD/arrows: move · Q/E: down/up · Shift: fast · right-drag: pan · click: inspect", egui::FontId::proportional(12.0), Color32::from_white_alpha(200));
+        self.overlay_windows(&ctx, rect, &data);
+        self.automation(&ctx, rs, rect);
+        let busy = self.stats.queued > 0 || self.stats.inflight > 0;
+        if busy || resp.hovered() || resp.dragged() || self.auto.screenshot.is_some() || self.auto.ui_shot.is_some() {
+            ctx.request_repaint();
+        }
+    }
+
+    fn detail_level_changed(&mut self) -> bool {
+        false
+    }
+
+    /// Apply a RAM limit (None = automatic) and save it for next time.
+    pub fn set_ram_cap(&mut self, cap: Option<f32>, save: bool) {
+        self.ram_cap_gb = cap;
+        let auto = mem::Budget::for_total(mem::query().total);
+        self.budget = match cap {
+            Some(gb) => auto.with_cap(gb),
+            None => auto,
+        };
+        self.dirty = true;
+        if save {
+            let p = Path::new(&self.work).join("gui_settings.json");
+            let mut j: serde_json::Value = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
+            j["map3d_ram_cap_gb"] = match cap {
+                Some(v) => serde_json::json!(v),
+                None => serde_json::Value::Null,
+            };
+            let _ = std::fs::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
+        }
+    }
+
+    /// Load the saved RAM limit, if any.
+    pub fn load_settings(&mut self) {
+        let p = Path::new(&self.work).join("gui_settings.json");
+        let cap = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|j| j["map3d_ram_cap_gb"].as_f64()).map(|v| v as f32);
+        if cap.is_some() {
+            self.set_ram_cap(cap, false);
+        }
+    }
+
+    fn ram_ui(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Memory");
+        let total = mem::gb(self.mem.total).max(4.0);
+        let mut auto = self.ram_cap_gb.is_none();
+        let mut gb = self.ram_cap_gb.unwrap_or(mem::gb(self.budget.soft));
+        let mut changed = false;
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut auto, "automatic").on_hover_text("20 % of installed RAM before streaming slows down, 30 % before distant models are dropped").changed() {
+                changed = true;
+            }
+            ui.add_enabled_ui(!auto, |ui| {
+                let r = ui.add(egui::Slider::new(&mut gb, 1.0..=(total * 0.9).floor()).step_by(0.5).suffix(" GB").text("RAM limit"));
+                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                    changed = true;
+                }
+            });
+        });
+        if changed {
+            self.set_ram_cap(if auto { None } else { Some(gb) }, true);
+        }
+        let (mi, bu) = (self.mem, self.budget);
+        let frac = (mi.process as f32 / bu.hard.max(1) as f32).clamp(0.0, 1.0);
+        let col = match self.pressure {
+            0 => Color32::from_rgb(90, 170, 90),
+            1 => Color32::from_rgb(220, 180, 40),
+            _ => Color32::from_rgb(220, 80, 60),
+        };
+        ui.add(egui::ProgressBar::new(frac).fill(col).text(format!("{:.1} GB used · slows at {:.1} · drops at {:.1} GB", mem::gb(mi.process), mem::gb(bu.soft), mem::gb(bu.hard))));
+        ui.label(egui::RichText::new(format!("{:.0} GB installed · {:.1} GB free · textures ≤ {:.1} GB · up to {} models", mem::gb(mi.total), mem::gb(mi.avail), mem::gb(bu.textures), bu.models)).small().weak());
+        ui.separator();
+    }
+
+    fn side_ui(&mut self, ui: &mut egui::Ui) {
+        self.ram_ui(ui);
+        ui.heading("Detail");
+        let mut lvl = self.detail_level;
+        if ui.add(egui::Slider::new(&mut lvl, 0.0..=1.0).text("detail")).changed() {
+            self.detail_level = lvl;
+            let keep = (self.detail.drawable_lod, self.detail.textures, self.detail.hd_fallback);
+            self.detail = Detail::from_level(lvl);
+            self.detail.drawable_lod = keep.0;
+            self.detail.textures = keep.1;
+            self.detail.hd_fallback = keep.2;
+        }
+        egui::CollapsingHeader::new("LOD distances (m)").default_open(false).show(ui, |ui| {
+            for k in 0..6 {
+                let lo = if k == 0 { 10.0 } else { self.detail.radii[k - 1] };
+                ui.add(egui::Slider::new(&mut self.detail.radii[k], lo..=12000.0).logarithmic(true).text(LOD_NAMES[k]));
+            }
+        });
+        ui.checkbox(&mut self.detail.hd_fallback, "HD fallback for unlinked LODs").on_hover_text("Most LOD placements have no linked model yet; keep large HD models out to the LOD distance instead and skip the LOD level.");
+        ui.add(egui::Slider::new(&mut self.detail.prop_density, 0.0..=1.0).text("prop density"));
+        ui.add(egui::Slider::new(&mut self.detail.veg_density, 0.0..=1.0).text("vegetation density"));
+        ui.add(egui::Slider::new(&mut self.detail.min_size, 0.0..=0.03).text("min screen size"));
+        ui.horizontal(|ui| {
+            ui.label("drawable LOD");
+            for k in 0..4 {
+                ui.selectable_value(&mut self.detail.drawable_lod, k, format!("{k}"));
+            }
+        });
+        ui.label(egui::RichText::new("Building drawables keep trim strips in LOD 1-3; the distance bands use the separate LOD/SLOD placements instead.").small().weak());
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.detail.textures, "textures");
+            egui::ComboBox::from_id_salt("maxtex").selected_text(format!("max {} px", self.detail.max_tex)).show_ui(ui, |ui| {
+                for v in [128u32, 256, 512, 1024] {
+                    ui.selectable_value(&mut self.detail.max_tex, v, format!("{v} px"));
+                }
+            });
+        });
+        ui.separator();
+        ui.heading("Show");
+        ui.horizontal_wrapped(|ui| {
+            for k in 0..6 {
+                ui.checkbox(&mut self.kinds[k], KIND_NAMES[k]);
+            }
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.label("levels");
+            for k in 0..6 {
+                ui.checkbox(&mut self.lods[k], LOD_NAMES[k]);
+            }
+        });
+        ui.checkbox(&mut self.show_terrain, "terrain (8 m heights)");
+        ui.checkbox(&mut self.show_roads, "roads (by speed)");
+        ui.checkbox(&mut self.show_lights, "lights (exterior, by hour)");
+        ui.checkbox(&mut self.show_proxies, "show proxies / placeholders").on_hover_text("Debug: also draw interior-shell, shadow, light and VFX proxies, placements without a model and degenerate models");
+        ui.checkbox(&mut self.decal_bias, "decal depth bias").on_hover_text("Markings, grime, signage and terrain blend layers drawn after opaque surfaces with a depth bias, by layer order");
+        ui.checkbox(&mut self.show_minimap, "minimap window");
+        ui.checkbox(&mut self.show_stats, "stats window");
+        ui.separator();
+        ui.heading("Light");
+        if ui.add(egui::Slider::new(&mut self.tod, 0.0..=24.0).text("time of day")).changed() {
+            self.look.set_time_of_day(self.tod);
+        }
+        ui.add(egui::Slider::new(&mut self.look.fog, 0.0..=0.002).logarithmic(true).text("fog"));
+        ui.add(egui::Slider::new(&mut self.look.exposure, 0.2..=4.0).text("exposure"));
+        egui::ComboBox::from_label("packed data").selected_text(crate::model_view::RMA_ORDERS[self.look.rma_order.min(3) as usize]).show_ui(ui, |ui| {
+            for (k, m) in crate::model_view::RMA_ORDERS.iter().enumerate() {
+                ui.selectable_value(&mut self.look.rma_order, k as u32, *m);
+            }
+        }).response.on_hover_text("How the packed material-data texture is read. Its channel order is unverified; \"ignore packed\" (default) avoids mirror-like surfaces.");
+        ui.add(egui::Slider::new(&mut self.speed, 0.1..=10.0).logarithmic(true).text("fly speed"));
+        ui.separator();
+        ui.heading("Go to");
+        let er = rage(self.cam.eye());
+        ui.label(format!("eye RAGE ({:.0}, {:.0}, {:.0})", er[0], er[1], er[2]));
+        ui.horizontal(|ui| {
+            if ui.button("downtown").clicked() {
+                self.place(-640.0, -60.0, 120.0);
+            }
+            if ui.button("street level").clicked() {
+                self.place(er[0], er[1], 2.0);
+                self.cam.pitch = 0.05;
+            }
+            if ui.button("overview").clicked() {
+                self.place(er[0], er[1], 900.0);
+                self.cam.pitch = 0.9;
+            }
+        });
+    }
+
+    fn overlay_windows(&mut self, ctx: &egui::Context, rect: egui::Rect, data: &MapData) {
+        if self.show_stats {
+            let st = self.stats.clone();
+            let picked = self.picked;
+            let mut open_model = None;
+            egui::Window::new("Stream")
+                .default_pos(rect.left_top() + egui::vec2(10.0, 10.0))
+                .constrain_to(rect)
+                .resizable(false)
+                .collapsible(true)
+                .show(ctx, |ui| {
+                    ui.label(format!("entities {} · models {} wanted / {} loaded", st.entities, st.models_wanted, st.models_ready));
+                    ui.label(format!("queue {} · loading {} · failed {}", st.queued, st.inflight, st.failed));
+                    ui.label(format!("instances {} · {:.1} M tris · textures {} ({:.2} GB)", st.instances, st.tris as f32 / 1e6, st.textures, st.tex_gb));
+                    ui.label(format!("bands: {}", (0..6).map(|k| format!("{} {}", LOD_NAMES[k], st.per_band[k])).collect::<Vec<_>>().join(" · ")));
+                    ui.label(format!("LOD parents handed to children {} · proxies hidden {}", st.handoffs, st.hidden));
+                    ui.label(egui::RichText::new(format!("update {:.1} ms · upload {:.1} ms", st.update_ms, st.upload_ms)).small().weak());
+                    let (mi, bu, pr) = (self.mem, self.budget, self.pressure);
+                    let txt = format!("RAM {:.1} GB (caps {:.1} / {:.1} of {:.0} GB) · {:.1} GB free · textures ≤ {:.1} GB · models ≤ {}", mem::gb(mi.process), mem::gb(bu.soft), mem::gb(bu.hard), mem::gb(mi.total), mem::gb(mi.avail), mem::gb(bu.textures), bu.models);
+                    match pr {
+                        0 => ui.label(egui::RichText::new(txt).small().weak()),
+                        1 => ui.colored_label(Color32::YELLOW, format!("{txt}\nmemory cap reached: loading only nearby models, 64 px textures")),
+                        _ => ui.colored_label(Color32::LIGHT_RED, format!("{txt}\nover the hard cap: dropping distant models")),
+                    };
+                    if let Some(i) = picked {
+                        ui.separator();
+                        let e = &data.ents[i as usize];
+                        ui.strong(data.name(e.name));
+                        ui.label(format!("{} · {} · model {}", KIND_NAMES[e.kind.min(5) as usize], LOD_NAMES[e.lod.min(5) as usize], data.name(e.model)));
+                        ui.label(format!("pos ({:.1}, {:.1}, {:.1}) · yaw {:.0}°", e.pos[0], e.pos[1], e.pos[2], e.yaw.to_degrees()));
+                        ui.label(format!("bbox {:.1} × {:.1} × {:.1} m", e.hi[0] - e.lo[0], e.hi[1] - e.lo[1], e.hi[2] - e.lo[2]));
+                        ui.label(format!("lod_dist {:.0} · child_lod_dist {:.0} · parent {}", e.lod_dist, e.child_lod_dist, if e.parent == u32::MAX { "none".to_string() } else { data.name(data.ents[e.parent as usize].name).to_string() }));
+                        let fl = rflag_names(e.rflags);
+                        if !fl.is_empty() {
+                            ui.label(format!("flags: {}", fl.join(", ")));
+                        }
+                        if let Some(Slot::Failed(err)) = self.cache.get(&e.model) {
+                            ui.colored_label(Color32::LIGHT_RED, err);
+                        }
+                        if ui.button("Open in model viewer").clicked() {
+                            open_model = Some(data.name(e.model).to_string());
+                        }
+                    }
+                });
+            if open_model.is_some() {
+                self.open_model = open_model;
+            }
+        }
+        if self.show_minimap {
+            let eye = rage(self.cam.eye());
+            let fwd = rage(self.cam.forward());
+            let mut teleport = None;
+            egui::Window::new("Minimap")
+                .default_pos(rect.right_top() + egui::vec2(-250.0, 10.0))
+                .constrain_to(rect)
+                .resizable(false)
+                .collapsible(true)
+                .show(ctx, |ui| {
+                    let size = egui::vec2(230.0, 230.0);
+                    let (r, resp) = ui.allocate_exact_size(size, egui::Sense::click());
+                    let p = ui.painter_at(r);
+                    p.rect_filled(r, 4.0, Color32::from_rgb(28, 32, 36));
+                    let range = 900.0f32; // metres from centre to edge
+                    let to_px = |x: f32, y: f32| r.center() + egui::vec2((x - eye[0]) / range * size.x * 0.5, -(y - eye[1]) / range * size.y * 0.5);
+                    data.road_grid.query(eye[0] - range, eye[1] - range, eye[0] + range, eye[1] + range, |i| {
+                        let rd = &data.roads[i as usize];
+                        let c = map2d::ramp((rd.speed / 35.0).clamp(0.0, 1.0));
+                        p.line_segment([to_px(rd.a[0], rd.a[1]), to_px(rd.b[0], rd.b[1])], Stroke::new(1.0, c));
+                    });
+                    // HD radius and view wedge
+                    p.circle_stroke(r.center(), self.detail.radii[0] / range * size.x * 0.5, Stroke::new(1.0, Color32::from_white_alpha(60)));
+                    let yaw = fwd[1].atan2(fwd[0]);
+                    let half = self.cam.fov * 0.5 * 1.3;
+                    let len = 60.0;
+                    let a = r.center() + egui::vec2((yaw - half).cos(), -(yaw - half).sin()) * len;
+                    let b = r.center() + egui::vec2((yaw + half).cos(), -(yaw + half).sin()) * len;
+                    p.add(egui::Shape::convex_polygon(vec![r.center(), a, b], Color32::from_rgba_unmultiplied(255, 220, 60, 50), Stroke::new(1.0, Color32::from_rgb(255, 220, 60))));
+                    p.text(r.left_bottom() + egui::vec2(4.0, -4.0), egui::Align2::LEFT_BOTTOM, format!("±{range:.0} m · click to move"), egui::FontId::proportional(10.0), Color32::from_white_alpha(160));
+                    if resp.clicked() {
+                        if let Some(q) = resp.interact_pointer_pos() {
+                            let d = q - r.center();
+                            teleport = Some([eye[0] + d.x / (size.x * 0.5) * range, eye[1] - d.y / (size.y * 0.5) * range]);
+                        }
+                    }
+                });
+            if let Some([x, y]) = teleport {
+                let g = data.height(eye[0], eye[1]).unwrap_or(0.0);
+                let alt = (eye[2] - g).max(2.0);
+                self.place(x, y, alt);
+            }
+        }
+    }
+
+    fn automation(&mut self, ctx: &egui::Context, rs: &egui_wgpu::RenderState, rect: egui::Rect) {
+        if let Some(path) = self.auto.screenshot.clone() {
+            self.auto.frames += 1;
+            let started = *self.auto.started.get_or_insert_with(Instant::now);
+            let idle = self.stats.queued == 0 && self.stats.inflight == 0 && self.rx.as_ref().map_or(true, |_| true);
+            if idle && self.frame > 5 {
+                self.auto.quiet_frames += 1;
+            } else {
+                self.auto.quiet_frames = 0;
+            }
+            let ready = (self.auto.quiet_frames > 20 && self.frames_ok()) || started.elapsed().as_secs() > 900;
+            if ready {
+                if let Some(data) = self.data.clone() {
+                    for f in std::mem::take(&mut self.auto.picks) {
+                        let (ndc_x, ndc_y) = (f[0] * 2.0 - 1.0, 1.0 - f[1] * 2.0);
+                        let inv = (self.cam.proj(rect.width() / rect.height()) * self.cam.view()).inverse();
+                        let a = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
+                        let b = inv.project_point3(Vec3::new(ndc_x, ndc_y, 0.5));
+                        match self.pick(&data, self.cam.eye(), (b - a).normalize()) {
+                            Some(i) => {
+                                let e = &data.ents[i as usize];
+                                eprintln!("pick {:.2},{:.2}: {} model {} at {:.0},{:.0},{:.0}", f[0], f[1], data.name(e.name), data.name(e.model), e.pos[0], e.pos[1], e.pos[2]);
+                            }
+                            None => eprintln!("pick {:.2},{:.2}: nothing", f[0], f[1]),
+                        }
+                    }
+                }
+                if let Some((w, h, px)) = self.renderer.as_ref().and_then(|r| r.read_back(rs)) {
+                    let _ = render3d::save_png(&path, w, h, &px);
+                }
+                self.auto.screenshot = None;
+                let ui_path = path.with_file_name(format!("{}_ui.png", path.file_stem().unwrap_or_default().to_string_lossy()));
+                self.auto.ui_shot = Some(ui_path);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
+            }
+            ctx.request_repaint();
+        }
+        if let Some(p) = self.auto.ui_shot.clone() {
+            let shot = ctx.input(|i| {
+                i.raw.events.iter().find_map(|e| match e {
+                    egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                    _ => None,
+                })
+            });
+            if let Some(img) = shot {
+                let rgba: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
+                let _ = render3d::save_png(&p, img.size[0] as u32, img.size[1] as u32, &rgba);
+                self.auto.ui_shot = None;
+                if self.auto.exit {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+            ctx.request_repaint();
+        }
+    }
+
+    fn frames_ok(&self) -> bool {
+        // under memory pressure not every wanted model will load: an empty
+        // queue is as good as it gets
+        self.pressure > 0 || self.want.keys().all(|m| self.cache.contains_key(m))
+    }
+}
+
+impl Drop for Map3D {
+    fn drop(&mut self) {
+        self.shared.stop.store(true, Ordering::Relaxed);
+        self.shared.cv.notify_all();
+    }
+}
+
+trait NanOr {
+    fn nan_or(self, v: f32) -> f32;
+}
+impl NanOr for f32 {
+    fn nan_or(self, v: f32) -> f32 {
+        if self.is_nan() { v } else { self }
+    }
+}
+
+fn hash32(i: u32) -> u32 {
+    let mut x = i.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
+    x ^= x >> 16;
+    x = x.wrapping_mul(0x7FEB_352D);
+    x ^= x >> 15;
+    x = x.wrapping_mul(0x846C_A68B);
+    x ^ (x >> 16)
+}
+
+/// Export (if needed) and load one model by entry id ("levels.rpf@<hex>").
+fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opts: &glb::LoadOpts, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<glb::Model> {
+    let (archive, off) = id.split_once('@').ok_or_else(|| anyhow::anyhow!("bad model id {id}"))?;
+    let (a, ix) = model_view::index_for(ws, archive, idx)?;
+    let off = u64::from_str_radix(off.trim_start_matches("0x"), 16)?;
+    let e = ix.entries.iter().find(|e| e.off == off).ok_or_else(|| anyhow::anyhow!("no entry {id}"))?;
+    let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(format!("{}_{:x}", model_view::export_sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off));
+    if !dir.join("model.glb").exists() {
+        let eo = ExportOptions { out: cache.to_path_buf(), png: !opts.no_textures, dds: false, raw: false, force: false, skip_embedded_textures: false };
+        let _ = sixng_core::export::export_entry(&a, e, &eo)?;
+    }
+    let lods = model_view::lods_in(&dir);
+    if lods.is_empty() {
+        anyhow::bail!("{id} has no model.glb");
+    }
+    glb::load_with(&lods[lod.min(lods.len() - 1)], cache, opts)
+}
