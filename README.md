@@ -220,6 +220,14 @@ again**).
   hair, top, jacket, trousers, shoes …). Single ped pieces are hidden as
   variants. Names are made readable: "Iguana (green, male)",
   "Dog (rottweiler, female)", "Farm monster man".
+- The viewer's **Parts** panel lists every part an animal or character
+  has, grouped by slot (body, eye, crown, shirt, harness …; head, top,
+  outer, bottom, feet, hat, glasses …). Pick one per group or "none";
+  accessories (hats, harnesses, holsters …) and alternate sets start off.
+  Animal sets that span several parts (`08 collarharness`: body + harness,
+  `09 corpse roadkill`) have a button each, and **Defaults** goes back.
+  The camera stays put while parts change, and the item page's Export and
+  Files follow the parts shown in the viewer.
 - Colours are never guessed. Many ped clothing and skin materials have no colour
   texture that SixNG can read (clothing colour is in BCPack; skin is built
   by the game at run time). Such materials render plain white, and the

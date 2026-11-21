@@ -54,9 +54,31 @@ const ANIMAL_SKIP: &[&str] = &[
     "generic", "costume", "collar", "harness", "hat", "badge", "ribbon", "bandana", "cape", "lace", "flower", "knife", "vest", "rope", "tranquilizer", "loop", "shadesaviators", "accessories", "human", "stick", "corpse", "roadkill", "gut", "gonad", "bone",
 ];
 
-/// Default parts of an animal root: `<root>_<words>_00` without accessories.
-/// Roots without such parts fall back to `<root minus _NN>_<words>_00`.
-pub fn animal_parts<'a>(ix: &'a ArchiveIndex, root: &str) -> Vec<&'a Entry> {
+/// One choosable part of an animal or a character, for the viewer's Parts
+/// panel. Parts in the same `group` replace each other (one per group, or none).
+#[derive(Clone, Debug)]
+pub struct PartOpt {
+    pub off: u64,
+    pub id: String,
+    pub name: String,
+    pub group: String,
+    pub label: String,
+    pub default: bool,
+}
+
+fn dedupe<'a>(it: impl Iterator<Item = (String, &'a Entry)>) -> BTreeMap<String, &'a Entry> {
+    let mut by_name: BTreeMap<String, &Entry> = BTreeMap::new();
+    for (n, e) in it {
+        by_name.entry(n).and_modify(|x| if e.off < x.off { *x = e }).or_insert(e);
+    }
+    by_name
+}
+
+/// Every part of an animal root: `<root>_<words>_<NN>[_<set>]` (`body_00`,
+/// `body_08_collarharness`, `harness_08_collarharness`). The default look is
+/// the `_00` parts without accessories. Roots without parts of their own fall
+/// back to `<root minus _NN>_…`.
+pub fn animal_options(ix: &ArchiveIndex, root: &str) -> Vec<PartOpt> {
     let root = root.to_ascii_lowercase();
     let mut prefixes = vec![format!("{root}_")];
     if let Some((stem, n)) = root.rsplit_once('_') {
@@ -64,27 +86,39 @@ pub fn animal_parts<'a>(ix: &'a ArchiveIndex, root: &str) -> Vec<&'a Entry> {
             prefixes.push(format!("{stem}_"));
         }
     }
+    let mut first_any: Vec<PartOpt> = Vec::new();
     for p in prefixes {
-        let mut by_name: BTreeMap<String, &Entry> = BTreeMap::new();
-        for e in &ix.entries {
-            if e.rtype.as_deref() != Some("dr") {
+        let by_name = dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+            let n = e.name.as_ref()?.to_ascii_lowercase();
+            n.starts_with(&p).then_some((n, e))
+        }));
+        let mut opts = Vec::new();
+        for (n, e) in by_name {
+            let toks: Vec<&str> = n[p.len()..].split('_').collect();
+            let Some(j) = toks.iter().position(|t| t.len() == 2 && t.chars().all(|c| c.is_ascii_digit())) else { continue };
+            let group = &toks[..j];
+            if group.is_empty() || group.iter().any(|t| t.is_empty() || !t.chars().all(|c| c.is_ascii_lowercase())) {
                 continue;
             }
-            let Some(n) = &e.name else { continue };
-            let n = n.to_ascii_lowercase();
-            let Some(rest) = n.strip_prefix(&p) else { continue };
-            let Some(words) = rest.strip_suffix("_00") else { continue };
-            let toks: Vec<&str> = words.split('_').collect();
-            if toks.is_empty() || toks.iter().any(|t| t.is_empty() || !t.chars().all(|c| c.is_ascii_lowercase()) || ANIMAL_SKIP.contains(t)) {
-                continue;
-            }
-            by_name.entry(n.clone()).and_modify(|x| if e.off < x.off { *x = e }).or_insert(e);
+            let set = toks[j + 1..].join(" ");
+            let default = toks[j] == "00" && set.is_empty() && !group.iter().any(|t| ANIMAL_SKIP.contains(t));
+            let label = if toks[j] == "00" && set.is_empty() { "default".to_string() } else { format!("{} {}", toks[j], set).trim().to_string() };
+            opts.push(PartOpt { off: e.off, id: e.id.clone(), name: n.clone(), group: group.join(" "), label, default });
         }
-        if !by_name.is_empty() {
-            return by_name.into_values().collect();
+        if opts.iter().any(|o| o.default) {
+            return opts;
+        }
+        if first_any.is_empty() {
+            first_any = opts;
         }
     }
-    Vec::new()
+    first_any
+}
+
+/// Default parts of an animal root: `<root>_<words>_00` without accessories.
+pub fn animal_parts<'a>(ix: &'a ArchiveIndex, root: &str) -> Vec<&'a Entry> {
+    let offs: Vec<u64> = animal_options(ix, root).into_iter().filter(|o| o.default).map(|o| o.off).collect();
+    ix.entries.iter().filter(|e| offs.contains(&e.off)).collect()
 }
 
 /// Outfit slot of a ped item word (`tshirtcrewneck` → top); None = left out
@@ -133,38 +167,72 @@ fn slot(item: &str) -> Option<&'static str> {
     SLOTS.iter().filter(|(w, _)| item.starts_with(w)).max_by_key(|(w, _)| w.len()).map(|(_, s)| *s)
 }
 
-/// One part per outfit slot for a character prefix (the first in name order),
-/// plus the eyes mesh that goes with the head.
-pub fn outfit_parts<'a>(ix: &'a ArchiveIndex, prefix: &str) -> Vec<&'a Entry> {
+/// Group of an accessory item word (`hatflatcap` → hat); None = its own word.
+fn accessory_group(item: &str) -> Option<&'static str> {
+    const G: &[(&str, &str)] = &[
+        ("hat", "hat"),
+        ("cap", "hat"),
+        ("helmet", "hat"),
+        ("beanie", "hat"),
+        ("sunglasses", "glasses"),
+        ("glasses", "glasses"),
+        ("backpack", "bag"),
+        ("bag", "bag"),
+        ("watch", "watch"),
+        ("necklace", "neck"),
+        ("chain", "neck"),
+        ("earring", "ears"),
+        ("glove", "gloves"),
+        ("mask", "mask"),
+    ];
+    G.iter().filter(|(w, _)| item.starts_with(w)).max_by_key(|(w, _)| w.len()).map(|(_, g)| *g)
+}
+
+/// Every part of a character prefix, grouped by outfit slot (or by item word
+/// for hats, bags, watches …). The default look is one part per slot (the
+/// first in name order) plus the eyes that go with the head; a one-piece
+/// outfit replaces top and bottom. Accessories, `_alt_` pieces and holsters
+/// are offered but off by default; clipping-cut (`_cull`) and first-person
+/// copies are left out.
+pub fn outfit_options(ix: &ArchiveIndex, prefix: &str) -> Vec<PartOpt> {
     let p = format!("{}_", prefix.to_ascii_lowercase());
-    let mut by_name: BTreeMap<String, &Entry> = BTreeMap::new();
-    for e in &ix.entries {
-        if e.rtype.as_deref() != Some("dr") {
-            continue;
-        }
-        let Some(n) = &e.name else { continue };
-        let n = n.to_ascii_lowercase();
-        if !n.starts_with(&p) || outfit_prefix(&n).as_deref() != Some(prefix) {
-            continue;
-        }
-        if ["_cull", "_alt_", "_fp", "eyecap", "tattooprojection", "holster"].iter().any(|x| n.contains(x)) {
-            continue;
-        }
-        by_name.entry(n.clone()).and_modify(|x| if e.off < x.off { *x = e }).or_insert(e);
-    }
-    let mut chosen: BTreeMap<String, &Entry> = BTreeMap::new();
+    let by_name = dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+        let n = e.name.as_ref()?.to_ascii_lowercase();
+        (n.starts_with(&p) && outfit_prefix(&n).as_deref() == Some(prefix)).then_some((n, e))
+    }));
+    let mut opts = Vec::new();
+    let mut chosen: BTreeMap<String, u64> = BTreeMap::new();
     for (n, e) in &by_name {
-        let item = n[p.len()..].split('_').next().unwrap_or("");
-        let Some(s) = slot(item) else { continue };
-        let key = if s == "head" && n.contains("_eyes") { "head_eyes".to_string() } else { s.to_string() };
-        chosen.entry(key).or_insert(e);
+        if ["_cull", "_fp", "eyecap", "tattooprojection"].iter().any(|x| n.contains(x)) {
+            continue;
+        }
+        let rest = &n[p.len()..];
+        let item = rest.split('_').next().unwrap_or("");
+        let optional = n.contains("_alt_") || n.contains("holster");
+        let group = match slot(item) {
+            Some("head") if n.contains("_eyes") => "head eyes".to_string(),
+            Some(s) => s.replace('_', " "),
+            None => accessory_group(item).unwrap_or(item).to_string(),
+        };
+        if !optional && slot(item).is_some() {
+            chosen.entry(group.clone()).or_insert(e.off);
+        }
+        opts.push(PartOpt { off: e.off, id: e.id.clone(), name: n.clone(), group, label: rest.to_string(), default: false });
     }
-    // a one-piece outfit replaces top and bottom
     if chosen.contains_key("full") {
         chosen.remove("top");
         chosen.remove("bottom");
     }
-    chosen.into_values().collect()
+    for o in &mut opts {
+        o.default = chosen.get(&o.group) == Some(&o.off);
+    }
+    opts
+}
+
+/// Default parts of a character prefix (see `outfit_options`).
+pub fn outfit_parts<'a>(ix: &'a ArchiveIndex, prefix: &str) -> Vec<&'a Entry> {
+    let offs: Vec<u64> = outfit_options(ix, prefix).into_iter().filter(|o| o.default).map(|o| o.off).collect();
+    ix.entries.iter().filter(|e| offs.contains(&e.off)).collect()
 }
 
 fn cap(s: &str) -> String {

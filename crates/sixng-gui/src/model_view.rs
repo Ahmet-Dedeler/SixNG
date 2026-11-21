@@ -25,6 +25,11 @@ pub struct Loaded {
     pub out_root: PathBuf,
     pub source: String,
     pub info: serde_json::Value,
+    /// Choosable parts (animals and characters) and the offsets shown now.
+    pub parts: Vec<crate::assemble::PartOpt>,
+    pub selected: Vec<u64>,
+    /// Query without the `#parts=` selection.
+    pub base: String,
 }
 
 type Pending = Arc<Mutex<Option<Result<Loaded, String>>>>;
@@ -65,6 +70,7 @@ pub struct ModelView {
     pub size: [u32; 2],
     last_shot: Option<String>,
     pub zoom_after_load: Option<f32>,
+    keep_cam_once: bool,
     pub wheels_on: bool,
     pub wheel_rim: String,
     pub wheel_tyre: String,
@@ -108,6 +114,7 @@ impl ModelView {
             size: [0, 0],
             last_shot: None,
             zoom_after_load: None,
+            keep_cam_once: false,
             wheels_on: true,
             wheel_rim: "rim_muscle_001_hi".into(),
             wheel_tyre: "tyre_muscle_001_hi".into(),
@@ -134,7 +141,7 @@ impl ModelView {
     /// Open by entry id, name regex or .glb path, on a worker thread.
     pub fn open(&mut self, query: &str, lod: usize, ctx: &egui::Context) {
         self.query = query.to_string();
-        if query.contains('@') {
+        if query.contains('@') && !query.contains("#parts=") {
             self.picker.opened(query.trim());
         }
         self.loading = true;
@@ -152,6 +159,86 @@ impl ModelView {
         });
     }
 
+    /// Entry ids of the parts the viewer shows for `id` now (root first for
+    /// animals), when that is the open model and it has parts.
+    pub fn selected_parts(&self, id: &str) -> Option<Vec<String>> {
+        let l = self.loaded.as_ref()?;
+        if l.base != id || l.parts.is_empty() {
+            return None;
+        }
+        let root = (!id.contains("#outfit:")).then(|| id.to_string());
+        Some(root.into_iter().chain(l.parts.iter().filter(|o| l.selected.contains(&o.off)).map(|o| o.id.clone())).collect())
+    }
+
+    /// Parts panel for animals and characters: one choice (or none) per
+    /// group, plus buttons for the named alternate sets. Returns the query to
+    /// reload with when the choice changes.
+    fn parts_ui(&self, ui: &mut egui::Ui) -> Option<String> {
+        let l = self.loaded.as_ref()?;
+        if l.parts.is_empty() {
+            return None;
+        }
+        let mut groups: std::collections::BTreeMap<&str, Vec<&crate::assemble::PartOpt>> = Default::default();
+        for o in &l.parts {
+            groups.entry(o.group.as_str()).or_default().push(o);
+        }
+        let mut sel = l.selected.clone();
+        let mut changed = false;
+        ui.heading(format!("Parts ({} shown of {})", l.selected.len(), l.parts.len()));
+        ui.label(egui::RichText::new("One choice per group. Accessories and alternate sets start off.").weak());
+        egui::Grid::new("parts_grid").num_columns(2).striped(true).show(ui, |ui| {
+            for (g, opts) in &groups {
+                let cur = opts.iter().find(|o| l.selected.contains(&o.off));
+                ui.label(*g);
+                let text = cur.map(|o| o.label.clone()).unwrap_or_else(|| "none".into());
+                egui::ComboBox::from_id_salt(("part", *g)).selected_text(text).width(240.0).show_ui(ui, |ui| {
+                    let mut set = |keep: Option<u64>| {
+                        sel.retain(|x| !opts.iter().any(|o| o.off == *x));
+                        sel.extend(keep);
+                        changed = true;
+                    };
+                    if ui.selectable_label(cur.is_none(), "none").clicked() && cur.is_some() {
+                        set(None);
+                    }
+                    for o in opts {
+                        let mut label = o.label.clone();
+                        if o.default && o.label != "default" {
+                            label += "  (default)";
+                        }
+                        let on = cur.map(|c| c.off) == Some(o.off);
+                        if ui.selectable_label(on, label).on_hover_text(&o.name).clicked() && !on {
+                            set(Some(o.off));
+                        }
+                    }
+                });
+                ui.end_row();
+            }
+        });
+        // named sets that span several groups (`08 collarharness`: body + harness)
+        let mut sets: Vec<&str> = l.parts.iter().filter(|o| o.label != "default" && o.label.contains(' ') && l.parts.iter().filter(|p| p.label == o.label).count() > 1).map(|o| o.label.as_str()).collect();
+        sets.sort();
+        sets.dedup();
+        ui.horizontal_wrapped(|ui| {
+            for s in &sets {
+                if ui.button(format!("set {s}")).on_hover_text("Switch every group that has this set to it").clicked() {
+                    for opts in groups.values() {
+                        if let Some(o) = opts.iter().find(|o| o.label == *s) {
+                            sel.retain(|x| !opts.iter().any(|p| p.off == *x));
+                            sel.push(o.off);
+                        }
+                    }
+                    changed = true;
+                }
+            }
+            if ui.button("Defaults").on_hover_text("Back to the default parts").clicked() {
+                sel = l.parts.iter().filter(|o| o.default).map(|o| o.off).collect();
+                changed = true;
+            }
+        });
+        ui.separator();
+        changed.then(|| format!("{}#parts={}", l.base, sel.iter().map(|o| format!("{o:x}")).collect::<Vec<_>>().join(",")))
+    }
+
     pub fn open_lod(&mut self, lod: usize, ctx: &egui::Context) {
         let Some(l) = &self.loaded else { return };
         let Some(p) = l.lods.get(lod).cloned() else { return };
@@ -159,11 +246,12 @@ impl ModelView {
         let lods = l.lods.clone();
         let source = l.source.clone();
         let info = l.info.clone();
+        let (parts, selected, base) = (l.parts.clone(), l.selected.clone(), l.base.clone());
         self.loading = true;
         let slot = self.pending.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let r = glb::load(&p, &root).map(|model| Loaded { model, lods, lod, out_root: root, source, info }).map_err(|e| format!("{e:#}"));
+            let r = glb::load(&p, &root).map(|model| Loaded { model, lods, lod, out_root: root, source, info, parts, selected, base }).map_err(|e| format!("{e:#}"));
             *slot.lock().unwrap() = Some(r);
             ctx.request_repaint();
         });
@@ -174,7 +262,7 @@ impl ModelView {
         self.loading = false;
         match r {
             Ok(l) => {
-                let keep_cam = self.loaded.as_ref().map(|o| o.source == l.source).unwrap_or(false);
+                let keep_cam = std::mem::take(&mut self.keep_cam_once) || self.loaded.as_ref().map(|o| o.source == l.source).unwrap_or(false);
                 let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
                 let mut g = ren.upload(rs, &l.model, &[]);
                 ren.ensure_edges(rs, &mut g, &l.model);
@@ -646,6 +734,12 @@ impl ModelView {
             }
         }
         ui.separator();
+        if let Some(q) = self.parts_ui(ui) {
+            self.keep_cam_once = true;
+            let ctx = ui.ctx().clone();
+            self.open(&q, 0, &ctx);
+            return;
+        }
         let Some(l) = &self.loaded else { return };
         ui.heading(format!("Materials ({})", l.model.materials.len()));
         let mut toggle: Option<(usize, bool)> = None;
@@ -772,7 +866,64 @@ pub fn index_for(ws: &Workspace, archive: &str, cache: &Arc<Mutex<HashMap<String
 }
 
 pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<Loaded> {
-    let q = q.trim();
+    let (q, sel) = split_parts(q);
+    let mut l = load_query_sel(ws, cache, q, sel, lod, idx)?;
+    l.base = q.to_string();
+    Ok(l)
+}
+
+/// `"<query>#parts=<hex>,<hex>"` → the query and the chosen part offsets.
+fn split_parts(q: &str) -> (&str, Option<Vec<u64>>) {
+    match q.trim().split_once("#parts=") {
+        Some((b, l)) => (b.trim(), Some(l.split(',').filter_map(|x| u64::from_str_radix(x.trim(), 16).ok()).collect())),
+        None => (q.trim(), None),
+    }
+}
+
+/// Export and merge a set of parts; returns the model (None if none loaded),
+/// the first part's LOD files, the loaded names and the errors. A model
+/// passed in (an animal root) has its placeholder geometry replaced.
+fn load_parts(a: &sixng_core::game::ArchiveInfo, parts: &[&sixng_core::scan::Entry], cache: &Path, lod: usize, mut model: Option<glb::Model>) -> (Option<glb::Model>, Vec<PathBuf>, Vec<String>, Vec<String>) {
+    let mut first = Vec::new();
+    let mut names = Vec::new();
+    let mut errs = Vec::new();
+    let mut fresh = true;
+    for e in parts {
+        match export_load(a, e, cache, lod) {
+            Ok((m, lods, _)) => {
+                if first.is_empty() {
+                    first = lods;
+                }
+                match &mut model {
+                    Some(into) if fresh => {
+                        into.meshes.clear();
+                        into.triangles = 0;
+                        into.vertices = 0;
+                        glb::merge(into, m);
+                    }
+                    Some(into) => glb::merge(into, m),
+                    None => model = Some(m),
+                }
+                fresh = false;
+                names.push(e.name.clone().unwrap_or_default());
+            }
+            Err(err) => errs.push(format!("{}: {err:#}", e.id)),
+        }
+    }
+    (model, first, names, errs)
+}
+
+/// The chosen parts: the selection when given, else the defaults.
+fn pick<'a>(ix: &'a ArchiveIndex, opts: &[crate::assemble::PartOpt], sel: &Option<Vec<u64>>) -> (Vec<u64>, Vec<&'a sixng_core::scan::Entry>) {
+    let chosen: Vec<u64> = match sel {
+        Some(s) => opts.iter().filter(|o| s.contains(&o.off)).map(|o| o.off).collect(),
+        None => opts.iter().filter(|o| o.default).map(|o| o.off).collect(),
+    };
+    let parts = chosen.iter().filter_map(|off| ix.entries.iter().find(|e| e.off == *off)).collect();
+    (chosen, parts)
+}
+
+fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, lod: usize, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<Loaded> {
     if q.to_lowercase().ends_with(".glb") {
         let p = PathBuf::from(q);
         let dir = p.parent().unwrap_or(Path::new(".")).to_path_buf();
@@ -784,36 +935,23 @@ pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx:
         let root = out_root_of(&p);
         let info = std::fs::read(dir.join("model.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let model = glb::load(&p, &root)?;
-        return Ok(Loaded { model, lods, lod, out_root: root, source: dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), info });
+        return Ok(Loaded { model, lods, lod, out_root: root, source: dir.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), info, parts: Vec::new(), selected: Vec::new(), base: String::new() });
     }
     // character outfit: "<archive>#outfit:<prefix>"
     if let Some((archive, prefix)) = q.split_once("#outfit:") {
         let (a, ix) = index_for(ws, archive, idx)?;
-        let parts = crate::assemble::outfit_parts(&ix, prefix);
-        if parts.is_empty() {
+        let opts = crate::assemble::outfit_options(&ix, prefix);
+        if opts.is_empty() {
             return Err(anyhow::anyhow!("no parts found for {prefix}"));
         }
-        let mut model: Option<glb::Model> = None;
-        let mut first = Vec::new();
-        let mut errs = Vec::new();
-        for e in &parts {
-            match export_load(&a, e, cache, lod) {
-                Ok((m, lods, _)) => {
-                    if first.is_empty() {
-                        first = lods;
-                    }
-                    match &mut model {
-                        None => model = Some(m),
-                        Some(into) => glb::merge(into, m),
-                    }
-                }
-                Err(err) => errs.push(format!("{}: {err:#}", e.id)),
-            }
+        let (selected, parts) = pick(&ix, &opts, &sel);
+        if parts.is_empty() {
+            return Err(anyhow::anyhow!("no parts of {prefix} selected"));
         }
+        let (model, first, names, errs) = load_parts(&a, &parts, cache, lod, None);
         let model = model.ok_or_else(|| anyhow::anyhow!("no part of {prefix} loaded: {}", errs.join("; ")))?;
-        let names: Vec<String> = parts.iter().map(|e| e.name.clone().unwrap_or_default()).collect();
         let info = serde_json::json!({ "assembled_from": names, "ids": parts.iter().map(|e| e.id.clone()).collect::<Vec<_>>(), "errors": errs });
-        return Ok(Loaded { model, lods: first.into_iter().take(1).collect(), lod: 0, out_root: cache.to_path_buf(), source: format!("{} (outfit, {} parts)", prefix, parts.len()), info });
+        return Ok(Loaded { model, lods: first.into_iter().take(1).collect(), lod: 0, out_root: cache.to_path_buf(), source: format!("{} (outfit, {} parts)", prefix, names.len()), info, parts: opts, selected, base: String::new() });
     }
     // entry: "<archive>@<hex>" or a name regex (in levels unless "archive:regex")
     let (archive, rest) = match q.split_once('@') {
@@ -832,36 +970,25 @@ pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx:
         Some(re) => find_name(&ix, re.trim_start_matches('~'))?,
         None => unreachable!(),
     };
-    let (mut model, lods, info) = export_load(&a, e, cache, lod)?;
+    let (model, lods, info) = export_load(&a, e, cache, lod)?;
     let lod = lod.min(lods.len() - 1);
     // animals: the fragment is a skeleton with a placeholder plane; add the textured parts
     let name = e.name.as_deref().unwrap_or("");
     if crate::assemble::is_animal(name) && e.rtype.as_deref() == Some("ft") {
-        let parts = crate::assemble::animal_parts(&ix, name);
-        let mut added = 0;
+        let opts = crate::assemble::animal_options(&ix, name);
+        let (selected, parts) = pick(&ix, &opts, &sel);
+        let (m, _, names, _) = load_parts(&a, &parts, cache, lod, Some(model));
+        let model = m.expect("root model passed in");
         let mut info = info;
-        let mut names = Vec::new();
-        for p in &parts {
-            if let Ok((m, _, _)) = export_load(&a, p, cache, lod) {
-                if added == 0 {
-                    model.meshes.clear();
-                    model.triangles = 0;
-                    model.vertices = 0;
-                }
-                glb::merge(&mut model, m);
-                added += 1;
-                names.push(p.name.clone().unwrap_or_default());
-            }
+        if let Some(o) = info.as_object_mut() {
+            o.insert("assembled_from".into(), serde_json::json!(names));
         }
-        if added > 0 {
-            if let Some(o) = info.as_object_mut() {
-                o.insert("assembled_from".into(), serde_json::json!(names));
-            }
-            return Ok(Loaded { model, lods: lods.into_iter().skip(lod).take(1).collect(), lod: 0, out_root: cache.to_path_buf(), source: format!("{} {} (+{} parts)", e.id, name, added), info });
-        }
-        return Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source: format!("{} {}", e.id, name), info });
+        let source = if names.is_empty() { format!("{} {}", e.id, name) } else { format!("{} {} (+{} parts)", e.id, name, names.len()) };
+        let lods = if opts.is_empty() { lods } else { lods.into_iter().skip(lod).take(1).collect() };
+        let lod = if opts.is_empty() { lod } else { 0 };
+        return Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source, info, parts: opts, selected, base: String::new() });
     }
-    Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source: format!("{} {}", e.id, name).trim().to_string(), info })
+    Ok(Loaded { model, lods, lod, out_root: cache.to_path_buf(), source: format!("{} {}", e.id, name).trim().to_string(), info, parts: Vec::new(), selected: Vec::new(), base: String::new() })
 }
 
 /// Export one entry into the viewer cache and load the GLB of a LOD level.

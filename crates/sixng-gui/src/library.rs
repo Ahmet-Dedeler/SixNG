@@ -321,6 +321,8 @@ impl Library {
             .entry(id.to_string())
             .or_insert_with(|| crate::model_view::assembly_ids(&sixng_core::export::Workspace::new(&mv.game, &mv.work), &mv.indexes, id))
             .clone();
+        // follow the parts chosen in the viewer, when it shows this model
+        let parts = mv.selected_parts(id).or(parts);
         ui.horizontal_top(|ui| {
             let t = self.thumbs.get(&ctx, id);
             let (rect, _) = ui.allocate_exact_size(egui::vec2(320.0, 320.0), egui::Sense::hover());
