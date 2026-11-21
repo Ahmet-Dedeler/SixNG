@@ -48,7 +48,7 @@ fn dir_size(d: &Path) -> u64 {
 impl Thumbs {
     pub fn new(game: &str, work: &str, budget_mb: u64) -> Self {
         // v2: animals and characters are put together from their parts
-        let dir = Path::new(work).join("thumbs").join("v2");
+        let dir = Path::new(work).join("thumbs").join("v3");
         let used = dir_size(&dir);
         let failed_ids = std::fs::read_to_string(dir.join("failed.txt")).map(|s| s.lines().map(String::from).collect()).unwrap_or_default();
         Thumbs {

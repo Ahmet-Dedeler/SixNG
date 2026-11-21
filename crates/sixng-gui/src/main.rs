@@ -18,8 +18,9 @@ mod mem;
 
 /// Export cache for the viewers. Bumped when the export layout changes
 /// (v2, 2026-11-20: LOD levels from the main LOD group; parts split out;
-/// v3, 2026-11-20: normals without a stored normal rebuilt from the faces).
-pub const GUI_CACHE: &str = "gui_cache_v3";
+/// v3, 2026-11-20: normals without a stored normal rebuilt from the faces;
+/// v4, 2026-11-20: alpha-bucket cloth with a constant colour alpha drawn opaque).
+pub const GUI_CACHE: &str = "gui_cache_v4";
 mod bakejob;
 mod model_picker;
 mod mapbake;

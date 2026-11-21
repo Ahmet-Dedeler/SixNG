@@ -340,19 +340,26 @@ pub struct PngStats {
     /// BCPack chunks and only lower mips could be decoded.
     #[serde(default)]
     pub mip: u32,
+    /// Lowest and highest alpha value. A narrow range on a colour texture
+    /// means the alpha channel holds a constant, not opacity.
+    #[serde(default)]
+    pub alpha_range: Option<[u8; 2]>,
 }
 
 fn stats(rgba: &[u8], w: u32, h: u32) -> PngStats {
     let mut s = [0f64; 4];
+    let (mut amin, mut amax) = (255u8, 0u8);
     for px in rgba.chunks_exact(4) {
         for k in 0..4 {
             s[k] += px[k] as f64;
         }
+        amin = amin.min(px[3]);
+        amax = amax.max(px[3]);
     }
     let n = (rgba.len() / 4).max(1) as f64;
     let m = s.map(|x| (x / n) as f32);
     let normal_like = m[2] > 200.0 && (100.0..160.0).contains(&m[0]) && (100.0..160.0).contains(&m[1]);
-    PngStats { width: w, height: h, mean_rgba: m, normal_like, mip: 0 }
+    PngStats { width: w, height: h, mean_rgba: m, normal_like, mip: 0, alpha_range: Some([amin, amax]) }
 }
 
 /// Decode mip 0 of a texture to `<dir>/<hash>.png` (plus a `.json` with
@@ -361,7 +368,8 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
     let p = dir.join(format!("{:016x}.png", t.hash));
     let js = dir.join(format!("{:016x}.json", t.hash));
     if p.exists() {
-        if let Some(st) = std::fs::read(&js).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
+        // stats written before alpha_range existed are refreshed below
+        if let Some(st) = std::fs::read(&js).ok().and_then(|b| serde_json::from_slice::<PngStats>(&b).ok()).filter(|st| st.alpha_range.is_some()) {
             return Ok((p, st));
         }
     }

@@ -280,6 +280,22 @@ struct ShaderTextures {
     base_factor: Option<[f32; 4]>,
     /// The `texture_fallback` record for that base colour.
     fallback: Option<serde_json::Value>,
+    /// Alpha range of the base-colour texture.
+    base_alpha: Option<[u8; 2]>,
+}
+
+/// Classification of a shader, corrected by its base-colour texture: an
+/// alpha-bucket material whose colour alpha is one constant value (ped
+/// clothing holds 64 or 128 there) is not see-through, so it is drawn opaque.
+fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_json::Value {
+    let mut c = crate::material::classify(&s.name_hash, &s.flags);
+    if let Some([lo, hi]) = st.base_alpha {
+        if c["alpha_mode"] == "BLEND" && c["class"] == "alpha" && hi.saturating_sub(lo) <= 12 {
+            c["alpha_mode"] = "OPAQUE".into();
+            c["alpha_note"] = format!("colour texture alpha is constant ({lo}-{hi}), not opacity: drawn opaque").into();
+        }
+    }
+    c
 }
 
 /// Resolve each shader's texture references in the ttpf stores, write the
@@ -297,6 +313,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], model_dir
         .map(|s| {
             let mut st = ShaderTextures::default();
             let mut srgb_fallback: Option<Option<String>> = None; // first sRGB slot only
+            let mut srgb_alpha = None;
             let mut normal_fallback = None;
             for t in &s.textures {
                 let h = u64::from_str_radix(&t.hash64, 16).unwrap_or(0);
@@ -357,9 +374,15 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], model_dir
                                     srgb_fallback = Some(None);
                                 }
                             }
-                            "base_color" if st.base.is_none() => st.base = Some(u),
+                            "base_color" if st.base.is_none() => {
+                                st.base = Some(u);
+                                st.base_alpha = stt.alpha_range;
+                            }
                             "normal" if st.normal.is_none() => st.normal = Some(u),
-                            "colour (sRGB)" if first_srgb => srgb_fallback = Some(Some(u)),
+                            "colour (sRGB)" if first_srgb => {
+                                srgb_fallback = Some(Some(u));
+                                srgb_alpha = stt.alpha_range;
+                            }
                             _ => {}
                         }
                     }
@@ -378,6 +401,9 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], model_dir
             }
             if st.base.is_none() {
                 st.base = srgb_fallback.flatten();
+                if st.base.is_some() {
+                    st.base_alpha = srgb_alpha;
+                }
             }
             if st.normal.is_none() {
                 st.normal = normal_fallback;
@@ -609,7 +635,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     base_color_uri: if crate::material::is_paint(&s.name_hash) { None } else { st.base.clone() },
                     normal_uri: st.normal.clone(),
                     gltf: {
-                        let mut g = crate::material::gltf_fields(&crate::material::classify(&s.name_hash, &s.flags), st.base.is_some() && !crate::material::is_paint(&s.name_hash));
+                        let mut g = crate::material::gltf_fields(&classify_shader(s, st), st.base.is_some() && !crate::material::is_paint(&s.name_hash));
                         if let (Some(f), false) = (st.base_factor, crate::material::is_paint(&s.name_hash)) {
                             if g["pbrMetallicRoughness"].is_null() {
                                 g["pbrMetallicRoughness"] = serde_json::json!({});
@@ -620,7 +646,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                         }
                         g
                     },
-                    extras: serde_json::json!({"shader_name_hash": s.name_hash, "classification": crate::material::classify(&s.name_hash, &s.flags), "textures": st.entries, "texture_fallback": st.fallback}),
+                    extras: serde_json::json!({"shader_name_hash": s.name_hash, "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback}),
                 }).collect();
                 for (lod, groups) in lod_groups.iter().enumerate() {
                     if groups.iter().all(|g| g.prims.is_empty()) {
@@ -693,7 +719,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts_note": "Wheel centres (model space, RAGE Z-up). Rims and tyres are shared models (rim_<class>_NNN, tyre_<class>_NNN) authored for the left-front at unit scale (rim radius 0.5); mirror X for right-hand wheels and scale by the vehicle's wheel size (not decoded yet).",
                 "drawable": info, "buffer_files": bufs, "texture_files": tex_files,
                 "materials": info.shaders.iter().zip(shader_tex.iter()).map(|(s, st)| {
-                    let c = crate::material::classify(&s.name_hash, &s.flags);
+                    let c = classify_shader(s, st);
                     let mut m = serde_json::json!({
                         "shader": s.index, "shader_name_hash": s.name_hash, "classification": c,
                         "base_color": if crate::material::is_paint(&s.name_hash) { None } else { st.base.clone() }, "normal": st.normal, "normal_green": "directx (+Y down); invert G for glTF/OpenGL",
