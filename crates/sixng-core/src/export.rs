@@ -236,6 +236,10 @@ pub struct ExportOptions {
     pub force: bool,
     /// Skip textures in drawables (only metadata).
     pub skip_embedded_textures: bool,
+    /// Body shape for ped clothing (`bodyshape::parse_spec` output): the
+    /// shared ped skeleton is posed with the game's body-shape rig. Empty =
+    /// neutral body.
+    pub body_shape: Vec<(String, f32)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -544,7 +548,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
                 &r.gfx[(b.gfx_off as usize).min(end)..end]
             };
-            let skin = ped_skin(a, e, &info, &mut item);
+            let skin = ped_skin(a, e, &info, o, &mut item);
             // Triangle meshes: one primitive per geometry, grouped by model.
             let mut mesh_meta = Vec::new();
             let prims_of = |gi: usize, material: Option<usize>, mesh_meta: &mut Vec<serde_json::Value>| -> Option<crate::gltf::TriPrim> {
@@ -804,9 +808,9 @@ struct SkinSetup {
 /// `GM_U01_*` helper bones store a parent-relative bind (their parent in the
 /// shared skeleton is not known), so their joint positions are not in model
 /// space; the rest pose is unaffected.
-fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, item: &mut ExportedItem) -> SkinSetup {
+fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o: &ExportOptions, item: &mut ExportedItem) -> SkinSetup {
     use crate::gltf::Joint;
-    let joint = |b: &crate::drawable::Bone, off: usize| Joint { name: b.name.clone(), parent: b.parent.map(|p| p as usize + off), bind: b.bind_matrix.unwrap() };
+    let joint = |b: &crate::drawable::Bone, off: usize| Joint { name: b.name.clone(), parent: b.parent.map(|p| p as usize + off), bind: b.bind_matrix.unwrap(), pose: None };
     let own_ok = info.skeleton.iter().all(|b| b.bind_matrix.is_some());
     let own: Vec<Joint> = if own_ok { info.skeleton.iter().map(|b| joint(b, 0)).collect() } else { Vec::new() };
     let mut out = SkinSetup { joints: own, geometry_map: Default::default() };
@@ -826,6 +830,15 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, it
     let pal: Vec<_> = cand.into_iter().filter(|(_, p)| p.iter().filter(|h| known(h)).count() * 10 >= p.len() * 9 || (ped.is_none() && p.iter().any(|h| own_hash.contains_key(h)))).collect();
     if let Some(p) = ped {
         let mut j: Vec<Joint> = p.bones.iter().map(|b| joint(b, 0)).collect();
+        if !o.body_shape.is_empty() {
+            match crate::bodyshape::get(&game_root(a), female) {
+                Ok(rig) => match crate::bodyshape::pose(&p.bones, rig, &crate::bodyshape::input_values(&o.body_shape)) {
+                    Some((posed, _)) => j.iter_mut().zip(posed).for_each(|(j, m)| j.pose = Some(m)),
+                    None => item.warnings.push("body shape: shared skeleton has bones without a bind pose; neutral body exported".into()),
+                },
+                Err(err) => item.warnings.push(format!("body shape: {err}; neutral body exported")),
+            }
+        }
         j.extend(info.skeleton.iter().map(|b| joint(b, n_ped)));
         out.joints = j;
     } else {

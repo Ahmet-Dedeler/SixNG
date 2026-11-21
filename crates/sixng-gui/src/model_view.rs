@@ -1144,7 +1144,7 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
 
 /// Export one entry into the viewer cache and load the GLB of a LOD level.
 fn export_load(a: &sixng_core::game::ArchiveInfo, e: &sixng_core::scan::Entry, cache: &Path, lod: usize) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
-    let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: false, skip_embedded_textures: false };
+    let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: false, skip_embedded_textures: false, body_shape: Vec::new() };
     let item = export::export_entry(a, e, &opts)?;
     let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(format!("{}_{:x}", export_sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off));
     let lods = lods_in(&dir);

@@ -236,6 +236,8 @@ struct App {
     loaded_index: Arc<Mutex<Option<ArchiveIndex>>>,
     tex_png: bool,
     tex_dds: bool,
+    /// Body shape for ped clothing exports (`gcweightbelly=0.5,...`).
+    body_shape: String,
     tab: Tab,
     model: model_view::ModelView,
     cli: Cli,
@@ -324,6 +326,7 @@ impl App {
             loaded_index: Arc::new(Mutex::new(None)),
             tex_png: true,
             tex_dds: false,
+            body_shape: String::new(),
         };
         a.map3d.load_settings();
         a.refresh();
@@ -555,6 +558,13 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
         let (Some(ix), Some(ai)) = (self.index.clone(), self.sel_archive) else { return };
         let a = self.archives[ai].clone();
         let idxs: Vec<usize> = if all_filtered { self.filtered.clone() } else { self.selected.iter().copied().collect() };
+        let body_shape = match sixng_core::bodyshape::parse_spec(&self.body_shape) {
+            Ok(v) => v,
+            Err(e) => {
+                self.settings_msg = e;
+                return;
+            }
+        };
         let opts = ExportOptions {
             out: PathBuf::from(&self.out),
             png: self.tex_png,
@@ -562,6 +572,7 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
             raw: false,
             force: false,
             skip_embedded_textures: false,
+            body_shape,
         };
         self.start_task(&format!("Extracting {} entries", idxs.len()), ctx, move |pr| {
             let sel: Vec<&Entry> = idxs.iter().map(|&i| &ix.entries[i]).collect();
@@ -777,6 +788,8 @@ impl eframe::App for App {
                 }
                 ui.checkbox(&mut self.tex_png, "PNG");
                 ui.checkbox(&mut self.tex_dds, "DDS");
+                ui.label("Body shape:").on_hover_text("Ped clothing: pose the shared ped skeleton with the game's body-shape rig, e.g. gcweightbelly=0.5,gcmusclechest=1 (gcweight* -1..1, gcmuscle* 0..1, gcbutt, gcbreasts; allweight=v, allmuscle=v). Empty = neutral. Needs packs.rpf and anim.rpf indexed.");
+                ui.add(egui::TextEdit::singleline(&mut self.body_shape).hint_text("neutral").desired_width(160.0));
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label("World data (whole map → Output):");

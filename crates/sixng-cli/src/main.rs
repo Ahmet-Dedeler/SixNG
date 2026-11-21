@@ -110,6 +110,12 @@ struct OutArgs {
     /// Only print the selection and size estimate.
     #[arg(long)]
     dry_run: bool,
+    /// Body shape for ped clothing, e.g. "gcweightbelly=0.5,gcmusclechest=1"
+    /// (gcweight* -1..1, gcmuscle* 0..1, gcbutt, gcbreasts; allweight=v and
+    /// allmuscle=v set a whole group). Poses the shared ped skeleton with the
+    /// game's body-shape rig; needs packs.rpf and anim.rpf indexed.
+    #[arg(long)]
+    body_shape: Option<String>,
 }
 
 impl OutArgs {
@@ -121,6 +127,14 @@ impl OutArgs {
             raw: self.raw,
             force: self.force,
             skip_embedded_textures: self.no_embedded_textures,
+            body_shape: match self.body_shape.as_deref().map(sixng_core::bodyshape::parse_spec) {
+                None => Vec::new(),
+                Some(Ok(v)) => v,
+                Some(Err(e)) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            },
         }
     }
 }

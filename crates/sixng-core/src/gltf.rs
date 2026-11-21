@@ -44,6 +44,10 @@ pub struct Joint {
     pub name: String,
     pub parent: Option<usize>,
     pub bind: [f32; 16],
+    /// Rest pose (bone -> model, Z-up) when it differs from the bind pose,
+    /// e.g. a body shape applied to the shared ped skeleton. The node
+    /// transforms use it; the inverse bind matrices still use `bind`.
+    pub pose: Option<[f32; 16]>,
 }
 
 /// RAGE (Z-up) -> glTF (Y-up) for a column-major 4x4: C * M * C^T with
@@ -194,10 +198,11 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
     let mut nodes: Vec<Value> = Vec::new();
     // Joint nodes first (indices 0..n), local matrices from model binds.
     let binds: Vec<[f32; 16]> = skeleton.iter().map(|j| yup_mat(&j.bind)).collect();
+    let poses: Vec<[f32; 16]> = skeleton.iter().map(|j| yup_mat(j.pose.as_ref().unwrap_or(&j.bind))).collect();
     for (i, j) in skeleton.iter().enumerate() {
         let local = match j.parent.filter(|&p| p < skeleton.len()) {
-            Some(p) => mat_mul(&crate::drawable::affine_inverse(&binds[p]), &binds[i]),
-            None => binds[i],
+            Some(p) => mat_mul(&crate::drawable::affine_inverse(&poses[p]), &poses[i]),
+            None => poses[i],
         };
         let children: Vec<usize> = skeleton.iter().enumerate().filter(|(_, c)| c.parent == Some(i)).map(|(k, _)| k).collect();
         let mut nd = json!({"name": j.name, "matrix": local});

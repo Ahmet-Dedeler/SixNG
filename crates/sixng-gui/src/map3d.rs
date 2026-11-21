@@ -1864,7 +1864,7 @@ fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opts: &glb::Lo
     add(0, t0);
     if !dir.join("model.glb").exists() {
         let t1 = Instant::now();
-        let eo = ExportOptions { out: cache.to_path_buf(), png: !opts.no_textures, dds: false, raw: false, force: false, skip_embedded_textures: false };
+        let eo = ExportOptions { out: cache.to_path_buf(), png: !opts.no_textures, dds: false, raw: false, force: false, skip_embedded_textures: false, body_shape: Vec::new() };
         let _ = sixng_core::export::export_entry(&a, e, &eo)?;
         add(1, t1);
         LOAD_T[4].fetch_add(1, Ordering::Relaxed);
