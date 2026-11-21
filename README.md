@@ -45,7 +45,7 @@ There is one Rust core library with two front ends:
 | Models (drawables `.#dr`, fragments/vehicles `.#ft`) | **works (geometry, LODs, skeleton, skinning); partial (materials)**: one GLB per LOD (`model.glb`, `model_lodN.glb`), with triangle meshes, normals and every UV set (UV0–UV3), one node per geometry, Y-up, metres. Fragments carry their **skeleton as glTF joints with correct pivots** and a **skin** (JOINTS_0/WEIGHTS_0 from the game's bone streams; u16 joints for skeletons over 255 bones, fixed 2026-11-20: earlier vehicle exports have wrong bones on interior, lamp, window and bumper geometries and should be re-exported). Checked in a glTF viewer (three.js) on `phoenix_mid` and three map pieces: shaded, normals, UV checker, joint markers, textured. **Materials link `ttpf` textures** (base colour and normal map, picked from the parameter hash and format) where they decode: on the map samples about half the materials get a base colour and a normal map. **Shader and parameter names** resolve since 2026-11-21 (all 344 shaders, about 75 % of parameter uses; see `sixng names`); texture names are still 64-bit hashes. **Tangents** (`TANGENT`, decoded from the game's tangent stream) are written where the mesh has one. Vertex colours are raw. Both models that had no geometry in the placement test now decode: a second small system stream is now detected, which recovered geometry for about 10 % of multi-stream models that had none. **Cables and pool/fountain water** (float-position vertex blobs) decode since 2026-11-20; cables are widened into crossed 2 cm ribbons because the game widens them in a shader. Since the same date, a stricter system-stream rule recovers **fragment props** and some **64 m `_hd` ground tiles** whose graphics page was being read as system data. In a BeamNG test box this took the models with no geometry from 74 to 0. Fragments get a real bbox in `model.json` (`drawable.bounds`; `bounds_raw` is meaningless on fragments). Occluder and water-vegetation LOD buffers are still not decoded. **LOD levels** come from the main drawable's LOD group since 2026-11-20. Earlier exports ranked every model array, so fragment props (streetlights, signs) got a small base plate or bracket as `model.glb` and buildings got trim strips as `model_lodN.glb`; re-export those. Embedded-drawable models now go to `model_parts.glb`. **Two-layer blend materials** (walls, ground pieces) get a `multilayer` block: base/layer-2 colour, normal and data textures, UV set and weight channel (COLOR0.a). |
 | Vehicles | **partial**: the body exports with pivots, skin and LODs; `^phoenix` gives 248 parts with 0 errors, including the `_dmg_mod_*` damage parts and mod-kit parts. **Wheels are shared models** (`rim_*`, `tyre_*`) placed at `model.json` → `wheel_mounts`. A test fit in all four arches looks right, but the per-vehicle wheel size and which rim the car uses are not decoded yet. **Textures**: 33 of `phoenix_mid`'s texture hashes now decode: interior, lights, trim, the shared detail masks (dirt, grime, scratches, decals) and normal atlases. **Paint**: the body's colour slot is an engine-default white texture; the colour is applied at runtime and the vehicle colour tables are **not decoded** (the vehicle/mod-kit table is a PSO with 64-bit field hashes). Handling data has not been located. |
 | Textures in unusual formats (R16/R32 float, …) | **skipped with a warning**. The texture JSON is still written; DDS export works where the format is known. |
-| Map placements | **works**: `sixng placements` decodes the map files (self-describing `0x7a` resources, the GTA V `.ymap` equivalent): **2,249,490 entities in 30,785 files** in `levels.rpf`, 95 % resolved to a named, exportable model. The count rose from 1.47 M after the resource stream-split fix. Position, rotation, scale, flags and GUID are decoded. **LOD hierarchy**: each entity has `lod {level (HD/LOD/SLOD1–4/ORPHAN_HD), parent_index, num_children, lod_dist, child_lod_dist, priority}`. `index.jsonl` gives each file's `parent_id`, the file that `parent_index` points into. Checked: every link goes one level up, and the median parent distance is 0.47 m. A second grouping linkage (field `e74c3c23` ≥ 0) is not decoded; other fields are kept by hash. `data.rpf` and `packs.rpf` contain no map files. Checked visually: two map files (a tower block with its base, walkway and planting, and an industrial site) rendered from their exported models line up. |
+| Map placements | **works**: `sixng placements` decodes the map files (self-describing `0x7a` resources, the GTA V `.ymap` equivalent): **2,249,490 entities in 30,785 files** in `levels.rpf`, 95 % resolved to a named, exportable model. The count rose from 1.47 M after the resource stream-split fix. Position, rotation, scale, flags and GUID are decoded. **LOD hierarchy**: each entity has `lod {level (HD/LOD/SLOD1–4/ORPHAN_HD), parent_index, parent_instance, num_children, lod_dist, child_lod_dist, priority}`. After `sixng lod-links` it also has `archetype_lod_dist`, `hd_texture_dist`, `effective_lod_dist` (lod_dist -1 means the archetype's) and a resolved `parent`: an LOD entity in another map file, or an instance of a `*_batchlod` prop batch (99.0 % of 1.05 M batch-linked HD entities and 99.9 % of 215 K entity-linked ones resolve, each with a method and confidence). Other fields are kept by hash. `data.rpf` and `packs.rpf` contain no map files. Checked visually: two map files (a tower block with its base, walkway and planting, and an industrial site) rendered from their exported models line up. |
 | Collision (physics bounds) | **works (geometry); partial (surface names)**: `sixng collision [levels]` decodes the unnamed bound resources in `levels.rpf` (the GTA V `.ybn` equivalent: composite → geometry bounds with triangles, boxes, spheres, capsules, cylinders) to one GLB per file in world coordinates, **split into one primitive per surface id**, plus `index.jsonl` (bbox, polygon counts, materials, primitive list) and `surfaces.json`. Surface ids are 15-bit hashes of the names in the game's material list (`ROAD_TARMAC`, `TRACK_GRASS_SHORT`, `METAL_RAILING` …); the hash function is unknown, so names are not attached yet. Checked visually: a building with window openings, a car park with railings and pillars, and terrain with coherent surface patches. A sample of 400 entries gave 353 bounds; the whole archive is about 87 K files, ~15 GB of GLB. |
 | Lights | **works (position, colour, direction); partial (other attributes)**: `sixng lights [levels]` follows the light extensions on archetypes and entities (GTA V `CExtensionDefLightEffect` / `CLightAttrDef` equivalent) through the meta pool references and writes `lights/levels/sets.jsonl` (**136,466 light sets, 274,819 lights** with local position, RGB colour, direction/tangent and every other field by hash) and `world.jsonl` (**624,184 placed lights** in world space, transformed by each entity that uses the archetype). Checked visually: the whole-map plot reads like a night satellite view, and a 1 km city cell shows lamp rows along both edges of a bridge and the arterials, and grids over car parks. The light fields are now named from their own member hashes (case-sensitive joaat of the GTA V `CLightAttr` names): `intensity`, `falloff` (range), `falloffExponent`, cone angles, corona, volumetric and fade distances, `timeFlags`; 774,847 placed lights including interiors. ~1 min, ~0.7 GB. |
 | Navmesh, road surface | **works (navmesh, road polygons, lane graph)**: `sixng navmesh [--roads-only]` decodes the navmesh tiles in `navmeshes.rpf` (GTA V `.ynv` equivalent, 128 m tiles) to GLB in world coordinates, one primitive per polygon flag; **flag 0x2000 = road surface** (checked visually). `sixng paths levels` writes the road/path-node graph (GTA V `.ynd` equivalent): 63,808 nodes with speed limit, street hash, **named node flags** (34 of 51: NoGps, Junction, InTunnel, Highway slip / exit, Stop, Yield, Bridge, WaterNode …), road class and density; 145,518 links with length, lane counts per direction and named flags (GpsCanGoBothWays, LeadsToDeadEnd / LeadsFromDeadEnd from the game's names; unpaved / track, two-way and no-ambient-traffic (bit 6) inferred); and **1,546 junctions** with entrances, turn paths and, for 369 signalised ones, **traffic-light phases** (duration and the placed traffic-light props, matched by entity hash for 99.6 %). |
@@ -166,6 +166,9 @@ ames.json; exports and the app use it.
 # Link archetypes whose drawable has no recovered name (bbox + archive-order match; ~9 min, once after indexing).
 # Writes work\index\archetype_links.json; placements / lights pick it up automatically
 .\target\release\sixng.exe link-archetypes levels
+# Archetype LOD distances and resolved LOD parents (~2.5 min). Writes work\index\archetype_lod.jsonl and
+# lod_parents.jsonl; placements pick them up automatically (re-run them)
+.\target\release\sixng.exe lod-links levels
 # BCPack texture gaps: every material with flat / low-mip textures, slot roles, class, terrain-layer
 # surface guesses and placement weight (~6 min; uses placements, batches, collision, surfaces)
 .\target\release\sixng.exe texture-gaps levels -o work\out --file work\texture_gaps.json --placements work\out\placements\levels
@@ -385,10 +388,20 @@ baked map (`entities.bin`; bake first with `--bake-map`):
 - Fly: drag to look, WASD/arrows to move, Q/E down/up, Shift faster. The
   speed scales with height above ground.
 - Models are exported on demand into `<work>/gui_cache_v4` (the model
-  viewer's cache) by background workers, nearest first, and drawn
-  instanced: one GPU model per model id, all its placements as instances.
-  Textures are shared between models and sized by distance (full size in
-  the HD band, then 1/2, 1/4, 1/8).
+  viewer's cache) by background workers and drawn instanced: one GPU model
+  per model id, all its placements as instances. Loads go on-screen first,
+  then big and near before small and far; placements outside the view
+  (widened a little) are not drawn but stay loaded for turning round.
+- **Texture streaming**: a model first loads with 64 px textures, read from
+  reduced copies (≤ 256 px) kept in `<work>/gui_cache_v4/lowtex` (written
+  on first use, capped at 4 GB), then reloads with sharper textures as the
+  camera comes closer (full size in the HD band, then 1/2, 1/4, 1/8).
+  Textures are shared between models.
+- **Quality** (low / medium / high / ultra, saved in
+  `<work>/gui_settings.json`) sets the detail, a triangle budget, a
+  draw-call budget, the far-field error and the texture cap. Over either
+  budget the smallest objects on screen are dropped first (the Stream
+  window shows the size cut); both budgets have their own sliders.
 - **Detail** slider: sets the LOD distance bands (HD, LOD, SLOD1–4), prop
   and vegetation density and the minimum screen size. Each can be tuned
   on its own, together with the drawable LOD file and the texture cap.
@@ -397,10 +410,18 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   large HD models stay visible out to 1.75× the HD distance and the LOD
   level is skipped. SLOD placements mostly carry a placeholder unit-cube
   bbox, so they are never culled by screen size.
-- Terrain: a 7 km mesh from the 8 m heights. The bake stores the top
-  collision surface (roofs included), so the mesh is a morphological
-  opening of it (min then max over about 100 m), which removes buildings
-  but keeps hills.
+- **Whole-map terrain** (far field): the whole map is always drawn, out to
+  the horizon, as a quadtree of tiles over the baked 8 m top-surface
+  heights, coloured with the 2D map's terrain tiles (coarse tiles for
+  coarse nodes, so the colour sharpens as nodes refine). Nodes refine by
+  screen-space error (**terrain error**, px) and frustum; children replace
+  a parent only once all four are loaded, so nothing pops out. Beyond the
+  HD building range the tiles keep the roofs (max-pooled heights), so
+  buildings without a loaded model show as blocks instead of a void; near
+  the camera a tile switches to ground heights (a morphological opening
+  that removes buildings) once at least 90 % of the building models on it
+  have loaded. Built in the background from the map data already in
+  memory (about 0.3 s); no extra bake. A sea plane fills the rest.
 - Overlays: roads (by speed) and exterior lights (by hour) as lines; a
   draggable **Minimap** window (click to move there) and a **Stream**
   window (entities, models wanted/loaded, queue, instances, triangles,
@@ -429,7 +450,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   farthest visible models. The texture budget is RAM/16 (0.5–3 GB) and the
   model cap is 120 per GB (800–8,000). The **Memory** panel shows usage
   against the caps; untick **automatic** to set your own limit with the
-  slider. It is saved in `<work>/gui_settings.json`.
+  slider. It is saved in `<work>/gui_settings.json`. The process figure
+  includes memory the graphics driver commits for GPU buffers and
+  textures, so it grows with what is on the GPU (about 3 GB plus the
+  estimated GPU memory downtown).
 
 - **Lighting**: ambient light comes from a mostly desaturated sky, and the
   fog fades towards a half-desaturated sky, so surfaces keep their texture
@@ -445,12 +469,17 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   (they showed as floating black boxes); the model viewer still shows them.
 
 Map 3D screenshots: `--tab map3d --center X,Y --height H --yaw DEG --pitch
-DEG --detail 0-1 [--tod H] [--lights] [--roads] [--no-terrain] [--fog F]
-[--max-tex PX] [--no-textures] [--no-hd-fallback] [--kinds a,b]
-[--lods a,b] [--ram-cap GB] [--no-windows] [--no-decal-bias]
-[--show-proxies] --screenshot out.png --exit`.
+DEG [--quality low|medium|high|ultra] [--detail 0-1] [--tod H] [--lights]
+[--roads] [--no-terrain] [--fog F] [--max-tex PX] [--no-textures]
+[--no-hd-fallback] [--kinds a,b] [--lods a,b] [--ram-cap GB]
+[--no-windows] [--no-decal-bias] [--show-proxies] [--fly X,Y,H,SECONDS]
+[--no-vsync] --screenshot out.png --exit`.
 The shot waits until every wanted model is loaded (15-minute limit) and
-also saves `out_ui.png` with the panels.
+also saves `out_ui.png` with the panels. `--fly` first waits for the
+start view, then flies to (X, Y, H metres above ground) and logs the
+frame times of the flight. Timings (open time, time to a complete
+low-texture view, frame times, RAM, estimated GPU memory, draw calls,
+loader times) go to stderr and `<work>/map3d_perf.log`.
 
 Screenshots from the command line (for checks and docs):
 

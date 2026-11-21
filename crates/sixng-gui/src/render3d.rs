@@ -280,6 +280,7 @@ pub fn class_id(c: &str) -> u32 {
         "water" => 8,
         "terrain_multilayer" => 9,
         "car_paint" => 10,
+        "map_tile" => 11,
         _ => 1,
     }
 }
@@ -304,6 +305,12 @@ pub struct Renderer3D {
     dummy_joints: wgpu::Buffer,
     pub default_frame_bg: wgpu::BindGroup,
     target: Option<Target>,
+    /// Draw calls in the last frame.
+    pub draws: u32,
+    /// Recorded opaque draws (key of the model set, bundle, draw count):
+    /// replayed while the drawn models and their instance counts stay the
+    /// same, so a still or moving camera costs no re-encoding.
+    bundle: Option<(u64, wgpu::RenderBundle, u32)>,
 }
 
 fn tex_rgba(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image) -> wgpu::Texture {
@@ -426,7 +433,7 @@ impl Renderer3D {
             ],
         });
         std::mem::forget(wt); // the 1x1 white texture lives for the process
-        Renderer3D { pipe_opaque, pipe_blend, pipe_decal, pipe_decal_blend, decal_bias: true, pipe_wire, pipe_lines, pipe_lines_top, pipe_sky, bgl_frame, bgl_mat, frame_ub, sampler, white, dummy_joints, default_frame_bg, target: None }
+        Renderer3D { pipe_opaque, pipe_blend, pipe_decal, pipe_decal_blend, decal_bias: true, pipe_wire, pipe_lines, pipe_lines_top, pipe_sky, bgl_frame, bgl_mat, frame_ub, sampler, white, dummy_joints, default_frame_bg, target: None, draws: 0, bundle: None }
     }
 
     /// Upload a CPU model (meshes, materials, textures, skeleton).
@@ -641,7 +648,63 @@ impl Renderer3D {
         queue.write_buffer(&self.frame_ub, 0, bytemuck::bytes_of(&fu));
         let lb = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("lines"), contents: bytemuck::cast_slice(lines), usage: wgpu::BufferUsages::VERTEX }));
         let lt = (!lines_on_top.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("lines top"), contents: bytemuck::cast_slice(lines_on_top), usage: wgpu::BufferUsages::VERTEX }));
+        // opaque draws: record once per model set, replay every frame
+        let key = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (look.mode, self.decal_bias).hash(&mut h);
+            for gm in models {
+                (*gm as *const GpuModel as usize, gm.n_instances, gm.instance_cap, gm.instances.size(), gm.meshes.len()).hash(&mut h);
+                for me in &gm.meshes {
+                    me.visible.hash(&mut h);
+                }
+            }
+            h.finish()
+        };
+        if self.bundle.as_ref().map(|b| b.0) != Some(key) {
+            let mut be = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
+                label: Some("opaque bundle"),
+                color_formats: &[Some(COLOR_FMT)],
+                depth_stencil: Some(wgpu::RenderBundleDepthStencil { format: DEPTH_FMT, depth_read_only: false, stencil_read_only: true }),
+                sample_count: MSAA,
+                multiview: None,
+            });
+            let mut n = 0u32;
+            be.set_pipeline(&self.pipe_opaque);
+            // static models share the default frame bind group (their joints
+            // buffer is never read), so it is bound once
+            let mut shared_bound = false;
+            for gm in models {
+                if gm.n_instances == 0 {
+                    continue;
+                }
+                if gm.meshes.iter().any(|m| m.skinned) {
+                    be.set_bind_group(0, &gm.frame_bg, &[]);
+                    shared_bound = false;
+                } else if !shared_bound {
+                    be.set_bind_group(0, &self.default_frame_bg, &[]);
+                    shared_bound = true;
+                }
+                be.set_vertex_buffer(1, gm.instances.slice(..));
+                for me in gm.meshes.iter().filter(|m| m.visible) {
+                    let blend = gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8);
+                    if blend && look.mode == 0 {
+                        continue;
+                    }
+                    if self.decal_bias && gm.mat_decal[me.material].is_some() {
+                        continue;
+                    }
+                    be.set_bind_group(1, &gm.mat_bg[me.material], &[]);
+                    be.set_vertex_buffer(0, me.vb.slice(..));
+                    be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    be.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
+                    n += 1;
+                }
+            }
+            self.bundle = Some((key, be.finish(&wgpu::RenderBundleDescriptor { label: Some("opaque bundle") }), n));
+        }
         let t = self.target.as_ref().unwrap();
+        let mut draws = 0u32;
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewer") });
         {
             let c = look.clear;
@@ -662,23 +725,9 @@ impl Renderer3D {
                 pass.draw(0..3, 0..1);
             }
             // opaque + mask
-            pass.set_pipeline(&self.pipe_opaque);
-            for gm in models {
-                pass.set_bind_group(0, &gm.frame_bg, &[]);
-                pass.set_vertex_buffer(1, gm.instances.slice(..));
-                for me in gm.meshes.iter().filter(|m| m.visible) {
-                    let blend = gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8);
-                    if blend && look.mode == 0 {
-                        continue;
-                    }
-                    if self.decal_bias && gm.mat_decal[me.material].is_some() {
-                        continue;
-                    }
-                    pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vb.slice(..));
-                    pass.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
-                }
+            if let Some((_, b, n)) = &self.bundle {
+                pass.execute_bundles(std::iter::once(b));
+                draws += n;
             }
             // decals: after all opaque surfaces, by layer order; opaque-mode
             // decals (terrain blend layers) write depth, blended ones do not
@@ -708,6 +757,7 @@ impl Renderer3D {
                     pass.set_vertex_buffer(0, me.vb.slice(..));
                     pass.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
+                    draws += 1;
                 }
             }
             // blended, back to front by mesh centre
@@ -733,6 +783,7 @@ impl Renderer3D {
                     pass.set_vertex_buffer(0, me.vb.slice(..));
                     pass.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
+                    draws += 1;
                 }
             }
             if look.wire {
@@ -764,6 +815,7 @@ impl Renderer3D {
             }
         }
         queue.submit([enc.finish()]);
+        self.draws = draws;
         let _ = &self.dummy_joints;
         t.egui_id
     }

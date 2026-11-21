@@ -1,22 +1,31 @@
 #![allow(dead_code)]
 //! 3D map: a streamed fly-through of the placed models.
 //!
-//! Entities come from the baked map (`work/map/entities.bin`, see mapbake).
-//! Each frame the camera picks entities by LOD band (HD near, then LOD and
-//! SLOD1-4 further out), drops props/vegetation by the density setting and
-//! anything that would be smaller than a few pixels, and draws one GPU model
-//! per placed model id with all its instances. Models are exported on demand
-//! into `work/gui_cache` (same cache as the model viewer) by worker threads,
-//! nearest first, and evicted least-recently-used. Textures are shared
-//! between models and capped in size. A coarse terrain mesh from the baked
-//! 8 m heights fills the distance. Overlays: roads and lights as lines, and
-//! draggable minimap / stats / inspect windows.
+//! Entities come from the baked map (`work/map/entities.bin`, see mapbake),
+//! bucketed by LOD level, LOD distance and size so a visibility update only
+//! visits entities that can be in range. The camera picks entities by LOD
+//! band (HD near, then LOD and SLOD1-4 further out), drops props/vegetation
+//! by the density setting, anything smaller than the screen-size cut (raised
+//! automatically to stay in the triangle and draw-call budget) and anything
+//! outside the (widened) view frustum, and draws one GPU model per placed
+//! model id with all its instances; the opaque draws are recorded once into
+//! a render bundle and replayed while the set stays the same.
+//!
+//! Models are exported on demand into `work/gui_cache` (same cache as the
+//! model viewer) by worker threads, on-screen, big and near first, and
+//! evicted least-recently-used. Textures stream: a model first loads with
+//! 64 px textures (from reduced copies in `<cache>/lowtex`), then reloads
+//! sharper as the camera comes closer. The whole map stays visible through
+//! the far field (`world3d`): a quadtree of the baked heights with the 2D
+//! map tiles as colour. Overlays: roads and lights as lines, and draggable
+//! minimap / stats / inspect windows.
 use crate::glb;
 use crate::map2d::{self, MapData};
 use crate::mapbake::{rflag_names, EntRec, KIND_NAMES, RF_BBOX_UNKNOWN, RF_HIDE};
 use crate::mem;
 use crate::model_view;
 use crate::render3d::{self, Camera, GpuModel, Instance, LineV, Look, Renderer3D};
+use crate::world3d::{self, World};
 use eframe::egui::{self, Color32, Pos2, Stroke};
 use eframe::egui_wgpu::{self, wgpu};
 use glam::{Mat4, Vec3};
@@ -40,7 +49,8 @@ pub fn rage(v: Vec3) -> [f32; 3] {
 }
 
 enum Slot {
-    Ready { gm: GpuModel, used: u64, tris: usize },
+    /// `tex`: texture size cap it was loaded with (u32::MAX = untextured).
+    Ready { gm: GpuModel, used: u64, tris: usize, tex: u32 },
     Failed(String),
 }
 
@@ -63,7 +73,8 @@ struct Shared {
     hard: AtomicBool,
 }
 
-type LoadResult = (u32, Result<glb::Model, String>);
+/// (model, texture size cap used, result)
+type LoadResult = (u32, u32, Result<glb::Model, String>);
 
 /// Detail settings (the "detail" slider sets them all; each can be tuned).
 #[derive(Clone, PartialEq)]
@@ -111,6 +122,35 @@ pub struct Auto {
     pub started: Option<Instant>,
     /// Automation: viewport points (fractions 0..1) to pick and print when the shot is taken.
     pub picks: Vec<[f32; 2]>,
+    /// Automation: once the first view has loaded, fly to (x, y, height over
+    /// ground) RAGE over `secs` seconds, then wait for loads and take the shot.
+    pub fly: Option<([f32; 3], f32)>,
+    fly_from: Option<(Vec3, Instant)>,
+    fly_done: bool,
+    fly_ms: Vec<f32>,
+}
+
+/// Timings for the perf log (open time, frame times).
+#[derive(Default)]
+struct Perf {
+    t_open: Option<Instant>,
+    data_s: Option<f32>,
+    first_idle_s: Option<f32>,
+    /// Every in-range model loaded at least with small textures.
+    coarse_s: Option<f32>,
+    last_frame: Option<Instant>,
+    frame_ms: std::collections::VecDeque<f32>,
+}
+
+/// Mean, 99th percentile and worst frame time (ms) of a sample.
+fn frame_summary(v: &[f32]) -> (f32, f32, f32) {
+    if v.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let mean = s.iter().sum::<f32>() / s.len() as f32;
+    (mean, s[((s.len() as f32 * 0.99) as usize).min(s.len() - 1)], *s.last().unwrap())
 }
 
 pub struct Map3D {
@@ -143,6 +183,7 @@ pub struct Map3D {
     tex_bytes: usize,
     children_start: Vec<u32>,
     children_list: Vec<u32>,
+    buckets: Vec<Bucket>,
     /// Texture key -> (models using it, estimated bytes).
     tex_refs: HashMap<String, (u32, usize)>,
     /// Model -> texture keys it uses.
@@ -153,6 +194,9 @@ pub struct Map3D {
     /// User RAM limit in GB (None = automatic, from the installed RAM).
     pub ram_cap_gb: Option<f32>,
     mem: mem::MemInfo,
+    /// Process RAM when the map opened, and the map's own memory estimate.
+    base_ram: Option<u64>,
+    mem_est: u64,
     pressure: u8,
     mem_checked: Option<Instant>,
     tex_keys: Arc<Mutex<HashSet<String>>>,
@@ -168,13 +212,30 @@ pub struct Map3D {
     last_proxies: bool,
     frame: u64,
     dirty: bool,
-    terrain: Option<(GpuModel, [f32; 2])>,
     stats: Stats,
     picked: Option<u32>,
     lines_cache: Option<(Vec3, f32, bool, bool, Vec<LineV>, Vec<LineV>)>,
     size: [u32; 2],
     load_opts_lod: usize,
+    perf: Perf,
+    world: World,
+    /// Screen-space error target of the far field (px).
+    pub world_tau: f32,
+    /// Visible building placements per 128 m cell: (wanted, loaded).
+    bld_ready: HashMap<(i32, i32), (u32, u32)>,
+    /// Models in range (on screen or not): kept loaded, not evicted first.
+    keep: HashSet<u32>,
+    last_fwd: Vec3,
+    /// Triangle budget; over it the screen-size cut is raised (`size_boost`).
+    pub tri_budget: usize,
+    pub draw_budget: usize,
+    size_boost: f32,
+    /// Quality preset index (see QUALITY).
+    pub quality: usize,
 }
+
+/// Quality presets: (name, detail, triangle budget (M), terrain error px, max texture px, draw-call budget).
+pub const QUALITY: [(&str, f32, f32, f32, u32, usize); 4] = [("low", 0.15, 6.0, 5.0, 128, 2500), ("medium", 0.4, 12.0, 3.0, 256, 5000), ("high", 0.6, 20.0, 2.0, 512, 8000), ("ultra", 0.9, 40.0, 1.5, 1024, 16000)];
 
 #[derive(Default, Clone)]
 struct Stats {
@@ -193,6 +254,14 @@ struct Stats {
     hidden: usize,
     tex_gb: f32,
     update_ms: f32,
+    /// Entities tested in the last visibility update.
+    visited: usize,
+    draws: u32,
+    render_ms: f32,
+    /// Models queued to reload with sharper textures.
+    upgrades: usize,
+    /// ms: loads + visibility, terrain + overlays.
+    phase: [f32; 4],
 }
 
 impl Map3D {
@@ -209,7 +278,7 @@ impl Map3D {
         cam.yaw = 0.0;
         cam.pitch = 0.35;
         let detail_level = 0.5;
-        Map3D {
+        let mut m = Map3D {
             game: game.into(),
             work: work.into(),
             data: None,
@@ -227,10 +296,11 @@ impl Map3D {
             show_proxies: false,
             children_start: Vec::new(),
             children_list: Vec::new(),
+            buckets: Vec::new(),
             kinds: [true; 6],
             lods: [true; 6],
             speed: 1.0,
-            auto: Auto { screenshot: None, exit: false, frames: 0, quiet_frames: 0, ui_shot: None, started: None, picks: Vec::new() },
+            auto: Auto { screenshot: None, exit: false, frames: 0, quiet_frames: 0, ui_shot: None, started: None, picks: Vec::new(), fly: None, fly_from: None, fly_done: false, fly_ms: Vec::new() },
             open_model: None,
             status: String::new(),
             renderer: None,
@@ -243,6 +313,8 @@ impl Map3D {
             budget: mem::Budget::for_total(mem::query().total),
             ram_cap_gb: None,
             mem: mem::query(),
+            base_ram: None,
+            mem_est: 0,
             pressure: 0,
             mem_checked: None,
             tex_keys: Arc::new(Mutex::new(HashSet::new())),
@@ -258,13 +330,24 @@ impl Map3D {
             last_proxies: false,
             frame: 0,
             dirty: true,
-            terrain: None,
             stats: Stats::default(),
             picked: None,
             lines_cache: None,
             size: [16, 16],
             load_opts_lod: 0,
-        }
+            perf: Perf::default(),
+            world: World::new(Path::new(work).join("map")),
+            world_tau: 2.5,
+            bld_ready: HashMap::new(),
+            keep: HashSet::new(),
+            last_fwd: Vec3::Z,
+            tri_budget: 20_000_000,
+            draw_budget: 8000,
+            size_boost: 1.0,
+            quality: 2,
+        };
+        m.set_quality(2);
+        m
     }
 
     pub fn cache_dir(&self) -> PathBuf {
@@ -277,6 +360,8 @@ impl Map3D {
         self.data = None;
         self.children_start.clear();
         self.children_list.clear();
+        self.buckets.clear();
+        self.world = World::new(Path::new(&self.work).join("map"));
         self.last_eye = Vec3::splat(f32::MAX);
     }
 
@@ -293,7 +378,18 @@ impl Map3D {
         self.workers_started = true;
         let (tx, rx) = mpsc::channel::<LoadResult>();
         self.rx = Some(rx);
+        {
+            // size of the reduced-texture cache, so it stays under its cap
+            let dir = self.cache_dir().join("lowtex");
+            glb::LOWTEX_BYTES.store(u64::MAX / 2, Ordering::Relaxed);
+            std::thread::spawn(move || {
+                let n: u64 = std::fs::read_dir(&dir).map(|rd| rd.filter_map(|e| e.ok()?.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0);
+                glb::LOWTEX_BYTES.store(n, Ordering::Relaxed);
+            });
+        }
         let idx: Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>> = Arc::new(Mutex::new(HashMap::new()));
+        let offs: OffMaps = Arc::new(Mutex::new(HashMap::new()));
+        let arcs: ArcCache = Arc::new(Mutex::new(HashMap::new()));
         let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).clamp(2, 6);
         for _ in 0..n {
             let sh = self.shared.clone();
@@ -302,6 +398,8 @@ impl Map3D {
             let game = self.game.clone();
             let work = self.work.clone();
             let keys = self.tex_keys.clone();
+            let offs = offs.clone();
+            let arcs = arcs.clone();
             std::thread::spawn(move || {
                 let ws = Workspace::new(&game, &work);
                 loop {
@@ -341,11 +439,12 @@ impl Map3D {
                         continue;
                     }
                     let max_tex = if sh.tex_over.load(Ordering::Relaxed) { max_tex.min(64) } else { max_tex };
-                    let opts = glb::LoadOpts { max_tex, skip_keys: Some(keys.clone()), no_textures: !textures, hide_placeholders: true };
-                    let res = load_model(&ws, &Path::new(&work).join(crate::GUI_CACHE), &id, lod, &opts, &idx);
+                    let opts = glb::LoadOpts { max_tex, skip_keys: Some(keys.clone()), no_textures: !textures, hide_placeholders: true, small_cache: true };
+                    let res = load_model(&ws, &Path::new(&work).join(crate::GUI_CACHE), &id, lod, &opts, &idx, &offs, &arcs).map(merge_meshes);
                     sh.unread.fetch_add(1, Ordering::SeqCst);
                     sh.inflight.lock().unwrap().remove(&req.model);
-                    if tx.send((req.model, res.map_err(|e| format!("{e:#}")))).is_err() {
+                    let used = if textures { max_tex } else { u32::MAX };
+                    if tx.send((req.model, used, res.map_err(|e| format!("{e:#}")))).is_err() {
                         return;
                     }
                 }
@@ -374,6 +473,37 @@ impl Map3D {
                 fill[p] += 1;
             }
         }
+        // buckets by level, LOD distance and size
+        let t0 = Instant::now();
+        let mut groups: HashMap<(usize, usize, usize), Vec<(f32, f32, u32)>> = HashMap::new();
+        for (i, e) in data.ents.iter().enumerate() {
+            if data.name(e.model).is_empty() {
+                continue;
+            }
+            let linked = (e.parent as usize) < n || count[i] < count[i + 1];
+            let level = e.lod.min(5) as usize;
+            let rad = 0.5 * ((e.hi[0] - e.lo[0]).powi(2) + (e.hi[1] - e.lo[1]).powi(2) + (e.hi[2] - e.lo[2]).powi(2)).sqrt();
+            let size = if e.rflags & RF_BBOX_UNKNOWN != 0 && e.lod > 0 { SIZE_CLASSES.len() - 1 } else { SIZE_CLASSES.iter().position(|&u| rad <= u).unwrap_or(SIZE_CLASSES.len() - 1) };
+            let dist = if linked {
+                usize::MAX
+            } else if e.lod_dist > 0.0 {
+                DIST_CLASSES.iter().position(|&u| e.lod_dist <= u).unwrap_or(DIST_CLASSES.len() - 1)
+            } else {
+                DIST_CLASSES.len()
+            };
+            groups.entry((level, dist, size)).or_default().push((e.pos[0], e.pos[1], i as u32));
+        }
+        let mut buckets: Vec<Bucket> = groups
+            .into_iter()
+            .map(|((level, dist, size), pts)| {
+                let span = if dist < DIST_CLASSES.len() { DIST_CLASSES[dist] } else { 1000.0 };
+                let cell = (span.min(SIZE_CLASSES[size] / 0.003) * 0.5).clamp(64.0, 1024.0);
+                Bucket { level, dist, size, count: pts.len(), grid: CsrGrid::build(cell, &pts) }
+            })
+            .collect();
+        buckets.sort_by_key(|b| (b.level, b.dist, b.size));
+        eprintln!("[map3d] {} entity buckets in {:.0} ms", buckets.len(), t0.elapsed().as_secs_f32() * 1000.0);
+        self.buckets = buckets;
         self.children_start = count;
         self.children_list = list;
     }
@@ -429,7 +559,18 @@ impl Map3D {
         let mut hidden = 0usize;
         let cache = &self.cache;
         let (cs, cl) = (&self.children_start, &self.children_list);
-        data.ent_grid.query(eye[0] - rmax, eye[1] - rmax, eye[0] + rmax, eye[1] + rmax, |i| {
+        // frustum (widened so turning a little shows loaded models at once)
+        let aspect = self.size[0] as f32 / self.size[1].max(1) as f32;
+        let vp = Mat4::perspective_rh((self.cam.fov * 1.3).min(3.0), aspect.max(0.1), 0.5, 1.0e5) * self.cam.view();
+        let planes: Vec<glam::Vec4> = [vp.row(3) + vp.row(0), vp.row(3) - vp.row(0), vp.row(3) + vp.row(1), vp.row(3) - vp.row(1)].iter().map(|p| *p / p.truncate().length().max(1e-6)).collect();
+        let cam_eye = self.cam.eye();
+        let cam_fwd = self.cam.forward();
+        let in_view = |c: Vec3, r: f32| -> bool { (c - cam_eye).dot(cam_fwd) > -r && planes.iter().all(|p| p.truncate().dot(c) + p.w >= -r) };
+        let min_size = d.min_size * self.size_boost;
+        let mut keep: HashSet<u32> = HashSet::new();
+        let mut visited = 0usize;
+        let mut visit = |i: u32| {
+            visited += 1;
             let e: &EntRec = &data.ents[i as usize];
             let kind = e.kind.min(5) as usize;
             if !drawable(e) {
@@ -480,7 +621,7 @@ impl Map3D {
                     return;
                 }
             }
-            if dist > 1.0 && rad / dist < d.min_size {
+            if dist > 1.0 && rad / dist < min_size {
                 return;
             }
             let dens = match kind {
@@ -491,16 +632,33 @@ impl Map3D {
             if dens < 1.0 && (hash32(i) as f32 / u32::MAX as f32) > dens {
                 return;
             }
+            let (s, c) = e.yaw.sin_cos();
+            let lc = [(e.lo[0] + e.hi[0]) * 0.5, (e.lo[1] + e.hi[1]) * 0.5, (e.lo[2] + e.hi[2]) * 0.5];
+            let wc = gl([e.pos[0] + lc[0] * c - lc[1] * s, e.pos[1] + lc[0] * s + lc[1] * c, e.pos[2] + lc[2]]);
+            let seen = in_view(wc, rad.min(2000.0));
+            keep.insert(e.model);
+            let nd = near.entry(e.model).or_insert(f32::MAX);
+            *nd = nd.min(dist);
+            // load order: big and near first, on screen before off screen
+            let p = prio.entry(e.model).or_insert(f32::MAX);
+            *p = p.min(dist / rad.clamp(1.0, 400.0).sqrt() * if seen { 1.0 } else { 3.0 });
+            if !seen {
+                return;
+            }
             n_ent += 1;
             per_band[l] += 1;
             let m = Mat4::from_translation(gl(e.pos)) * Mat4::from_rotation_y(e.yaw);
             want.entry(e.model).or_default().push(Instance::new(m, false));
-            let nd = near.entry(e.model).or_insert(f32::MAX);
-            *nd = nd.min(dist);
-            let p = prio.entry(e.model).or_insert(f32::MAX);
-            *p = p.min(dist / rad.clamp(1.0, 400.0).sqrt());
             visible.push((i, e.model));
-        });
+        };
+        for b in &self.buckets {
+            if !lods[b.level] {
+                continue;
+            }
+            let r = b.radius(d);
+            b.grid.query(eye[0] - r, eye[1] - r, eye[0] + r, eye[1] + r, &mut visit);
+        }
+        self.stats.visited = visited;
         self.stats.handoffs = handoffs;
         self.stats.hidden = hidden;
         // requests: wanted models that are not cached or in flight, nearest first
@@ -517,6 +675,21 @@ impl Map3D {
             (d.max_tex / div).max(64)
         };
         let tx_on = if d.textures { 1 } else { 0 };
+        // Texture streaming: a model first loads with small textures (fast,
+        // from the reduced copies), then reloads sharper when the camera is
+        // close enough to need twice the size.
+        let mut upgrades: Vec<Req> = Vec::new();
+        if d.textures && !over {
+            for (&m, &p) in &prio {
+                if let Some(Slot::Ready { tex, .. }) = self.cache.get(&m) {
+                    let want_t = tex_for(near.get(&m).copied().unwrap_or(0.0));
+                    if *tex != u32::MAX && want_t >= tex.saturating_mul(2) && !inflight.contains(&m) && self.pressure == 0 {
+                        upgrades.push(Req { model: m, id: format!("{}|{}|{}|{}", data.name(m), d.drawable_lod, want_t, tx_on), prio: p * 3.0 + 1.0 });
+                    }
+                }
+            }
+        }
+        self.stats.upgrades = upgrades.len();
         let mut reqs: Vec<Req> = prio
             .iter()
             .filter(|(m, _)| !self.cache.contains_key(m) && !inflight.contains(m))
@@ -527,8 +700,9 @@ impl Map3D {
                 1 => near.get(m).map_or(false, |&dd| dd < d.radii[0]),
                 _ => false,
             })
-            .map(|(&m, &p)| Req { model: m, id: format!("{}|{}|{}|{}", data.name(m), d.drawable_lod, tex_for(near.get(&m).copied().unwrap_or(0.0)), tx_on), prio: p })
+            .map(|(&m, &p)| Req { model: m, id: format!("{}|{}|{}|{}", data.name(m), d.drawable_lod, tex_for(near.get(&m).copied().unwrap_or(0.0)).min(FIRST_TEX), tx_on), prio: p })
             .collect();
+        reqs.extend(upgrades);
         reqs.sort_by(|a, b| a.prio.partial_cmp(&b.prio).unwrap_or(std::cmp::Ordering::Equal));
         reqs.truncate(4000);
         let nq = reqs.len();
@@ -539,6 +713,7 @@ impl Map3D {
         self.stats.queued = nq;
         self.stats.per_band = per_band;
         self.want = want;
+        self.keep = keep;
         self.near_dist = near;
         self.visible = visible;
         self.stats.update_ms = t0.elapsed().as_secs_f32() * 1000.0;
@@ -549,7 +724,7 @@ impl Map3D {
         let mut inst_total = 0;
         let mut tris = 0;
         for (m, slot) in self.cache.iter_mut() {
-            if let Slot::Ready { gm, used, tris: t } = slot {
+            if let Slot::Ready { gm, used, tris: t, .. } = slot {
                 match self.want.get(m) {
                     Some(v) => {
                         ren.set_instances(rs, gm, v);
@@ -583,7 +758,7 @@ impl Map3D {
         let mut any = false;
         let ren = self.renderer.as_ref().unwrap();
         while t0.elapsed().as_millis() < 12 {
-            let Ok((m, res)) = rx.try_recv() else { break };
+            let Ok((m, tex, res)) = rx.try_recv() else { break };
             self.shared.unread.fetch_sub(1, Ordering::SeqCst);
             any = true;
             match res {
@@ -612,7 +787,7 @@ impl Map3D {
                     } else {
                         gm.n_instances = 0;
                     }
-                    self.cache.insert(m, Slot::Ready { gm, used: self.frame, tris: model.triangles });
+                    self.cache.insert(m, Slot::Ready { gm, used: self.frame, tris: model.triangles, tex });
                 }
                 Err(e) => {
                     self.cache.insert(m, Slot::Failed(e));
@@ -670,7 +845,7 @@ impl Map3D {
                 .cache
                 .iter()
                 .filter_map(|(m, s)| match s {
-                    Slot::Ready { used, .. } if !self.want.contains_key(m) => Some((*used, *m)),
+                    Slot::Ready { used, .. } if !self.keep.contains(m) => Some((*used, *m)),
                     _ => None,
                 })
                 .collect();
@@ -704,101 +879,21 @@ impl Map3D {
         }
         self.mem_checked = Some(Instant::now());
         self.mem = mem::query();
-        let p = self.budget.pressure(&self.mem);
+        // The process figure keeps memory the allocator and the graphics
+        // driver hold on to after eviction, so on its own it never comes
+        // back down. Judge pressure by the map's own estimate (RAM at open
+        // plus GPU data, x1.6 as measured downtown), capped by the process
+        // figure; the low-free-RAM guard still uses the real numbers.
+        let base = *self.base_ram.get_or_insert(self.mem.process);
+        let est = base + (self.gpu_bytes() as f64 * 1.6) as u64;
+        self.mem_est = est.min(self.mem.process);
+        let p = self.budget.pressure(&mem::MemInfo { process: self.mem_est, ..self.mem });
         self.shared.hard.store(p >= 2, Ordering::Relaxed);
         self.shared.tex_over.store(self.tex_bytes as u64 > self.budget.textures || p > 0, Ordering::Relaxed);
         if p != self.pressure || p >= 2 {
             self.pressure = p;
             self.dirty = true;
         }
-    }
-
-    fn build_terrain(&mut self, rs: &egui_wgpu::RenderState, data: &MapData, centre: [f32; 2]) {
-        const STEP: f32 = 16.0;
-        const HALF: i32 = 220; // 2 x 220 x 16 m = 7 km
-        let n = (2 * HALF + 1) as usize;
-        let mut verts = Vec::with_capacity(n * n);
-        let mut hs = vec![f32::NAN; n * n];
-        let cx = (centre[0] / STEP).round() * STEP;
-        let cy = (centre[1] / STEP).round() * STEP;
-        for j in 0..n {
-            for i in 0..n {
-                let x = cx + (i as i32 - HALF) as f32 * STEP;
-                let y = cy + (j as i32 - HALF) as f32 * STEP;
-                hs[j * n + i] = data.height(x, y).unwrap_or(f32::NAN);
-            }
-        }
-        // The bake stores the top collision surface (roofs included). A
-        // morphological opening (min then max over ~100 m) removes buildings
-        // but keeps hills; a final 3x3 mean smooths the steps.
-        let hs = {
-            const R: i32 = 3;
-            let filt = |src: &Vec<f32>, take_min: bool| {
-                let mut out = vec![0.0f32; n * n];
-                for j in 0..n as i32 {
-                    for i in 0..n as i32 {
-                        let mut v = if take_min { f32::MAX } else { f32::MIN };
-                        for dj in -R..=R {
-                            for di in -R..=R {
-                                let (x, y) = ((i + di).clamp(0, n as i32 - 1), (j + dj).clamp(0, n as i32 - 1));
-                                let s = src[y as usize * n + x as usize];
-                                let s = if s.is_nan() { -2.0 } else { s };
-                                v = if take_min { v.min(s) } else { v.max(s) };
-                            }
-                        }
-                        out[j as usize * n + i as usize] = v;
-                    }
-                }
-                out
-            };
-            let water: Vec<bool> = hs.iter().map(|v| v.is_nan()).collect();
-            let opened = filt(&filt(&hs, true), false);
-            let mut sm = opened.clone();
-            for j in 1..n - 1 {
-                for i in 1..n - 1 {
-                    let mut s = 0.0;
-                    for dj in 0..3 {
-                        for di in 0..3 {
-                            s += opened[(j + dj - 1) * n + i + di - 1];
-                        }
-                    }
-                    sm[j * n + i] = s / 9.0;
-                }
-            }
-            sm.iter().zip(&water).map(|(v, w)| if *w { f32::NAN } else { *v }).collect::<Vec<f32>>()
-        };
-        let h = |i: usize, j: usize| hs[j.min(n - 1) * n + i.min(n - 1)];
-        for j in 0..n {
-            for i in 0..n {
-                let x = cx + (i as i32 - HALF) as f32 * STEP;
-                let y = cy + (j as i32 - HALF) as f32 * STEP;
-                let z = h(i, j);
-                let z = if z.is_nan() { -2.0 } else { z };
-                let zx = h(i + 1, j) - h(i.saturating_sub(1), j);
-                let zy = h(i, j + 1) - h(i, j.saturating_sub(1));
-                let nr = Vec3::new(-zx.nan_or(0.0), -zy.nan_or(0.0), 2.0 * STEP).normalize();
-                let p = gl([x, y, z - 1.5]);
-                let water = h(i, j).is_nan() || z < 0.5;
-                let col = if water { [60, 80, 95, 255] } else { [120, 124, 106, 255] };
-                verts.push(glb::Vertex { pos: p.into(), nrm: gl([nr.x, nr.y, nr.z]).into(), tan: [1.0, 0.0, 0.0, 1.0], uv0: [0.0, 0.0], uv1: [0.0, 0.0], col, joints: [0; 4], weights: [0; 4] });
-            }
-        }
-        let mut idx = Vec::with_capacity((n - 1) * (n - 1) * 6);
-        for j in 0..n - 1 {
-            for i in 0..n - 1 {
-                let a = (j * n + i) as u32;
-                let b = a + 1;
-                let c = a + n as u32;
-                let d = c + 1;
-                idx.extend_from_slice(&[a, b, c, b, d, c]);
-            }
-        }
-        let mesh = glb::Mesh { name: "terrain".into(), verts, indices: idx, material: Some(0), skinned: false, has_tangents: false, uv_sets: 1, centre: gl([cx, cy, 0.0]).into() };
-        let mat = glb::Material { name: "terrain".into(), class: "terrain".into(), alpha_mode: "OPAQUE".into(), base_factor: [0.20, 0.21, 0.16, 1.0], base: None, normal: None, packed: None, emissive: None, slots: vec![], gap: "ok".into(), shader_hash: String::new(), decal: None };
-        let model = glb::Model { path: PathBuf::new(), meshes: vec![mesh], materials: vec![mat], joints: vec![], images: vec![], bbox: [[0.0; 3]; 2], triangles: 0, vertices: 0, extras: Default::default() };
-        let ren = self.renderer.as_ref().unwrap();
-        let gm = ren.upload(rs, &model, &[]);
-        self.terrain = Some((gm, [cx, cy]));
     }
 
     fn overlay_lines(&mut self, data: &MapData) -> (Vec<LineV>, Vec<LineV>) {
@@ -884,6 +979,18 @@ impl Map3D {
 
     pub fn ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let now = Instant::now();
+        let t_open = *self.perf.t_open.get_or_insert(now);
+        if let Some(l) = self.perf.last_frame.replace(now) {
+            let ms = (now - l).as_secs_f32() * 1000.0;
+            self.perf.frame_ms.push_back(ms);
+            if self.perf.frame_ms.len() > 240 {
+                self.perf.frame_ms.pop_front();
+            }
+            if self.auto.fly_from.is_some() && !self.auto.fly_done {
+                self.auto.fly_ms.push(ms);
+            }
+        }
         let Some(rs) = frame.wgpu_render_state() else {
             ui.label("The 3D map needs the wgpu renderer.");
             return;
@@ -893,9 +1000,14 @@ impl Map3D {
             ctx.request_repaint();
             return;
         };
+        if self.perf.data_s.is_none() {
+            self.perf.data_s = Some(t_open.elapsed().as_secs_f32());
+        }
         self.frame += 1;
         self.start_workers();
         if self.renderer.is_none() {
+            let ai = rs.adapter.get_info();
+            eprintln!("[map3d] adapter {} ({:?}, {:?}) present {:?}", ai.name, ai.backend, ai.device_type, rs.target_format);
             self.renderer = Some(Renderer3D::new(rs));
         }
         // side panel
@@ -906,11 +1018,13 @@ impl Map3D {
             self.dirty = true;
         }
         // uploads first, then visibility
+        let tph = Instant::now();
         self.check_memory();
         let got = if self.pressure >= 2 { self.drain_loads() } else { self.poll_loads(rs) };
         let eye = self.cam.eye();
         let moved = (eye - self.last_eye).length();
-        if self.dirty || moved > 15.0 || self.last_kinds != self.kinds || self.last_lods != self.lods || self.last_proxies != self.show_proxies || self.last_detail.as_ref() != Some(&self.detail) {
+        let turned = self.cam.forward().dot(self.last_fwd) < 0.995;
+        if self.dirty || moved > 15.0 || turned || self.last_kinds != self.kinds || self.last_lods != self.lods || self.last_proxies != self.show_proxies || self.last_detail.as_ref() != Some(&self.detail) {
             let lod_changed = self.last_detail.as_ref().map_or(false, |d| d.drawable_lod != self.detail.drawable_lod || d.textures != self.detail.textures || d.max_tex != self.detail.max_tex);
             if lod_changed {
                 self.cache.clear();
@@ -922,6 +1036,7 @@ impl Map3D {
             }
             self.update_visible(&data);
             self.last_eye = eye;
+            self.last_fwd = self.cam.forward();
             self.last_detail = Some(self.detail.clone());
             self.last_kinds = self.kinds;
             self.last_lods = self.lods;
@@ -929,15 +1044,21 @@ impl Map3D {
             self.dirty = false;
             self.apply_instances(rs);
             self.evict();
+            self.govern();
         } else if got {
             self.apply_instances(rs);
+            self.govern();
         }
+        self.stats.phase[0] = tph.elapsed().as_secs_f32() * 1000.0;
+        let tph = Instant::now();
         let er = rage(eye);
         if self.show_terrain {
-            let rebuild = self.terrain.as_ref().map_or(true, |(_, c)| (c[0] - er[0]).abs() > 1200.0 || (c[1] - er[1]).abs() > 1200.0);
-            if rebuild {
-                self.build_terrain(rs, &data, [er[0], er[1]]);
+            self.world.start(Arc::new(data.h8.clone()));
+            let ren = self.renderer.as_ref().unwrap();
+            if self.world.poll(rs, ren, 4.0) {
+                ctx.request_repaint();
             }
+            self.update_building_readiness(&data);
         }
         {
             let inflight = self.shared.inflight.lock().unwrap().len();
@@ -989,11 +1110,33 @@ impl Map3D {
             }
         }
         let (under, top) = self.overlay_lines(&data);
+        if self.show_terrain {
+            self.cam.far = 150_000.0;
+            let ready = &self.bld_ready;
+            let ok = |r: [f32; 4]| -> bool {
+                let c0 = ((r[0] - crate::mapbake::X0) / 128.0).floor() as i32;
+                let c1 = ((r[2] - crate::mapbake::X0) / 128.0).ceil() as i32;
+                let r0 = ((crate::mapbake::Y1 - r[3]) / 128.0).floor() as i32;
+                let r1 = ((crate::mapbake::Y1 - r[1]) / 128.0).ceil() as i32;
+                for cy in r0..r1 {
+                    for cx in c0..c1 {
+                        if let Some(&(w, l)) = ready.get(&(cx, cy)) {
+                            if (l as f32) < 0.9 * w as f32 {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                true
+            };
+            let view = world3d::View { cam: &self.cam, aspect: rect.width() / rect.height().max(1.0), viewport_h: px[1] as f32, tau: self.world_tau, ground_r: self.ground_radius(), ground_ok: &ok };
+            self.world.select(&view);
+        }
+        self.stats.phase[1] = tph.elapsed().as_secs_f32() * 1000.0;
         let mut models: Vec<&GpuModel> = Vec::new();
         if self.show_terrain {
-            if let Some((t, _)) = &self.terrain {
-                models.push(t);
-            }
+            let ren = self.renderer.as_ref().unwrap();
+            models.extend(self.world.models(rs, ren));
         }
         for s in self.cache.values() {
             if let Slot::Ready { gm, .. } = s {
@@ -1002,9 +1145,16 @@ impl Map3D {
                 }
             }
         }
+        // thinner fog higher up, so the whole map shows when zoomed out
+        let mut look = self.look.clone();
+        let alt = (er[2] - data.height(er[0], er[1]).unwrap_or(0.0)).max(1.0);
+        look.fog *= (400.0 / (alt + 400.0)).min(1.0);
         let ren = self.renderer.as_mut().unwrap();
         ren.decal_bias = self.decal_bias;
-        let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
+        let tr = Instant::now();
+        let tid = ren.render(rs, px, &self.cam, &look, &models, &under, &top);
+        self.stats.render_ms = tr.elapsed().as_secs_f32() * 1000.0;
+        self.stats.draws = ren.draws;
         ui.painter().image(tid, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
         // picked entity outline (bbox corners projected)
         if let Some(i) = self.picked {
@@ -1025,12 +1175,76 @@ impl Map3D {
         }
         // hint
         ui.painter().text(rect.left_bottom() + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, "drag: look · WASD/arrows: move · Q/E: down/up · Shift: fast · right-drag: pan · click: inspect", egui::FontId::proportional(12.0), Color32::from_white_alpha(200));
+        let tov = Instant::now();
         self.overlay_windows(&ctx, rect, &data);
+        self.stats.phase[2] = tov.elapsed().as_secs_f32() * 1000.0;
+        self.stats.phase[3] = now.elapsed().as_secs_f32() * 1000.0;
         self.automation(&ctx, rs, rect);
         let busy = self.stats.queued > 0 || self.stats.inflight > 0;
         if busy || resp.hovered() || resp.dragged() || self.auto.screenshot.is_some() || self.auto.ui_shot.is_some() {
             ctx.request_repaint();
         }
+    }
+
+    /// Visible building placements per 128 m cell and how many have their
+    /// model loaded: the far field switches a node to ground heights only
+    /// when its buildings are on screen.
+    /// Keep the drawn triangles near the budget by raising or lowering the
+    /// screen-size cut.
+    fn govern(&mut self) {
+        // triangles and draw calls, whichever is further over its budget
+        let t = (self.stats.tris as f32 / self.tri_budget.max(1) as f32).max(self.stats.draws as f32 / self.draw_budget.max(1) as f32);
+        let b = 1.0;
+        if t > b && self.size_boost < 16.0 {
+            self.size_boost = (self.size_boost * 1.25).min(16.0);
+            self.dirty = true;
+        } else if t < 0.6 * b && self.size_boost > 1.0 {
+            self.size_boost = (self.size_boost / 1.15).max(1.0);
+            self.dirty = true;
+        }
+    }
+
+    /// Apply a quality preset: detail, triangle budget, terrain error, texture size.
+    pub fn set_quality(&mut self, q: usize) {
+        let q = q.min(QUALITY.len() - 1);
+        let (_, det, tris, tau, tex, draws) = QUALITY[q];
+        self.draw_budget = draws;
+        self.quality = q;
+        self.detail_level = det;
+        let keep = (self.detail.drawable_lod, self.detail.textures, self.detail.hd_fallback);
+        self.detail = Detail::from_level(det);
+        self.detail.drawable_lod = keep.0;
+        self.detail.textures = keep.1;
+        self.detail.hd_fallback = keep.2;
+        self.detail.max_tex = tex;
+        self.tri_budget = (tris * 1.0e6) as usize;
+        self.world_tau = tau;
+        self.size_boost = 1.0;
+        self.dirty = true;
+    }
+
+    fn ground_radius(&self) -> f32 {
+        // out to here the far field lies flat under the streamed buildings
+        // (the HD band of large buildings); beyond it shows them as blocks
+        let d = &self.detail;
+        if d.hd_fallback { d.radii[1].min(d.radii[0] * 1.75).max(d.radii[0]) } else { d.radii[0] }
+    }
+
+    fn update_building_readiness(&mut self, data: &MapData) {
+        let mut m: HashMap<(i32, i32), (u32, u32)> = HashMap::new();
+        for &(i, model) in &self.visible {
+            let e = &data.ents[i as usize];
+            if e.kind != 1 {
+                continue;
+            }
+            let k = (((e.pos[0] - crate::mapbake::X0) / 128.0).floor() as i32, ((crate::mapbake::Y1 - e.pos[1]) / 128.0).floor() as i32);
+            let v = m.entry(k).or_insert((0, 0));
+            v.0 += 1;
+            if self.cache.contains_key(&model) {
+                v.1 += 1;
+            }
+        }
+        self.bld_ready = m;
     }
 
     fn detail_level_changed(&mut self) -> bool {
@@ -1057,13 +1271,24 @@ impl Map3D {
         }
     }
 
-    /// Load the saved RAM limit, if any.
+    /// Load the saved RAM limit and quality preset, if any.
     pub fn load_settings(&mut self) {
         let p = Path::new(&self.work).join("gui_settings.json");
-        let cap = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|j| j["map3d_ram_cap_gb"].as_f64()).map(|v| v as f32);
+        let j = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).unwrap_or_default();
+        let cap = j["map3d_ram_cap_gb"].as_f64().map(|v| v as f32);
         if cap.is_some() {
             self.set_ram_cap(cap, false);
         }
+        if let Some(q) = j["map3d_quality"].as_str().and_then(|q| QUALITY.iter().position(|x| x.0 == q)) {
+            self.set_quality(q);
+        }
+    }
+
+    fn save_setting(&self, key: &str, v: serde_json::Value) {
+        let p = Path::new(&self.work).join("gui_settings.json");
+        let mut j: serde_json::Value = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_else(|| serde_json::json!({}));
+        j[key] = v;
+        let _ = std::fs::write(&p, serde_json::to_vec_pretty(&j).unwrap_or_default());
     }
 
     fn ram_ui(&mut self, ui: &mut egui::Ui) {
@@ -1078,7 +1303,9 @@ impl Map3D {
             }
             ui.add_enabled_ui(!auto, |ui| {
                 let r = ui.add(egui::Slider::new(&mut gb, 1.0..=(total * 0.9).floor()).step_by(0.5).suffix(" GB").text("RAM limit"));
-                if r.drag_stopped() || (r.changed() && !r.dragged()) {
+                // only real input saves (the slider also reports a change
+                // when it snaps a value set from the command line)
+                if r.drag_stopped() || (r.changed() && r.has_focus()) {
                     changed = true;
                 }
             });
@@ -1087,19 +1314,40 @@ impl Map3D {
             self.set_ram_cap(if auto { None } else { Some(gb) }, true);
         }
         let (mi, bu) = (self.mem, self.budget);
-        let frac = (mi.process as f32 / bu.hard.max(1) as f32).clamp(0.0, 1.0);
+        let frac = (self.mem_est as f32 / bu.hard.max(1) as f32).clamp(0.0, 1.0);
         let col = match self.pressure {
             0 => Color32::from_rgb(90, 170, 90),
             1 => Color32::from_rgb(220, 180, 40),
             _ => Color32::from_rgb(220, 80, 60),
         };
-        ui.add(egui::ProgressBar::new(frac).fill(col).text(format!("{:.1} GB used · slows at {:.1} · drops at {:.1} GB", mem::gb(mi.process), mem::gb(bu.soft), mem::gb(bu.hard))));
+        ui.add(egui::ProgressBar::new(frac).fill(col).text(format!("{:.1} GB map · slows at {:.1} · drops at {:.1} GB", mem::gb(self.mem_est), mem::gb(bu.soft), mem::gb(bu.hard)))).on_hover_text(format!("Map estimate: RAM at open plus GPU data. Process total {:.1} GB (includes memory the allocator and driver keep after eviction).", mem::gb(mi.process)));
         ui.label(egui::RichText::new(format!("{:.0} GB installed · {:.1} GB free · textures ≤ {:.1} GB · up to {} models", mem::gb(mi.total), mem::gb(mi.avail), mem::gb(bu.textures), bu.models)).small().weak());
         ui.separator();
     }
 
     fn side_ui(&mut self, ui: &mut egui::Ui) {
         self.ram_ui(ui);
+        ui.heading("Quality");
+        ui.horizontal(|ui| {
+            for k in 0..QUALITY.len() {
+                if ui.selectable_label(self.quality == k, QUALITY[k].0).on_hover_text("Detail, triangle and draw-call budget, far-field error and texture size together").clicked() {
+                    self.set_quality(k);
+                    self.save_setting("map3d_quality", serde_json::json!(QUALITY[k].0));
+                }
+            }
+        });
+        let mut tb = self.tri_budget as f32 / 1e6;
+        if ui.add(egui::Slider::new(&mut tb, 1.0..=80.0).logarithmic(true).suffix(" M").text("triangle budget")).on_hover_text("Over this the smallest objects on screen are dropped first").changed() {
+            self.tri_budget = (tb * 1e6) as usize;
+            self.dirty = true;
+        }
+        let mut db = self.draw_budget as f32;
+        if ui.add(egui::Slider::new(&mut db, 500.0..=40000.0).logarithmic(true).text("draw-call budget")).on_hover_text("GPU cost grows with the number of draw calls (one per model material)").changed() {
+            self.draw_budget = db as usize;
+            self.dirty = true;
+        }
+        ui.label(egui::RichText::new(format!("small objects cut ×{:.1} to stay in budget", self.size_boost)).small().weak());
+        ui.separator();
         ui.heading("Detail");
         let mut lvl = self.detail_level;
         if ui.add(egui::Slider::new(&mut lvl, 0.0..=1.0).text("detail")).changed() {
@@ -1148,7 +1396,8 @@ impl Map3D {
                 ui.checkbox(&mut self.lods[k], LOD_NAMES[k]);
             }
         });
-        ui.checkbox(&mut self.show_terrain, "terrain (8 m heights)");
+        ui.checkbox(&mut self.show_terrain, "whole-map terrain").on_hover_text("Far field: the baked 8 m top surface as a streamed quadtree, with the 2D map tiles as colour. Buildings show as blocks until their models load.");
+        ui.add(egui::Slider::new(&mut self.world_tau, 1.0..=12.0).logarithmic(true).text("terrain error (px)")).on_hover_text("Screen-space error of the far field: smaller is finer and loads more tiles");
         ui.checkbox(&mut self.show_roads, "roads (by speed)");
         ui.checkbox(&mut self.show_lights, "lights (exterior, by hour)");
         ui.checkbox(&mut self.show_proxies, "show proxies / placeholders").on_hover_text("Debug: also draw interior-shell, shadow, light and VFX proxies, placements without a model and degenerate models");
@@ -1199,13 +1448,16 @@ impl Map3D {
                 .collapsible(true)
                 .show(ctx, |ui| {
                     ui.label(format!("entities {} · models {} wanted / {} loaded", st.entities, st.models_wanted, st.models_ready));
-                    ui.label(format!("queue {} · loading {} · failed {}", st.queued, st.inflight, st.failed));
+                    ui.label(format!("queue {} (sharpen {}) · loading {} · failed {}", st.queued, st.upgrades, st.inflight, st.failed));
                     ui.label(format!("instances {} · {:.1} M tris · textures {} ({:.2} GB)", st.instances, st.tris as f32 / 1e6, st.textures, st.tex_gb));
                     ui.label(format!("bands: {}", (0..6).map(|k| format!("{} {}", LOD_NAMES[k], st.per_band[k])).collect::<Vec<_>>().join(" · ")));
                     ui.label(format!("LOD parents handed to children {} · proxies hidden {}", st.handoffs, st.hidden));
-                    ui.label(egui::RichText::new(format!("update {:.1} ms · upload {:.1} ms", st.update_ms, st.upload_ms)).small().weak());
+                    let ws = self.world.stats.clone();
+                    ui.label(egui::RichText::new(format!("draw calls {} · render {:.1} ms · size cut ×{:.2} (budget {:.0} M tris, {} draws)", st.draws, st.render_ms, self.size_boost, self.tri_budget as f32 / 1e6, self.draw_budget)).small().weak());
+                    ui.label(format!("terrain: {} tiles drawn ({} ground) · level ≤ {} · {} resident · {} queued · {:.1} M tris", ws.drawn, ws.ground, ws.max_level, ws.resident, ws.queued, ws.tris as f32 / 1e6));
+                    ui.label(egui::RichText::new(format!("update {:.1} ms ({} tested) · upload {:.1} ms", st.update_ms, st.visited, st.upload_ms)).small().weak());
                     let (mi, bu, pr) = (self.mem, self.budget, self.pressure);
-                    let txt = format!("RAM {:.1} GB (caps {:.1} / {:.1} of {:.0} GB) · {:.1} GB free · textures ≤ {:.1} GB · models ≤ {}", mem::gb(mi.process), mem::gb(bu.soft), mem::gb(bu.hard), mem::gb(mi.total), mem::gb(mi.avail), mem::gb(bu.textures), bu.models);
+                    let txt = format!("map {:.1} GB, process {:.1} GB (caps {:.1} / {:.1} of {:.0} GB) · {:.1} GB free · textures ≤ {:.1} GB · models ≤ {}", mem::gb(self.mem_est), mem::gb(mi.process), mem::gb(bu.soft), mem::gb(bu.hard), mem::gb(mi.total), mem::gb(mi.avail), mem::gb(bu.textures), bu.models);
                     match pr {
                         0 => ui.label(egui::RichText::new(txt).small().weak()),
                         1 => ui.colored_label(Color32::YELLOW, format!("{txt}\nmemory cap reached: loading only nearby models, 64 px textures")),
@@ -1281,6 +1533,9 @@ impl Map3D {
     }
 
     fn automation(&mut self, ctx: &egui::Context, rs: &egui_wgpu::RenderState, rect: egui::Rect) {
+        if self.perf.coarse_s.is_none() && self.frame > 5 && self.stats.queued <= self.stats.upgrades && !self.keep.is_empty() && self.keep.iter().all(|m| self.cache.contains_key(m)) {
+            self.perf.coarse_s = self.perf.t_open.map(|t| t.elapsed().as_secs_f32());
+        }
         if let Some(path) = self.auto.screenshot.clone() {
             self.auto.frames += 1;
             let started = *self.auto.started.get_or_insert_with(Instant::now);
@@ -1290,8 +1545,35 @@ impl Map3D {
             } else {
                 self.auto.quiet_frames = 0;
             }
-            let ready = (self.auto.quiet_frames > 20 && self.frames_ok()) || started.elapsed().as_secs() > 900;
+            let mut ready = (self.auto.quiet_frames > 20 && self.frames_ok()) || started.elapsed().as_secs() > 900;
+            if ready && self.perf.first_idle_s.is_none() {
+                self.perf.first_idle_s = self.perf.t_open.map(|t| t.elapsed().as_secs_f32());
+                self.perf_log("first view loaded");
+            }
+            if let Some((to, secs)) = self.auto.fly {
+                if !self.auto.fly_done {
+                    if self.auto.fly_from.is_none() && ready {
+                        self.auto.fly_from = Some((self.cam.eye(), Instant::now()));
+                    }
+                    if let Some((from, t0)) = self.auto.fly_from {
+                        let f = (t0.elapsed().as_secs_f32() / secs.max(0.1)).min(1.0);
+                        let g = self.data.as_ref().and_then(|d| d.height(to[0], to[1])).unwrap_or(0.0);
+                        self.cam.eye = from.lerp(gl([to[0], to[1], g + to[2]]), f);
+                        self.dirty = true;
+                        if f >= 1.0 {
+                            self.auto.fly_done = true;
+                            let (mean, p99, worst) = frame_summary(&self.auto.fly_ms);
+                            self.perf_log(&format!("fly {:.0} s: {} frames, mean {:.1} ms ({:.0} fps), p99 {:.1} ms, worst {:.1} ms", secs, self.auto.fly_ms.len(), mean, 1000.0 / mean.max(0.01), p99, worst));
+                            self.auto.quiet_frames = 0;
+                        }
+                    }
+                    ready = false;
+                }
+            }
             if ready {
+                let v: Vec<f32> = self.perf.frame_ms.iter().copied().collect();
+                let (mean, p99, worst) = frame_summary(&v);
+                self.perf_log(&format!("shot: last {} frames mean {:.1} ms ({:.0} fps), p99 {:.1}, worst {:.1}", v.len(), mean, 1000.0 / mean.max(0.01), p99, worst));
                 if let Some(data) = self.data.clone() {
                     for f in std::mem::take(&mut self.auto.picks) {
                         let (ndc_x, ndc_y) = (f[0] * 2.0 - 1.0, 1.0 - f[1] * 2.0);
@@ -1336,10 +1618,55 @@ impl Map3D {
         }
     }
 
+    /// Estimated GPU bytes: vertex, index and instance buffers plus textures.
+    fn gpu_bytes(&self) -> u64 {
+        let mut b = self.tex_bytes as u64;
+        for s in self.cache.values() {
+            if let Slot::Ready { gm, .. } = s {
+                b += gm.instances.size();
+                for m in &gm.meshes {
+                    b += m.vb.size() + m.ib.size();
+                }
+            }
+        }
+        b + self.world.stats.gpu_bytes
+    }
+
+    /// One line to stderr and `<work>/map3d_perf.log`.
+    fn perf_log(&mut self, what: &str) {
+        let m = mem::query();
+        let st = &self.stats;
+        let er = rage(self.cam.eye());
+        let ws = self.world.stats.clone();
+        let line = format!(
+            "[map3d] {what} | map est {:.2} GB | coarse {} | terrain {} tiles ({} ground, level <= {}, {} resident, {} queued, {:.1} M tris) | t {:.1} s (data {:.1} s, first view {}) | eye ({:.0}, {:.0}, {:.0}) | RAM {:.2} GB | GPU est {:.2} GB | models {} | inst {} | {:.1} M tris | update {:.1} ms ({} tested) | draws {} | render cpu {:.1} ms | stream {:.1} ms | terrain {:.1} ms | windows {:.1} ms | ui total {:.1} ms | size cut x{:.2} | loads {}: lookup {:.0} ms, export {} x {:.0} ms, glb {:.0} ms avg",
+            mem::gb(self.mem_est),
+            self.perf.coarse_s.map_or("-".to_string(), |v| format!("{v:.1} s")),
+            ws.drawn, ws.ground, ws.max_level, ws.resident, ws.queued, ws.tris as f32 / 1e6,
+            self.perf.t_open.map_or(0.0, |t| t.elapsed().as_secs_f32()),
+            self.perf.data_s.unwrap_or(0.0),
+            self.perf.first_idle_s.map_or("-".to_string(), |v| format!("{v:.1} s")),
+            er[0], er[1], er[2],
+            mem::gb(m.process),
+            self.gpu_bytes() as f32 / (1u64 << 30) as f32,
+            st.models_ready, st.instances, st.tris as f32 / 1e6, st.update_ms, st.visited, st.draws, st.render_ms, st.phase[0], st.phase[1], st.phase[2], st.phase[3], self.size_boost,
+            LOAD_T[3].load(Ordering::Relaxed),
+            LOAD_T[0].load(Ordering::Relaxed) as f32 / 1000.0 / LOAD_T[3].load(Ordering::Relaxed).max(1) as f32,
+            LOAD_T[4].load(Ordering::Relaxed),
+            LOAD_T[1].load(Ordering::Relaxed) as f32 / 1000.0 / LOAD_T[4].load(Ordering::Relaxed).max(1) as f32,
+            LOAD_T[2].load(Ordering::Relaxed) as f32 / 1000.0 / LOAD_T[3].load(Ordering::Relaxed).max(1) as f32
+        );
+        eprintln!("{line}");
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(Path::new(&self.work).join("map3d_perf.log")) {
+            use std::io::Write;
+            let _ = writeln!(f, "{line}");
+        }
+    }
+
     fn frames_ok(&self) -> bool {
         // under memory pressure not every wanted model will load: an empty
         // queue is as good as it gets
-        self.pressure > 0 || self.want.keys().all(|m| self.cache.contains_key(m))
+        (!self.show_terrain || self.world.idle()) && (self.pressure > 0 || self.keep.iter().all(|m| self.cache.contains_key(m)))
     }
 }
 
@@ -1359,6 +1686,100 @@ impl NanOr for f32 {
     }
 }
 
+/// Compact spatial grid (cell lists in one array) over the baked map box.
+struct CsrGrid {
+    cell: f32,
+    nx: usize,
+    ny: usize,
+    start: Vec<u32>,
+    items: Vec<u32>,
+}
+
+impl CsrGrid {
+    fn build(cell: f32, pts: &[(f32, f32, u32)]) -> Self {
+        let nx = (crate::mapbake::W as f32 * crate::mapbake::CELL / cell).ceil() as usize + 1;
+        let ny = (crate::mapbake::H as f32 * crate::mapbake::CELL / cell).ceil() as usize + 1;
+        let key = |x: f32, y: f32| -> Option<usize> {
+            let cx = ((x - crate::mapbake::X0) / cell).floor();
+            let cy = ((crate::mapbake::Y1 - y) / cell).floor();
+            (cx >= 0.0 && cy >= 0.0 && (cx as usize) < nx && (cy as usize) < ny).then(|| cy as usize * nx + cx as usize)
+        };
+        let mut start = vec![0u32; nx * ny + 1];
+        for &(x, y, _) in pts {
+            if let Some(k) = key(x, y) {
+                start[k + 1] += 1;
+            }
+        }
+        for k in 0..nx * ny {
+            start[k + 1] += start[k];
+        }
+        let mut fill = start.clone();
+        let mut items = vec![0u32; start[nx * ny] as usize];
+        for &(x, y, i) in pts {
+            if let Some(k) = key(x, y) {
+                items[fill[k] as usize] = i;
+                fill[k] += 1;
+            }
+        }
+        CsrGrid { cell, nx, ny, start, items }
+    }
+
+    fn query(&self, x0: f32, y0: f32, x1: f32, y1: f32, mut f: impl FnMut(u32)) {
+        let cl = |v: f32, n: usize| ((v.floor().max(0.0)) as usize).min(n - 1);
+        let cx0 = cl((x0 - crate::mapbake::X0) / self.cell, self.nx);
+        let cx1 = cl((x1 - crate::mapbake::X0) / self.cell, self.nx);
+        let cy0 = cl((crate::mapbake::Y1 - y1) / self.cell, self.ny);
+        let cy1 = cl((crate::mapbake::Y1 - y0) / self.cell, self.ny);
+        for cy in cy0..=cy1 {
+            let row = cy * self.nx;
+            for &i in &self.items[self.start[row + cx0] as usize..self.start[row + cx1 + 1] as usize] {
+                f(i);
+            }
+        }
+    }
+}
+
+/// Texture size cap of a model's first load (sharper copies follow).
+const FIRST_TEX: u32 = 64;
+
+/// Upper bounds of the entity LOD-distance classes (m, at game scale).
+const DIST_CLASSES: [f32; 7] = [50.0, 100.0, 200.0, 400.0, 800.0, 1600.0, f32::INFINITY];
+/// Upper bounds of the bbox-radius classes (m).
+const SIZE_CLASSES: [f32; 4] = [2.0, 8.0, 32.0, f32::INFINITY];
+
+/// Entities of one LOD level, LOD-distance class and size class, so that a
+/// visibility update only visits entities that can be in range.
+struct Bucket {
+    level: usize,
+    /// Index into DIST_CLASSES, DIST_CLASSES.len() = no own distance (LOD band),
+    /// usize::MAX = linked into a LOD hierarchy (always queried to the far limit).
+    dist: usize,
+    size: usize,
+    count: usize,
+    grid: CsrGrid,
+}
+
+impl Bucket {
+    /// Query radius around the eye for the current detail settings.
+    fn radius(&self, d: &Detail) -> f32 {
+        let rmax = d.radii[5];
+        let k = d.radii[0] / 330.0;
+        let lim = if self.dist == usize::MAX {
+            rmax
+        } else if self.dist < DIST_CLASSES.len() {
+            DIST_CLASSES[self.dist] * k
+        } else if self.level == 0 {
+            d.radii[0].max(if d.hd_fallback { d.radii[1].min(d.radii[0] * 1.75) } else { 0.0 })
+        } else {
+            d.radii[self.level]
+        };
+        let size_lim = if self.dist == usize::MAX || d.min_size <= 0.0 { f32::INFINITY } else { SIZE_CLASSES[self.size] / d.min_size };
+        // bbox centres sit up to one radius from the placement origin
+        let margin = if self.size + 1 < SIZE_CLASSES.len() { SIZE_CLASSES[self.size] } else { 600.0 };
+        lim.min(size_lim).min(rmax) + margin
+    }
+}
+
 fn hash32(i: u32) -> u32 {
     let mut x = i.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
     x ^= x >> 16;
@@ -1369,19 +1790,92 @@ fn hash32(i: u32) -> u32 {
 }
 
 /// Export (if needed) and load one model by entry id ("levels.rpf@<hex>").
-fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opts: &glb::LoadOpts, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>) -> anyhow::Result<glb::Model> {
+/// Loader timing totals (µs): index lookup, export, GLB + texture load; then counts.
+static LOAD_T: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+/// Archive id -> (entry offset -> entry index), built once per archive.
+/// Also caches resolved archives (name -> info): resolving lists the game
+/// folder each time.
+type OffMaps = Arc<Mutex<HashMap<String, Arc<HashMap<u64, usize>>>>>;
+type ArcCache = Arc<Mutex<HashMap<String, (sixng_core::game::ArchiveInfo, Arc<ArchiveIndex>)>>>;
+
+/// Merge the meshes of a model that share a material (and are not skinned)
+/// into one, so each material is one draw call.
+fn merge_meshes(mut m: glb::Model) -> glb::Model {
+    if m.meshes.len() < 2 {
+        return m;
+    }
+    let mut out: Vec<glb::Mesh> = Vec::new();
+    let mut slot: HashMap<(Option<usize>, bool, u32), usize> = HashMap::new();
+    for me in std::mem::take(&mut m.meshes) {
+        if me.skinned {
+            out.push(me);
+            continue;
+        }
+        let key = (me.material, me.has_tangents, me.uv_sets as u32);
+        match slot.get(&key) {
+            Some(&k) if out[k].verts.len() + me.verts.len() < (1 << 24) => {
+                let o = &mut out[k];
+                let base = o.verts.len() as u32;
+                let (n0, n1) = (o.verts.len() as f32, me.verts.len() as f32);
+                let c0 = Vec3::from(o.centre);
+                let c1 = Vec3::from(me.centre);
+                o.centre = ((c0 * n0 + c1 * n1) / (n0 + n1).max(1.0)).into();
+                o.verts.extend_from_slice(&me.verts);
+                o.indices.extend(me.indices.iter().map(|i| i + base));
+            }
+            _ => {
+                slot.insert(key, out.len());
+                out.push(me);
+            }
+        }
+    }
+    m.meshes = out;
+    m
+}
+
+fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opts: &glb::LoadOpts, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>, offs: &OffMaps, arcs: &ArcCache) -> anyhow::Result<glb::Model> {
+    let t0 = Instant::now();
+    let add = |k: usize, t: Instant| LOAD_T[k].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     let (archive, off) = id.split_once('@').ok_or_else(|| anyhow::anyhow!("bad model id {id}"))?;
-    let (a, ix) = model_view::index_for(ws, archive, idx)?;
+    let got = arcs.lock().unwrap().get(archive).cloned();
+    let (a, ix) = match got {
+        Some(v) => v,
+        None => {
+            let v = model_view::index_for(ws, archive, idx)?;
+            arcs.lock().unwrap().insert(archive.to_string(), v.clone());
+            v
+        }
+    };
     let off = u64::from_str_radix(off.trim_start_matches("0x"), 16)?;
-    let e = ix.entries.iter().find(|e| e.off == off).ok_or_else(|| anyhow::anyhow!("no entry {id}"))?;
+    let map = {
+        let got = offs.lock().unwrap().get(&a.id).cloned();
+        match got {
+            Some(m) => m,
+            None => {
+                let m = Arc::new(ix.entries.iter().enumerate().map(|(i, e)| (e.off, i)).collect::<HashMap<u64, usize>>());
+                offs.lock().unwrap().insert(a.id.clone(), m.clone());
+                m
+            }
+        }
+    };
+    let e = map.get(&off).map(|&i| &ix.entries[i]).ok_or_else(|| anyhow::anyhow!("no entry {id}"))?;
     let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(format!("{}_{:x}", model_view::export_sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off));
+    add(0, t0);
     if !dir.join("model.glb").exists() {
+        let t1 = Instant::now();
         let eo = ExportOptions { out: cache.to_path_buf(), png: !opts.no_textures, dds: false, raw: false, force: false, skip_embedded_textures: false };
         let _ = sixng_core::export::export_entry(&a, e, &eo)?;
+        add(1, t1);
+        LOAD_T[4].fetch_add(1, Ordering::Relaxed);
     }
     let lods = model_view::lods_in(&dir);
     if lods.is_empty() {
         anyhow::bail!("{id} has no model.glb");
     }
-    glb::load_with(&lods[lod.min(lods.len() - 1)], cache, opts)
+    let t2 = Instant::now();
+    let r = glb::load_with(&lods[lod.min(lods.len() - 1)], cache, opts);
+    add(2, t2);
+    LOAD_T[3].fetch_add(1, Ordering::Relaxed);
+    r
 }

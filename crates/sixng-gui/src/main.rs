@@ -14,6 +14,7 @@ mod glb;
 mod assemble;
 mod map2d;
 mod map3d;
+mod world3d;
 mod mem;
 
 /// Export cache for the viewers. Bumped when the export layout changes
@@ -154,6 +155,7 @@ fn main() -> eframe::Result<()> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size(size).with_title("SixNG Extractor").with_icon(app_icon()),
         renderer: eframe::Renderer::Wgpu,
+        vsync: !cli.has("no-vsync"),
         ..Default::default()
     };
     eframe::run_native("SixNG Extractor", opts, Box::new(move |_cc| Ok(Box::new(App::new(cli)))))
@@ -1069,6 +1071,11 @@ impl App {
                 // "x,y;x,y" as fractions of the 3D view
                 m3.auto.picks = v.split(';').filter_map(|p| p.split_once(',')).filter_map(|(a, b)| Some([a.trim().parse().ok()?, b.trim().parse().ok()?])).collect();
             }
+            if let Some(v) = c.get("quality") {
+                if let Some(q) = map3d::QUALITY.iter().position(|x| x.0 == v) {
+                    m3.set_quality(q);
+                }
+            }
             if let Some(v) = c.f("detail") {
                 m3.detail_level = v;
                 m3.detail = map3d::Detail::from_level(v);
@@ -1113,6 +1120,13 @@ impl App {
             if c.has("no-windows") {
                 m3.show_minimap = false;
                 m3.show_stats = false;
+            }
+            if let Some(v) = c.get("fly") {
+                // "x,y,height,seconds"
+                let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
+                if v.len() == 4 {
+                    m3.auto.fly = Some(([v[0], v[1], v[2]], v[3]));
+                }
             }
             if let Some(p) = c.get("screenshot") {
                 m3.auto.screenshot = Some(PathBuf::from(p));

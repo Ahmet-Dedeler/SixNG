@@ -247,32 +247,54 @@ fn slot_status(t: &Value) -> (String, u32) {
     }
 }
 
+/// Half-size box filter of an RGBA8 image (odd edges clamp).
+fn half(pw: u32, ph: u32, p: &[u8]) -> (u32, u32, Vec<u8>) {
+    let (nw, nh) = ((pw / 2).max(1) as usize, (ph / 2).max(1) as usize);
+    let (pw, ph) = (pw as usize, ph as usize);
+    let mut o = vec![0u8; nw * nh * 4];
+    for y in 0..nh {
+        let (y0, y1) = ((y * 2).min(ph - 1), (y * 2 + 1).min(ph - 1));
+        let r0 = &p[y0 * pw * 4..(y0 + 1) * pw * 4];
+        let r1 = &p[y1 * pw * 4..(y1 + 1) * pw * 4];
+        let orow = &mut o[y * nw * 4..(y + 1) * nw * 4];
+        for x in 0..nw {
+            let (x0, x1) = ((x * 2).min(pw - 1) * 4, (x * 2 + 1).min(pw - 1) * 4);
+            for c in 0..4 {
+                orow[x * 4 + c] = ((r0[x0 + c] as u32 + r0[x1 + c] as u32 + r1[x0 + c] as u32 + r1[x1 + c] as u32 + 2) >> 2) as u8;
+            }
+        }
+    }
+    (nw as u32, nh as u32, o)
+}
+
 /// Box-filter mip chain of an RGBA8 image.
-fn mip_chain(w: u32, h: u32, px: Vec<u8>) -> Vec<(u32, u32, Vec<u8>)> {
+pub fn mip_chain(w: u32, h: u32, px: Vec<u8>) -> Vec<(u32, u32, Vec<u8>)> {
     let mut v = vec![(w, h, px)];
     loop {
         let (pw, ph, p) = v.last().unwrap();
         if *pw == 1 && *ph == 1 {
             break;
         }
-        let (nw, nh) = ((*pw / 2).max(1), (*ph / 2).max(1));
-        let mut o = vec![0u8; (nw * nh * 4) as usize];
-        for y in 0..nh {
-            for x in 0..nw {
-                for c in 0..4 {
-                    let mut s = 0u32;
-                    for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
-                        let sx = (x * 2 + dx).min(pw - 1);
-                        let sy = (y * 2 + dy).min(ph - 1);
-                        s += p[((sy * pw + sx) * 4 + c) as usize] as u32;
-                    }
-                    o[((y * nw + x) * 4 + c) as usize] = (s / 4) as u8;
-                }
-            }
-        }
-        v.push((nw, nh, o));
+        let n = half(*pw, *ph, p);
+        v.push(n);
     }
     v
+}
+
+/// Size of the reduced texture copies kept for distant models.
+pub const SMALL_TEX: u32 = 256;
+/// Bytes in `<cache>/lowtex` (set by the 3D map at start, then counted up)
+/// and the cap above which no further copies are written.
+pub static LOWTEX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub const LOWTEX_CAP: u64 = 4 << 30;
+
+/// Where the reduced copy of a texture lives (`<cache>/lowtex/<hash>.png`).
+fn small_path(out_root: &Path, p: &Path) -> PathBuf {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in p.to_string_lossy().as_bytes() {
+        h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
+    }
+    out_root.join("lowtex").join(format!("{h:016x}.png"))
 }
 
 fn load_png(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
@@ -290,6 +312,10 @@ pub struct LoadOpts {
     pub max_tex: u32,
     pub skip_keys: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
     pub no_textures: bool,
+    /// Read and write reduced copies (<= SMALL_TEX px) under `<cache>/lowtex`
+    /// when `max_tex` is at most that size: far faster than decoding the
+    /// full-size PNG every time.
+    pub small_cache: bool,
     /// Drop (discard) materials whose every decoded texture is a tiny (<= 8 px)
     /// placeholder; used by the 3D map (see `placeholder_only`).
     pub hide_placeholders: bool,
@@ -308,7 +334,8 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
     let mut images: Vec<Image> = Vec::new();
     let mut img_by_key: HashMap<String, usize> = HashMap::new();
     let mut add_img = |p: PathBuf, srgb: bool, images: &mut Vec<Image>| -> Option<usize> {
-        let key = format!("{}|{}", p.display(), srgb);
+        // the size cap is part of the key: a sharper copy is a separate texture
+        let key = format!("{}|{}|{}", p.display(), srgb, opts.max_tex);
         if let Some(&i) = img_by_key.get(&key) {
             return Some(i);
         }
@@ -320,8 +347,30 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             img_by_key.insert(key, images.len() - 1);
             return Some(images.len() - 1);
         }
-        let (w, h, px) = load_png(&p)?;
+        let small = opts.small_cache && opts.max_tex > 0 && opts.max_tex <= SMALL_TEX;
+        let sp = small.then(|| small_path(out_root, &p));
+        let from_small = sp.as_ref().and_then(|sp| load_png(sp));
+        let was_small = from_small.is_some();
+        let (w, h, px) = match from_small {
+            Some(v) => v,
+            None => load_png(&p)?,
+        };
         let mut mips = mip_chain(w, h, px);
+        let room = LOWTEX_BYTES.load(std::sync::atomic::Ordering::Relaxed) < LOWTEX_CAP;
+        if let (Some(sp), false, true) = (&sp, was_small, room) {
+            // keep a reduced copy for next time (best effort)
+            if let Some((mw, mh, m)) = mips.iter().find(|m| m.0.max(m.1) <= SMALL_TEX) {
+                if (*mw).max(*mh) < w.max(h) {
+                    let _ = std::fs::create_dir_all(sp.parent().unwrap());
+                    let tmp = sp.with_extension("tmp");
+                    if image::save_buffer_with_format(&tmp, m, *mw, *mh, image::ExtendedColorType::Rgba8, image::ImageFormat::Png).is_ok() {
+                        let n = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+                        LOWTEX_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                        let _ = std::fs::rename(&tmp, sp);
+                    }
+                }
+            }
+        }
         if opts.max_tex > 0 {
             while mips.len() > 1 && mips[0].0.max(mips[0].1) > opts.max_tex {
                 mips.remove(0);
