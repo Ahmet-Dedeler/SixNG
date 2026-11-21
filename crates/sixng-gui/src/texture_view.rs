@@ -149,7 +149,7 @@ impl TextureView {
         let Some(set) = self.set else { return };
         self.sel = Some(r);
         let t = &set.stores[r.0].textures[r.1];
-        // largest mip that is fully stored (BCPack-compressed mips cannot be decoded), capped to 2048 px for the preview
+        // largest mip outside undecodable BCPack chunks (all formats but BC1), capped to 2048 px for the preview
         let mut m = set.stores[r.0].best_mip(t).unwrap_or(0);
         while (t.width >> m).max(t.height >> m) > 2048 && m + 1 < t.mips() {
             m += 1;
@@ -357,7 +357,7 @@ impl TextureView {
         }
         let Some(d) = &self.decoded else { return };
         if d.undecoded > 0 {
-            ui.colored_label(egui::Color32::from_rgb(220, 180, 80), format!("{} KiB of this texture is BCPack-compressed and cannot be decoded; lower mips may be clean.", d.undecoded / 1024));
+            ui.colored_label(egui::Color32::from_rgb(220, 180, 80), format!("{} KiB of this texture is in BCPack chunks that cannot be decoded (only BC1 decodes so far); lower mips may be clean.", d.undecoded / 1024));
         }
         let need = (d.hash, d.mip, self.channel);
         if self.tex.as_ref().map(|x| (x.0, x.1, x.2)) != Some(need) {

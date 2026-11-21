@@ -9,8 +9,9 @@
 //! +0x18 chunk table, 8 bytes per entry:
 //!       u32 a: (a & 0xFFFFFF) << 8 = file offset of a zlib stream; bits 24-29 = flags
 //!              (codec: 0x20 zlib; 0x04 BC1, 0x0C/0x10 BC3/BC4?, 0x14 BC5, 0x18 BC6H,
-//!              0x1C BC7 = per-format BCPack, the Xbox Series hardware texture codec,
-//!              no public decoder; 0x00 stored), bits 30-31 = 4 KiB pages added to the virtual offset
+//!              0x1C BC7 = per-format BCPack, the Xbox Series hardware texture codec;
+//!              BC1 decodes with `bcpack-rs`, the others not yet; 0x00 stored),
+//!              bits 30-31 = 4 KiB pages added to the virtual offset
 //!       u32 b: virtual offset = 0x1000 + (b & 0xFFFFF) * 0x4000 + (a >> 30) * 0x1000
 //!              (the 0x1000 is the header page); b >> 20 = bytes of padding after
 //!              the chunk's data (stored length = next offset - offset - pad)
@@ -71,6 +72,25 @@ pub struct Ttpf {
     pub virt_size: u64,
     pub textures: Vec<TtpfTex>,
     by_hash: HashMap<u64, usize>,
+}
+
+/// Flags of a BCPack chunk (any BC format).
+fn is_bcpack(fl: u8) -> bool {
+    fl & 0x1C != 0
+}
+
+/// BCPack chunks that SixNG cannot decode: every codec but BC1 (0x04).
+fn is_undecoded(fl: u8) -> bool {
+    is_bcpack(fl) && fl & 0x3F != bcpack::ttpf::CODEC_BC1
+}
+
+/// Decode a BCPack BC1 chunk to plain BC1 blocks (`blocks` x 8 bytes).
+/// `None` if the stream does not decode.
+fn decode_bc1(comp: &[u8], blocks: usize) -> Option<Vec<u8>> {
+    use bcpack::bc1::{QuadTable, Window};
+    static TABLES: std::sync::OnceLock<(Window, QuadTable)> = std::sync::OnceLock::new();
+    let (w, q) = TABLES.get_or_init(|| (Window::default_table(), QuadTable::default_table()));
+    bcpack::bc1::decode(comp, blocks, w, q).ok().map(|o| o.blocks)
 }
 
 fn u32le(b: &[u8], o: usize) -> u32 {
@@ -152,8 +172,8 @@ impl Ttpf {
         Ok(self.read_ex(virt, len)?.0)
     }
 
-    /// Like `read`; also returns how many bytes fell in chunks that are not
-    /// zlib (flag bits 0x1C set, another codec, left as zeros).
+    /// Like `read`; also returns how many bytes could not be decoded (BCPack
+    /// chunks other than BC1, or a BC1 chunk that fails to decode; left as zeros).
     pub fn read_ex(&self, virt: u64, len: u64) -> Result<(Vec<u8>, u64)> {
         let mut out = vec![0u8; len as usize];
         let mut skipped = 0u64;
@@ -165,14 +185,22 @@ impl Ttpf {
             if v1 <= virt || v0 >= end {
                 continue;
             }
-            if fl & 0x1C != 0 {
+            if is_undecoded(fl) {
                 skipped += end.min(v1) - virt.max(v0);
                 continue;
             }
             f.seek(SeekFrom::Start(foff))?;
             let mut comp = vec![0u8; (fnext - foff).saturating_sub(pad) as usize];
             f.read_exact(&mut comp)?;
-            let raw = if fl & 0x3F == 0 {
+            let raw = if is_bcpack(fl) {
+                match decode_bc1(&comp, ((v1 - v0) / 8) as usize) {
+                    Some(b) => b,
+                    None => {
+                        skipped += end.min(v1) - virt.max(v0);
+                        continue;
+                    }
+                }
+            } else if fl & 0x3F == 0 {
                 comp // stored (5 chunks in all stores; sizes match)
             } else {
                 let mut raw = Vec::with_capacity((v1 - v0) as usize);
@@ -188,23 +216,29 @@ impl Ttpf {
         Ok((out, skipped))
     }
 
-    /// Bytes of [virt, virt + len) that fall in BCPack chunks (no read).
+    /// Bytes of [virt, virt + len) that fall in BCPack chunks SixNG cannot
+    /// decode (all but BC1; no read).
     pub fn bcpack_bytes(&self, virt: u64, len: u64) -> u64 {
+        self.bcpack_bytes_where(virt, len, is_undecoded)
+    }
+
+    fn bcpack_bytes_where(&self, virt: u64, len: u64, pick: fn(u8) -> bool) -> u64 {
         let end = virt + len;
         let mut n = 0;
         for w in self.chunks.windows(2) {
             let ((_, v0, fl, _), (_, v1, _, _)) = (w[0], w[1]);
-            if v1 > virt && v0 < end && fl & 0x1C != 0 {
+            if v1 > virt && v0 < end && pick(fl) {
                 n += end.min(v1) - virt.max(v0);
             }
         }
         n
     }
 
-    /// Virtual ranges [start, end) of the BCPack chunks, sorted and merged
-    /// (for fast per-texture checks over a whole store).
+    /// Virtual ranges [start, end) of the BCPack chunks SixNG cannot decode
+    /// (all but BC1), sorted and merged (for fast per-texture checks over a
+    /// whole store).
     pub fn bcpack_ranges(&self) -> Vec<(u64, u64)> {
-        let mut v: Vec<(u64, u64)> = self.chunks.windows(2).filter(|w| w[0].2 & 0x1C != 0).map(|w| (w[0].1, w[1].1)).filter(|r| r.1 > r.0).collect();
+        let mut v: Vec<(u64, u64)> = self.chunks.windows(2).filter(|w| is_undecoded(w[0].2)).map(|w| (w[0].1, w[1].1)).filter(|r| r.1 > r.0).collect();
         v.sort();
         let mut m: Vec<(u64, u64)> = Vec::with_capacity(v.len());
         for r in v {
@@ -216,12 +250,16 @@ impl Ttpf {
         m
     }
 
-    /// Largest mip of `t` that lies entirely outside BCPack chunks.
+    /// Largest mip of `t` that lies entirely outside undecodable BCPack chunks.
     pub fn best_mip(&self, t: &TtpfTex) -> Option<u32> {
+        self.best_mip_where(t, is_undecoded)
+    }
+
+    fn best_mip_where(&self, t: &TtpfTex, pick: fn(u8) -> bool) -> Option<u32> {
         let l = t.layout()?;
         (0..l.mips.len()).find(|&m| {
             let (a, b) = l.mip_span(m);
-            self.bcpack_bytes(t.virt + a, b - a) == 0
+            self.bcpack_bytes_where(t.virt + a, b - a, pick) == 0
         }).map(|m| m as u32)
     }
 
@@ -406,8 +444,9 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
     let p = dir.join(format!("{:016x}.png", t.hash));
     let js = dir.join(format!("{:016x}.json", t.hash));
     if p.exists() {
-        // stats written before alpha_range existed are refreshed below
-        if let Some(st) = std::fs::read(&js).ok().and_then(|b| serde_json::from_slice::<PngStats>(&b).ok()).filter(|st| st.alpha_range.is_some()) {
+        // stats written before alpha_range existed are refreshed below, and so
+        // are lower-mip PNGs whose top mips now decode (BC1 BCPack)
+        if let Some(st) = std::fs::read(&js).ok().and_then(|b| serde_json::from_slice::<PngStats>(&b).ok()).filter(|st| st.alpha_range.is_some() && !matches!(store.best_mip(t), Some(m) if m < st.mip)) {
             return Ok((p, st));
         }
     }
@@ -415,13 +454,14 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
         return Err(anyhow!("tile mode {} / format {} not supported", t.tile_mode(), t.dxgi_format));
     }
     let (data, skipped) = store.data_ex(t)?;
-    // Top mips in BCPack chunks: fall back to the largest mip stored as zlib.
+    // Top mips in BCPack chunks that did not decode: fall back to the largest
+    // mip outside all BCPack chunks (a BC1 chunk that fails counts too).
     let mip = if skipped == 0 {
         0
     } else {
-        match store.best_mip(t) {
+        match store.best_mip_where(t, is_bcpack) {
             Some(m) => m,
-            None => return Err(anyhow!("{skipped} bytes in BCPack chunks, no mip outside them (Xbox hardware texture codec, no public decoder)")),
+            None => return Err(anyhow!("{skipped} bytes in BCPack chunks, no mip outside them (Xbox hardware texture codec; only BC1 decodes so far)")),
         }
     };
     let (rgba, w, h) = decode_rgba(t, &data, mip)?;
@@ -433,4 +473,27 @@ pub fn write_png(store: &Ttpf, t: &TtpfTex, dir: &Path) -> Result<(PathBuf, PngS
     std::fs::rename(&tmp, &p)?;
     std::fs::write(&js, serde_json::to_vec(&st)?)?;
     Ok((p, st))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_bc1_bcpack_decodes() {
+        // flags byte = codec | (4 KiB page bits << 6)
+        assert!(!is_bcpack(0x20) && !is_bcpack(0x00) && !is_bcpack(0xA0));
+        assert!(is_bcpack(0x04) && !is_undecoded(0x04) && !is_undecoded(0xC4));
+        for c in [0x0C, 0x10, 0x14, 0x18, 0x1C, 0x5C] {
+            assert!(is_undecoded(c));
+        }
+    }
+
+    #[test]
+    fn bc1_chunk_decodes_to_blocks() {
+        let (chunk, _) = bcpack::encode::synthetic_bc1(7, 512, 200);
+        assert_eq!(decode_bc1(&chunk, 512).map(|b| b.len()), Some(512 * 8));
+        // a wrong block count does not converge
+        assert_eq!(decode_bc1(&chunk, 1024), None);
+    }
 }

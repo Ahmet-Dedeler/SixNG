@@ -2,9 +2,9 @@
 //! which materials lost texture detail to BCPack, how badly, and how much
 //! of the map uses them.
 //!
-//! * Per texture: `flat` (every mip has bytes in BCPack chunks; the export
-//!   writes a flat fallback colour), `lowmip` (top mips in BCPack; exported
-//!   at mip N), `ok`. Same rule as the exporter (`ttpf::write_png`), checked
+//! * Per texture: `flat` (every mip has bytes in BCPack chunks that do not
+//!   decode, i.e. any format but BC1; the export writes a flat fallback
+//!   colour), `lowmip` (top mips in such chunks; exported at mip N), `ok`. Same rule as the exporter (`ttpf::write_png`), checked
 //!   from the chunk table only, without decoding.
 //! * Per material (drawable shader): class (terrain / road / building /
 //!   prop / foliage / vehicle / water / interior ...), the slot role of each
@@ -788,7 +788,7 @@ pub fn texture_gaps(archives: &[(ArchiveInfo, Vec<Entry>)], inp: &GapInputs, pro
     let roles: BTreeMap<&str, Value> = by_role.iter().map(|(k, v)| (*k, json!({"flat": v[0], "lowmip": v[1], "ok_or_other": v[2]}))).collect();
 
     Ok((json!({
-        "note": "BCPack texture gaps (sixng texture-gaps). status: flat = every mip has bytes in BCPack chunks (Xbox hardware texture codec, no public decoder); the export writes a flat fallback colour (model's decoded colour average, flat normal, mid grey for data maps). lowmip = top mips in BCPack, exported at mip N (resolution in `textures`). One record per affected material (drawable shader); `status` is its worst slot. placements = entity placements + batched instances using the model; area_m2 = local bbox x*y extent x scale^2 summed over placements (overlaps counted twice; LOD proxies cover the same ground as their HD models). Terrain / layered materials: a colour slot starts a layer (guess from slot order); surface_type from the layer's mean colour (when any mip decodes), else the model name, else the collision surface categories under the placements (inferred, see surface_categories.json). Classes come from shader families and model names (class_source).",
+        "note": "BCPack texture gaps (sixng texture-gaps). status: flat = every mip has bytes in BCPack chunks that do not decode (Xbox hardware texture codec; BC1 decodes, the other formats not yet); the export writes a flat fallback colour (model's decoded colour average, flat normal, mid grey for data maps). lowmip = top mips in such chunks, exported at mip N (resolution in `textures`). One record per affected material (drawable shader); `status` is its worst slot. placements = entity placements + batched instances using the model; area_m2 = local bbox x*y extent x scale^2 summed over placements (overlaps counted twice; LOD proxies cover the same ground as their HD models). Terrain / layered materials: a colour slot starts a layer (guess from slot order); surface_type from the layer's mean colour (when any mip decodes), else the model name, else the collision surface categories under the placements (inferred, see surface_categories.json). Classes come from shader families and model names (class_source).",
         "generated_by": "sixng texture-gaps",
         "seconds": t0.elapsed().as_secs_f64().round(),
         "inputs": {"archives": archives.iter().map(|a| json!({"archive": a.0.id, "drawables": a.1.len()})).collect::<Vec<_>>(), "usage": usage_info, "collision_cue": coll.is_some()},
