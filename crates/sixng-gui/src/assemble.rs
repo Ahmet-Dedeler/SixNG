@@ -236,18 +236,6 @@ pub fn pretty_name(name: &str) -> Option<String> {
     }
 }
 
-/// Ped meshes: some vertices carry wrong normals; smooth ones from the
-/// triangles where no normal map covers them. Colours are not guessed:
-/// materials without a colour texture stay plain and are labelled.
-pub fn fix_ped_normals(model: &mut crate::glb::Model) {
-    let no_nmap: Vec<bool> = model.materials.iter().map(|m| m.normal.is_none()).collect();
-    for me in model.meshes.iter_mut() {
-        if me.material.map_or(true, |k| no_nmap.get(k).copied().unwrap_or(true)) {
-            crate::glb::recompute_normals(me);
-        }
-    }
-}
-
 /// Label materials that have no colour texture (BCPack-only, or skin the
 /// game builds at runtime): they render plain white, and the material list
 /// says so instead of inventing a colour.

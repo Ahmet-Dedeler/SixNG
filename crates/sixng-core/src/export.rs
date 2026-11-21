@@ -538,7 +538,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     "shader_index": material,
                     "uv_sets": m.uvs.len(), "uv_slots": m.uvs.iter().map(|u| u.0).collect::<Vec<_>>(),
                     "normals": m.normals.is_some(), "vertex_colors_raw": m.colors.is_some(),
-                    "triangles_flipped_to_match_normals": m.flipped, "triangles_dropped": m.dropped,
+                    "triangles_flipped_to_match_normals": m.flipped, "triangles_dropped": m.dropped, "normals_rebuilt_from_faces": m.rebuilt_normals,
                     "position_axis_order": m.axis_order, "skinned": m.joints.is_some(),
                     "skin_influences": m.joints.as_ref().map(|j| j.iter().zip(m.weights.as_ref().unwrap()).map(|(a, w)| w.iter().filter(|&&x| x > 0).count().max(1).min(a.len())).max().unwrap_or(1)),
                     "bones": m.joints.as_ref().map(|b| { let mut u: Vec<u16> = b.iter().zip(m.weights.as_ref().unwrap()).flat_map(|(j, w)| (0..4).filter(|&k| w[k] > 0).map(|k| j[k]).collect::<Vec<_>>()).collect(); u.sort(); u.dedup(); u.iter().filter_map(|&i| info.skeleton.get(i as usize).map(|x| x.name.clone())).collect::<Vec<_>>() }),

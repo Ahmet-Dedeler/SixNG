@@ -264,8 +264,8 @@ Unnamed.
 You can also open by entry id (`levels.rpf@10f266d010`), by name regex
 (`^phoenix_hi$`, searched in `levels`; `data:^w_pi` for another
 archive), from an exported `.glb`, or with **Open in model viewer** in
-the Archives page. Entries are exported on the fly into `<work>/gui_cache_v2`
-(models plus PNG textures; v2 since the 2026-11-20 LOD fix).
+the Archives page. Entries are exported on the fly into `<work>/gui_cache_v3`
+(models plus PNG textures; v3 since the 2026-11-20 normals fix; older `gui_cache_v*` folders can be deleted).
 
 - Shading: base colour, normal map (DirectX green), packed
   roughness/metal/AO with a channel-order switch, alpha / cutout / decal /
@@ -357,7 +357,7 @@ baked map (`entities.bin`; bake first with `--bake-map`):
 
 - Fly: drag to look, WASD/arrows to move, Q/E down/up, Shift faster. The
   speed scales with height above ground.
-- Models are exported on demand into `<work>/gui_cache_v2` (the model
+- Models are exported on demand into `<work>/gui_cache_v3` (the model
   viewer's cache) by background workers, nearest first, and drawn
   instanced: one GPU model per model id, all its placements as instances.
   Textures are shared between models and sized by distance (full size in

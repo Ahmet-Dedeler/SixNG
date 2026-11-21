@@ -798,8 +798,7 @@ pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx:
         let mut errs = Vec::new();
         for e in &parts {
             match export_load(&a, e, cache, lod) {
-                Ok((mut m, lods, _)) => {
-                    crate::assemble::fix_ped_normals(&mut m);
+                Ok((m, lods, _)) => {
                     if first.is_empty() {
                         first = lods;
                     }
@@ -835,9 +834,6 @@ pub(crate) fn load_query(ws: &Workspace, cache: &Path, q: &str, lod: usize, idx:
     };
     let (mut model, lods, info) = export_load(&a, e, cache, lod)?;
     let lod = lod.min(lods.len() - 1);
-    if e.name.as_deref().map_or(false, crate::assemble::is_ped_part) {
-        crate::assemble::fix_ped_normals(&mut model);
-    }
     // animals: the fragment is a skeleton with a placeholder plane; add the textured parts
     let name = e.name.as_deref().unwrap_or("");
     if crate::assemble::is_animal(name) && e.rtype.as_deref() == Some("ft") {

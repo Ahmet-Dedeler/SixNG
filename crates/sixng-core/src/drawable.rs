@@ -383,6 +383,9 @@ pub struct Mesh {
     pub flipped: usize,
     /// Triangles dropped (index out of range or degenerate).
     pub dropped: usize,
+    /// Vertices whose stored normal word held no normal (bit 31 clear);
+    /// their normals were rebuilt from the faces around them.
+    pub rebuilt_normals: usize,
     /// Model axis held by each quantised position slot (x, y, z slot).
     /// [0, 1, 2] = identity. The encoder puts the flattest axis in the
     /// 16-bit z slot and rotates the others cyclically.
@@ -427,6 +430,21 @@ fn tangent_decode(w: u32, n: Option<[f32; 3]>) -> [f32; 4] {
     let l = t.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-12);
     let sign = if (w >> 31) & 1 == 1 { -1.0 } else { 1.0 };
     [t[0] / l, t[1] / l, t[2] / l, sign]
+}
+
+/// Normal word (stream 2, format 0x21): octahedral x in bits 0-9, y in
+/// bits 10-19. Bit 31 is set on words that hold a normal. Words with it
+/// clear (about a third of the vertices of ped heads, a few per cent of
+/// other skinned meshes, almost none on static ones) decode to directions
+/// that disagree with the surface in ~75 % of cases (checked against the
+/// face normals of `cs_ali` / `crr_iguana` heads and bodies, a helicopter
+/// and buildings), and no other field layout fits them; they are treated as
+/// missing and rebuilt from the faces.
+fn octa_decode_checked(w: u32) -> Option<[f32; 3]> {
+    if w >> 31 == 0 {
+        return None;
+    }
+    Some(octa_decode(w))
 }
 
 fn octa_decode(w: u32) -> [f32; 3] {
@@ -485,8 +503,21 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
     let mut positions = decode_positions(blob, h);
     let v = positions.len();
     let stream = |slot: u32| h.sections.iter().find(|s| s.0 == slot).map(|s| (s.1 as usize, s.2));
+    // Vertices whose normal word has no usable normal get a zero normal here
+    // (left out of the axis and winding checks) and are rebuilt from the
+    // faces at the end.
+    let mut invalid: Vec<usize> = Vec::new();
     let mut normals = stream(2).filter(|s| s.1 == 0x21).and_then(|s| blob.get(s.0..s.0 + 4 * v)).map(|b| {
-        b.chunks_exact(4).map(|c| octa_decode(u32::from_le_bytes(c.try_into().unwrap()))).collect::<Vec<_>>()
+        b.chunks_exact(4)
+            .enumerate()
+            .map(|(i, c)| match octa_decode_checked(u32::from_le_bytes(c.try_into().unwrap())) {
+                Some(n) => n,
+                None => {
+                    invalid.push(i);
+                    [0.0; 3]
+                }
+            })
+            .collect::<Vec<_>>()
     });
     let mut uvs = Vec::new();
     for slot in UV_SLOTS {
@@ -594,7 +625,7 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
                 for k in 0..n0 { let x = indices[k] + v as u32; indices.push(x); }
                 for u in uvs.iter_mut() { let c = u.1.clone(); u.1.extend(c); }
                 let colors: Option<Vec<[u8; 4]>> = colors.map(|c: Vec<[u8; 4]>| { let mut d = c.clone(); d.extend(c); d });
-                return Mesh { positions: pos2, normals: Some(nrm2), uvs, colors, indices, flipped: 0, dropped, axis_order: [0, 1, 2], joints: None, weights: None, tangents: None };
+                return Mesh { positions: pos2, normals: Some(nrm2), uvs, colors, indices, flipped: 0, dropped, axis_order: [0, 1, 2], joints: None, weights: None, tangents: None, rebuilt_normals: 0 };
             }
         }
     }
@@ -665,13 +696,45 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
             }
         }
     }
+    // Rebuild the normals of vertices whose stored word has no usable normal
+    // (bit 31 clear, see `octa_decode_checked`) from the oriented faces
+    // around them, welding vertices at the same position so UV seams stay
+    // smooth.
+    let mut rebuilt_normals = 0;
+    if let (Some(n), false) = (normals.as_mut(), invalid.is_empty()) {
+        let key = |p: [f32; 3]| [(p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64];
+        let mut acc: std::collections::HashMap<[i64; 3], [f32; 3]> = std::collections::HashMap::new();
+        for t in indices.chunks_exact(3) {
+            let (a, b, c) = (positions[t[0] as usize], positions[t[1] as usize], positions[t[2] as usize]);
+            let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+            let w = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
+            let f = [u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]];
+            for &i in t {
+                if invalid.contains(&(i as usize)) {
+                    let e = acc.entry(key(positions[i as usize])).or_insert([0.0; 3]);
+                    for k in 0..3 {
+                        e[k] += f[k];
+                    }
+                }
+            }
+        }
+        for &i in &invalid {
+            if let Some(g) = acc.get(&key(positions[i])) {
+                let l = (g[0] * g[0] + g[1] * g[1] + g[2] * g[2]).sqrt();
+                if l > 0.0 {
+                    n[i] = [g[0] / l, g[1] / l, g[2] / l];
+                    rebuilt_normals += 1;
+                }
+            }
+        }
+    }
     let tangents = stream(11).filter(|s| s.1 == 0x27).and_then(|s| blob.get(s.0..s.0 + 4 * v)).map(|b| {
         b.chunks_exact(4)
             .enumerate()
             .map(|(i, c)| tangent_decode(u32::from_le_bytes(c.try_into().unwrap()), normals.as_ref().map(|n| n[i])))
             .collect::<Vec<_>>()
     });
-    Mesh { positions, normals, uvs, colors, indices, flipped, dropped, axis_order, joints, weights, tangents }
+    Mesh { positions, normals, uvs, colors, indices, flipped, dropped, axis_order, joints, weights, tangents, rebuilt_normals }
 }
 
 /// A geometry: a mesh blob paired with its meshlet index buffer.

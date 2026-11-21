@@ -611,30 +611,3 @@ pub fn merge(into: &mut Model, other: Model) {
     into.triangles += other.triangles;
     into.vertices += other.vertices;
 }
-
-/// Smooth vertex normals from the triangles, welding vertices at the same
-/// position (seams stay smooth). For meshes whose stored normals are wrong.
-pub fn recompute_normals(me: &mut Mesh) {
-    let key = |p: [f32; 3]| [(p[0] * 1e4).round() as i64, (p[1] * 1e4).round() as i64, (p[2] * 1e4).round() as i64];
-    let mut acc: HashMap<[i64; 3], [f32; 3]> = HashMap::new();
-    for t in me.indices.chunks_exact(3) {
-        let (a, b, c) = (me.verts[t[0] as usize].pos, me.verts[t[1] as usize].pos, me.verts[t[2] as usize].pos);
-        let u = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-        let v = [c[0] - a[0], c[1] - a[1], c[2] - a[2]];
-        let n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
-        for &i in t {
-            let e = acc.entry(key(me.verts[i as usize].pos)).or_insert([0.0; 3]);
-            for k in 0..3 {
-                e[k] += n[k];
-            }
-        }
-    }
-    for v in me.verts.iter_mut() {
-        if let Some(n) = acc.get(&key(v.pos)) {
-            let l = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt();
-            if l > 0.0 {
-                v.nrm = [n[0] / l, n[1] / l, n[2] / l];
-            }
-        }
-    }
-}
