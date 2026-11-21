@@ -10,7 +10,8 @@
 //!   each at a fixed 2D origin derived from its tail offset.
 //!
 //! Verified on the stores: tile mode 0 = `SW_64KB_D`, modes 1, 2, 3 =
-//! `SW_4KB_S` (mip n+1 equals mip n downsampled, every format checked).
+//! `SW_4KB_S` (mip n+1 equals mip n downsampled, every format checked;
+//! 1-byte elements (A8 / R8) added 2026-11-21, checked the same way).
 
 /// Element-coordinate bit order inside a block, low bit first:
 /// (is_x, coordinate bit).
@@ -22,6 +23,9 @@ fn equation(sw: Swizzle, bpe: u32) -> Option<&'static [(bool, u8)]> {
         (Swizzle::S4K, 8) => &[(X, 0), (Y, 0), (Y, 1), (X, 1), (X, 2), (Y, 2), (X, 3), (Y, 3), (X, 4)],
         (Swizzle::D64K, 16) => &[(X, 0), (Y, 0), (X, 1), (Y, 1), (Y, 2), (X, 2), (Y, 3), (X, 3), (Y, 4), (X, 4), (Y, 5), (X, 5)],
         (Swizzle::D64K, 8) => &[(X, 0), (Y, 0), (X, 1), (X, 2), (Y, 1), (Y, 2), (X, 3), (Y, 3), (X, 4), (Y, 4), (X, 5), (Y, 5), (X, 6)],
+        // 1-byte elements (R8 / A8)
+        (Swizzle::S4K, 1) => &[(X, 0), (X, 1), (X, 2), (X, 3), (Y, 0), (Y, 1), (Y, 2), (Y, 3), (Y, 4), (X, 4), (Y, 5), (X, 5)],
+        (Swizzle::D64K, 1) => &[(X, 0), (X, 1), (X, 2), (Y, 1), (Y, 0), (Y, 2), (X, 3), (Y, 3), (Y, 4), (X, 4), (Y, 5), (X, 5), (Y, 6), (X, 6), (Y, 7), (X, 7)],
         _ => return None,
     })
 }
@@ -87,7 +91,12 @@ impl Layout {
             place[i].offset = off;
             off += (mw.div_ceil(bw) * bw) as u64 * (mh.div_ceil(bh) * bh) as u64 * bpe as u64;
         }
-        let b256 = if bpe == 16 { (4, 4) } else { (8, 4) };
+        // 256-byte block in elements (the unit of mip-tail origins)
+        let b256 = match bpe {
+            16 => (4, 4),
+            8 => (8, 4),
+            _ => (16, 16),
+        };
         for (k, p) in place.iter_mut().enumerate().skip(first) {
             let m = max_tail - 1 - (k - first) as u32;
             let mo: u32 = if m > 6 { 16 << m } else { m << 8 };
@@ -257,5 +266,13 @@ mod tests {
         let l = Layout::new(Swizzle::S4K, 128, 128, 7, 8).unwrap().with_cube_copies(6, 4, None).unwrap();
         assert_eq!(l.base, 104 * 4096);
         assert_eq!(l.total, (104 + 258) * 4096);
+    }
+
+    #[test]
+    fn one_byte_elements_match_store_spacing() {
+        // A8 512x512, 6 mips, tile 2: 4 full mips + one 4 KiB tail block
+        assert_eq!(Layout::new(Swizzle::S4K, 512, 512, 6, 1).unwrap().total, 352256);
+        // A8 1024x1024, 7 mips, tile 0: 3 full mips + one 64 KiB tail block
+        assert_eq!(Layout::new(Swizzle::D64K, 1024, 1024, 7, 1).unwrap().total, 1441792);
     }
 }

@@ -418,7 +418,7 @@ impl TtpfTex {
         }
     }
     /// Mip-chain layout (`None` for unsupported tile modes or element sizes:
-    /// only 8- and 16-byte BCn elements are mapped).
+    /// 1-, 8- and 16-byte elements are mapped).
     /// Array size (d1 bits 10-19, plus 1). 1 for almost all textures; 6 on
     /// cube maps; 2-64 on a few texture arrays.
     pub fn slices(&self) -> u32 {
