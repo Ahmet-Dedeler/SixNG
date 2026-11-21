@@ -69,6 +69,14 @@ cargo build --release
 This produces `target\release\sixng.exe` (CLI) and
 `target\release\sixng-gui.exe` (GUI).
 
+**macOS** (Apple Silicon, tested on macOS with Rust 1.100): the same
+`cargo build --release` works once CMake is installed (`brew install cmake`).
+It produces `target/release/sixng` and `target/release/sixng-gui`; the GUI
+renders through Metal. `scripts/macos-app.sh` builds `dist/SixNG.app` (GUI and CLI, ad-hoc
+signed, not notarised). The app keeps its settings and default work folder
+in `~/Library/Application Support/SixNG`, never inside the bundle; plain
+binaries keep them next to the exe like on Windows.
+
 There is no default game folder; you set it once:
 
 - CLI: `--game <folder>` or the `SIXNG_GAME` environment variable, or the
