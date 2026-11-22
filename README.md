@@ -273,6 +273,18 @@ again**).
   `09 corpse roadkill`) have a button each, and **Defaults** goes back.
   The camera stays put while parts change, and the item page's Export and
   Files follow the parts shown in the viewer.
+- **Head skins** (since 2026-11-21): ped heads bind no textures in the
+  model, so SixNG adds the face (colour and normal map). For about 900
+  heads (named characters such as `cs_jada_watts` and most ambient
+  `head_*` faces) the game's material data names the head, and that face
+  is used. Other heads (`a_head_base_*`, crowd `hc_*` heads, characters
+  whose materials are in archives not indexed yet) get a face of the same
+  sex, body type and ethnicity from that library. The viewer shows
+  **Head skin ◀ n / N ▶** to switch through the faces; exports take the
+  **Head skin** number next to Body shape, or `extract --head-skin N`.
+  `model.json` records the choice (`head_skin`: linked or auto, index,
+  count, texture hashes). The table is built from the `packs` index on
+  first use (about 5 s) and kept in `<work>/index/head_skins.json`.
 - Colours are never guessed. Many ped clothing and skin materials have no colour
   texture that SixNG can read (clothing colour is in BCPack; skin is built
   by the game at run time). Such materials render plain white, and the

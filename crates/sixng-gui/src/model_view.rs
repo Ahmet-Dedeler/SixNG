@@ -34,6 +34,11 @@ pub struct Loaded {
 
 type Pending = Arc<Mutex<Option<Result<Loaded, String>>>>;
 
+/// Face variant the viewer exports ped heads with (`ExportOptions::head_skin`).
+pub static HEAD_SKIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Last head exported for the viewer: (variant, variant count, source).
+static HEAD_SKIN_SEEN: Mutex<Option<(usize, usize, String)>> = Mutex::new(None);
+
 #[derive(Default, Clone)]
 pub struct Automation {
     pub screenshot: Option<PathBuf>,
@@ -176,6 +181,7 @@ impl ModelView {
             self.picker.opened(query.trim());
         }
         self.loading = true;
+        *HEAD_SKIN_SEEN.lock().unwrap() = None;
         self.status = format!("loading {query} …");
         let q = query.to_string();
         let ws = Workspace::new(&self.game, &self.work);
@@ -801,6 +807,29 @@ impl ModelView {
     }
 
     fn side_ui(&mut self, ui: &mut egui::Ui, rs: &egui_wgpu::RenderState) {
+        let seen = HEAD_SKIN_SEEN.lock().unwrap().clone();
+        if let Some((i, n, src)) = seen.filter(|_| !self.loading) {
+            ui.heading("Head skin");
+            let mut step = None;
+            ui.horizontal(|ui| {
+                if ui.button("◀").on_hover_text("Previous face").clicked() {
+                    step = Some((i + n - 1) % n);
+                }
+                ui.label(format!("{} / {n}", i + 1));
+                if ui.button("▶").on_hover_text("Next face").clicked() {
+                    step = Some((i + 1) % n);
+                }
+            });
+            ui.label(if src == "linked" { "faces the game links to this head" } else { "automatic: faces of the same sex, body type and ethnicity" });
+            if let Some(k) = step {
+                HEAD_SKIN.store(k, std::sync::atomic::Ordering::Relaxed);
+                let lod = self.loaded.as_ref().map_or(0, |l| l.lod);
+                let q = self.query.clone();
+                self.keep_cam_once = true;
+                self.open(&q, lod, ui.ctx());
+            }
+            ui.separator();
+        }
         ui.heading("View");
         egui::ComboBox::from_label("mode").selected_text(MODES[self.look.mode as usize]).show_ui(ui, |ui| {
             for (k, m) in MODES.iter().enumerate() {
@@ -1144,7 +1173,9 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
 
 /// Export one entry into the viewer cache and load the GLB of a LOD level.
 fn export_load(a: &sixng_core::game::ArchiveInfo, e: &sixng_core::scan::Entry, cache: &Path, lod: usize) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
-    let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: false, skip_embedded_textures: false, body_shape: Vec::new() };
+    // Heads are exported again each time (small), so the chosen face variant applies.
+    let head = sixng_core::headskin::is_head(e.name.as_deref().unwrap_or(""));
+    let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: head, skip_embedded_textures: false, body_shape: Vec::new(), head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed) };
     let item = export::export_entry(a, e, &opts)?;
     let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(format!("{}_{:x}", export_sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off));
     let lods = lods_in(&dir);
@@ -1152,7 +1183,13 @@ fn export_load(a: &sixng_core::game::ArchiveInfo, e: &sixng_core::scan::Entry, c
         return Err(anyhow::anyhow!("{} exported no model.glb (status {}, files {:?}{})", e.id, item.status, item.files, item.error.map(|x| format!(", {x}")).unwrap_or_default()));
     }
     let lod = lod.min(lods.len() - 1);
-    let info = std::fs::read(dir.join("model.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let info: serde_json::Value = std::fs::read(dir.join("model.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    if let Some(h) = info.get("head_skin") {
+        let n = h["count"].as_u64().unwrap_or(0) as usize;
+        if n > 0 {
+            *HEAD_SKIN_SEEN.lock().unwrap() = Some((h["index"].as_u64().unwrap_or(0) as usize, n, h["source"].as_str().unwrap_or("").to_string()));
+        }
+    }
     let mut model = glb::load(&lods[lod], cache)?;
     crate::assemble::mark_missing_colour(&mut model);
     Ok((model, lods, info))

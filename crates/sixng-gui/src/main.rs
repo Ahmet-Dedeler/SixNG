@@ -238,6 +238,8 @@ struct App {
     tex_dds: bool,
     /// Body shape for ped clothing exports (`gcweightbelly=0.5,...`).
     body_shape: String,
+    /// Face variant for ped head exports.
+    head_skin: usize,
     tab: Tab,
     model: model_view::ModelView,
     cli: Cli,
@@ -327,6 +329,7 @@ impl App {
             tex_png: true,
             tex_dds: false,
             body_shape: String::new(),
+            head_skin: 0,
         };
         a.map3d.load_settings();
         a.refresh();
@@ -573,6 +576,7 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
             force: false,
             skip_embedded_textures: false,
             body_shape,
+            head_skin: self.head_skin,
         };
         self.start_task(&format!("Extracting {} entries", idxs.len()), ctx, move |pr| {
             let sel: Vec<&Entry> = idxs.iter().map(|&i| &ix.entries[i]).collect();
@@ -790,6 +794,8 @@ impl eframe::App for App {
                 ui.checkbox(&mut self.tex_dds, "DDS");
                 ui.label("Body shape:").on_hover_text("Ped clothing: pose the shared ped skeleton with the game's body-shape rig, e.g. gcweightbelly=0.5,gcmusclechest=1 (gcweight* -1..1, gcmuscle* 0..1, gcbutt, gcbreasts; allweight=v, allmuscle=v). Empty = neutral. Needs packs.rpf and anim.rpf indexed.");
                 ui.add(egui::TextEdit::singleline(&mut self.body_shape).hint_text("neutral").desired_width(160.0));
+                ui.label("Head skin:").on_hover_text("Ped heads: face variant (0 = first). A head gets the face the game links to it, or one of the faces of the same sex, body type and ethnicity. The model viewer has arrows to switch through them.");
+                ui.add(egui::DragValue::new(&mut self.head_skin).range(0..=999));
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label("World data (whole map → Output):");

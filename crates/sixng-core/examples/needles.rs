@@ -4,6 +4,8 @@
 //! Usage: needles <archive path> <index json> <needle> [needle ...]
 //! A needle `0x1234abcd` is searched as that raw little-endian u32 only;
 //! 16 hex digits (`0x0123456789abcdef`) as a raw little-endian u64.
+//! Entries that are not resources (PSO, XML, plain files) are searched
+//! as their raw decompressed bytes (page "raw").
 //! Prints one JSON line per entry with hits.
 use rayon::prelude::*;
 use sixng_core::{resource::Resource, scan};
@@ -51,10 +53,16 @@ fn main() -> anyhow::Result<()> {
         if k % 5000 == 0 {
             eprintln!("{k}/{n}");
         }
-        let Ok(r) = Resource::load(&archive, e) else { return };
+        let pages: Vec<(&str, Vec<u8>)> = match Resource::load(&archive, e) {
+            Ok(r) => vec![("sys", r.sys), ("gfx", r.gfx)],
+            Err(_) => match scan::read_entry(&archive, e) {
+                Ok(b) => vec![("raw", b)],
+                Err(_) => return,
+            },
+        };
         let mut hits = Vec::new();
         for (label, nd) in &needles {
-            for (page, buf) in [("sys", &r.sys), ("gfx", &r.gfx)] {
+            for (page, buf) in &pages {
                 let f = find_all(buf, nd);
                 if !f.is_empty() {
                     hits.push(serde_json::json!({"needle": label, "page": page, "at": f}));

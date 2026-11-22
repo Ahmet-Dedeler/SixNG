@@ -246,6 +246,19 @@ impl<'a> Meta<'a> {
                     .map(|(_, sl)| json!({"key": sl.get(field_name(0x6098_a50e)), "value": sl.get(field_name(0x063f_a3f2))}))
                     .collect::<Vec<_>>())
             }
+            // Map (meta, 24 bytes): u64 1, u64 pool reference, u16 count,
+            // u16 capacity. The reference points at `count` consecutive entry
+            // structs ({`6098a50e` key, `063fa3f2` value}, struct taken from
+            // the block). Empty maps point at block 0.
+            0x71 => {
+                let n = r.u16(p + 16) as usize;
+                let Some((h, base)) = self.ptr(r.u64(p + 8)) else { return Some(json!([])) };
+                let esz = self.structs.get(&h).map_or(0, |s| s.size as usize);
+                if esz == 0 || n > 100_000 {
+                    return Some(json!({"map": n, "struct": format!("{h:08x}")}));
+                }
+                json!((0..n).filter_map(|i| self.object(h, base + i * esz, depth + 1)).collect::<Vec<_>>())
+            }
             // Bit set / flags (PSO, 16 bytes): the first 64 bits.
             0x65 => json!(format!("{:016x}", r.u64(p))),
             // Tagged value (PSO, 16 bytes): u32 tag, then payload.

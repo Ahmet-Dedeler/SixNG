@@ -240,6 +240,10 @@ pub struct ExportOptions {
     /// shared ped skeleton is posed with the game's body-shape rig. Empty =
     /// neutral body.
     pub body_shape: Vec<(String, f32)>,
+    /// Head skin variant for ped heads (`headskin`): index into the faces
+    /// linked to the head, or into the automatic candidates; wraps around.
+    #[serde(default)]
+    pub head_skin: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -542,7 +546,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             fs::write(dir.join("sys.bin"), &r.sys)?;
             item.files.push(rel(&o.out, &dir.join("sys.bin")));
-            let shader_tex = link_textures(a, &info.shaders, &dir, o);
+            let head = head_skin_shaders(a, e, &info.shaders, o, &mut item);
+            let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), &dir, o);
             let slice = |i: usize| {
                 let b = &info.buffers[i];
                 let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
@@ -765,6 +770,11 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 }).collect::<Vec<_>>(),
                 "materials_note": "Textures come from the data/ttdb/*.ttpf stores by 64-bit hash and are written once to <out>/textures/ttpf/<hash>.png. Roles are guessed from the shader parameter hash and the format (sRGB = colour, BC5 / known normal slots = normal map). classification.class is one of opaque/alpha/cutout/decal/glass/window/emissive/water/terrain_multilayer/car_paint, from the shader record flags and known shader families. shader_name and param_name are joaat names from <work>/names/names.json (`sixng names`), null when unknown. slot_role names the PBR map a known parameter slot holds.",
             });
+            let mut j = j;
+            if let Some((_, rec)) = &head {
+                j["head_skin"] = rec.clone();
+                j["head_skin_note"] = "Heads bind no textures; the face comes from the material preset whose drawable tag lists this head (source \"linked\"), else from the faces of linked heads with the same sex, body type and ethnicity code (\"auto\"). index / count: the variant chosen with --head-skin.".into();
+            }
             fs::write(&marker, serde_json::to_vec_pretty(&j)?)?;
             item.files.push(rel(&o.out, &marker));
         }
@@ -808,6 +818,42 @@ struct SkinSetup {
 /// `GM_U01_*` helper bones store a parent-relative bind (their parent in the
 /// shared skeleton is not known), so their joint positions are not in model
 /// space; the rest pose is unaffected.
+/// Ped heads bind no textures: add the face (albedo and normal map) chosen
+/// by `headskin` to their texture-less shaders, with the choice record for
+/// model.json. None when not a head.
+fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Shader], o: &ExportOptions, item: &mut ExportedItem) -> Option<(Vec<crate::drawable::Shader>, serde_json::Value)> {
+    let name = e.name.as_deref()?;
+    if !crate::headskin::is_head(name) || shaders.iter().any(|s| !s.textures.is_empty()) {
+        return None;
+    }
+    let t = match crate::headskin::get(&game_root(a)) {
+        Ok(t) => t,
+        Err(err) => {
+            item.warnings.push(format!("head skin: {err}"));
+            return None;
+        }
+    };
+    let set = crate::ttpf::global(&game_root(a));
+    let Some(c) = t.choose(name, o.head_skin, |h| set.get(h).is_some()) else {
+        item.warnings.push("head skin: no face texture found".into());
+        return None;
+    };
+    let rec = serde_json::json!({"source": c.source, "group": c.group, "index": c.index, "count": c.count, "albedo": format!("{:016x}", c.skin.albedo), "normal": format!("{:016x}", c.skin.normal)});
+    let tex = |param_hash: &str, h: u64| crate::drawable::TexRef { param: 0, param_hash: param_hash.into(), hash64: format!("{h:016x}"), hash32: String::new() };
+    let sh = shaders
+        .iter()
+        .map(|s| {
+            let mut s = s.clone();
+            s.textures.push(tex(ALBEDO_PARAMS[0], c.skin.albedo));
+            if c.skin.normal != 0 {
+                s.textures.push(tex("1e77bf4c", c.skin.normal));
+            }
+            s
+        })
+        .collect();
+    Some((sh, rec))
+}
+
 fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o: &ExportOptions, item: &mut ExportedItem) -> SkinSetup {
     use crate::gltf::Joint;
     let joint = |b: &crate::drawable::Bone, off: usize| Joint { name: b.name.clone(), parent: b.parent.map(|p| p as usize + off), bind: b.bind_matrix.unwrap(), pose: None };

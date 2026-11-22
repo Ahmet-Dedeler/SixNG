@@ -116,6 +116,11 @@ struct OutArgs {
     /// game's body-shape rig; needs packs.rpf and anim.rpf indexed.
     #[arg(long)]
     body_shape: Option<String>,
+    /// Face variant for ped heads (0 = first). Heads get the face the game
+    /// links to them, or one of the faces of the same sex, body type and
+    /// ethnicity; model.json `head_skin.count` says how many there are.
+    #[arg(long, default_value_t = 0)]
+    head_skin: usize,
 }
 
 impl OutArgs {
@@ -135,6 +140,7 @@ impl OutArgs {
                     std::process::exit(2);
                 }
             },
+            head_skin: self.head_skin,
         }
     }
 }

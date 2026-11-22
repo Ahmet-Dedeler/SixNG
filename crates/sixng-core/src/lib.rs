@@ -7,6 +7,7 @@ pub mod lights;
 pub mod paths;
 pub mod pedskel;
 pub mod bodyshape;
+pub mod headskin;
 pub mod batches;
 pub mod drawable;
 pub mod export;
