@@ -251,11 +251,11 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
             layer("base", base, "TEXCOORD_0", "1 - COLOR0.a"),
             layer("layer2", l2, "TEXCOORD_1", "COLOR0.a"),
         ],
-        "overlay": {"colour_alpha": tex(overlay), "uv_set": null, "weight": "texture alpha (grime/dirt); UV set unknown"},
+        "overlay": {"colour_alpha": tex(overlay), "uv_set": "TEXCOORD_2", "weight": "texture alpha (grime/dirt)", "uv_note": "TEXCOORD_2 by analogy with prop_2lyr_batch, where a seam test shows it (the tiling wall dirt maps cannot be checked that way). On walls it is constant (0, 1) on most primitives (uniform dirt), exactly the horizontal position at 1 m per unit (rotated, no residual) on ground and track pieces, and an irregular second mapping on others"},
         "extra_data": tex(extra),
         "vertex_color_channels": {"r": "unverified: a baked shading term, mostly 255 (dark blobs on ground tiles where trees stand, 23 on average on trees, 252 on interior shaders; does not follow sky visibility from its own or neighbouring placed geometry in ray tests, nor nearby batch trees, grass AO or road distance)", "g": "unverified: equal to r on 63 % of ordinary vertices; low on ground shaders and varies widely within one collision surface, so not a surface-type mask (looks painted per vertex)", "b": "tint palette index (entry within the palette row)", "a": "layer 2 weight"},
-        "confidence": {"grouping": "high", "weight_channel": "medium", "uv_layer2": "medium", "uv_base": "low", "data_channels": "unknown"},
-        "note": "Derived from texture-size grouping and vertex/UV statistics, not from shader code. Blend: lerp(base, layer2, COLOR0.a), then the overlay by its alpha. Normal maps: DirectX green.",
+        "confidence": {"grouping": "high", "weight_channel": "medium", "uv_layer2": "medium", "uv_base": "low", "uv_overlay": "low", "data_channels": "unknown"},
+        "note": "Derived from texture-size grouping and vertex/UV statistics, not from shader code. Blend: lerp(base, layer2, COLOR0.a), then the overlay by its alpha (TEXCOORD_2). Normal maps: DirectX green.",
     });
     if name_hash == "89c8fe07" {
         // Unpainted vertices are A = 255 here (every granite rock, plain
@@ -268,8 +268,7 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
         out["vertex_color_channels"]["r"] = json!("unverified on props: 0/1 part masks on containers, varies on concrete barriers (lower on upward faces)");
         out["confidence"]["weight_channel"] = json!("medium (direction from where the painting sits, not from shader code)");
         out["note"] = json!("Derived from recovered slot names, UV tests and where the vertex alpha is painted, not from shader code. Blend: lerp(base, layer2, 1 - COLOR0.a), sharpened by the layers' materialb alpha (height-like), then the dirt overlay by its alpha on TEXCOORD_2. Normal maps: DirectX green.");
-        out["overlay"]["uv_set"] = json!("TEXCOORD_2");
-        out["overlay"]["weight"] = json!("texture alpha (grime/dirt)");
+        out["overlay"].as_object_mut().unwrap().remove("uv_note");
         out["confidence"]["uv_overlay"] = json!("medium");
         out["prop_2lyr"] = json!({
             "slot_names": {"p0": "lyr0diffusetex", "p6": "lyr0normaltex", "p7": "lyr0materialbtex", "p9": "lyr0materialatex", "p4": "lyr1diffusetex", "p10": "lyr1normaltex", "p5": "lyr1materialbtex", "p2": "lyr1materialatex", "p8": "dirtdiffusetex", "p1": "tintpalettetex (embedded)", "p11": "unnamed (greyscale mask, containers only)"},
@@ -562,6 +561,7 @@ mod paint_tests {
         assert!(l["prop_2lyr"].is_object());
         assert_eq!(l["layers"][1]["weight"], "1 - COLOR0.a");
         assert_eq!(layers("b217b263", &entries).unwrap()["layers"][1]["weight"], "COLOR0.a");
+        assert_eq!(layers("b217b263", &entries).unwrap()["overlay"]["uv_set"], "TEXCOORD_2");
     }
 
     #[test]
