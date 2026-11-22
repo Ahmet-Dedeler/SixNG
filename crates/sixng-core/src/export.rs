@@ -1014,13 +1014,6 @@ struct SkinSetup {
     geometry_map: std::collections::HashMap<usize, Vec<u16>>,
 }
 
-/// Skin joints for a drawable. Normally the drawable's own skeleton, bone k =
-/// joint k. Ped clothing (models with a bone palette that names the
-/// drawable's own bones) indexes the palette instead; the joint list is then
-/// the shared ped skeleton followed by the drawable's own bones. The own
-/// `GM_U01_*` helper bones store a parent-relative bind (their parent in the
-/// shared skeleton is not known), so their joint positions are not in model
-/// space; the rest pose is unaffected.
 /// Ped heads bind no textures: add the face (albedo and normal map) chosen
 /// by `headskin` to their texture-less shaders, with the choice record for
 /// model.json. None when not a head.
@@ -1057,6 +1050,13 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
     Some((sh, rec))
 }
 
+/// Skin joints for a drawable. Normally the drawable's own skeleton, bone k =
+/// joint k. Ped clothing (models with a bone palette that names the
+/// drawable's own bones) and ped heads (no skeleton of their own, palette
+/// bones in the shared skeleton) index the palette instead; the joint list is
+/// then the shared ped skeleton followed by the drawable's own bones. The own
+/// `GM_U01_*` helper bones hang under the shared bone their record names
+/// (`Bone::parent_hash`), with their parent-relative bind moved to model space.
 fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o: &ExportOptions, item: &mut ExportedItem) -> SkinSetup {
     use crate::gltf::Joint;
     let joint = |b: &crate::drawable::Bone, off: usize| Joint { name: b.name.clone(), parent: b.parent.map(|p| p as usize + off), bind: b.bind_matrix.unwrap(), pose: None };
@@ -1065,13 +1065,20 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o:
     let mut out = SkinSetup { joints: own, geometry_map: Default::default() };
     let own_hash: std::collections::HashMap<u32, usize> = info.skeleton.iter().enumerate().map(|(i, b)| (crate::meta7a::joaat(&b.name), i)).collect();
     let cand: Vec<(&crate::drawable::Model, &Vec<u32>)> = info.models.iter().filter_map(|m| m.bone_palette.as_ref().map(|p| (m, p))).collect();
-    // A ped drawable: some palette names one of the drawable's own bones
-    // (the ascending check alone is not proof).
-    if !own_ok || !cand.iter().any(|(_, p)| p.iter().any(|h| own_hash.contains_key(h))) {
+    if !own_ok || cand.is_empty() {
         return out;
     }
     let female = crate::pedskel::is_female_name(e.name.as_deref().unwrap_or(""));
-    let ped = crate::pedskel::get(&game_root(a), female);
+    // A ped drawable: some palette names one of the drawable's own bones
+    // (the ascending check alone is not proof), or a ped part's palette
+    // names shared ped skeleton bones only (heads, low-detail copies).
+    let names_own = cand.iter().any(|(_, p)| p.iter().any(|h| own_hash.contains_key(h)));
+    let ped_name = crate::pedskel::is_ped_name(e.name.as_deref().unwrap_or(""));
+    let ped = if names_own || ped_name { crate::pedskel::get(&game_root(a), female) } else { None };
+    let in_ped = |p: &Vec<u32>| ped.is_some_and(|s| !p.is_empty() && p.iter().filter(|h| s.by_hash.contains_key(h)).count() * 10 >= p.len() * 9);
+    if !names_own && !cand.iter().any(|(_, p)| in_ped(p)) {
+        return out;
+    }
     let n_ped = ped.map_or(0, |p| p.bones.len());
     // Each model's palette is used when most of its bones resolve (lower LODs
     // may name only shared-skeleton bones).
@@ -1088,7 +1095,39 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o:
                 Err(err) => item.warnings.push(format!("body shape: {err}; neutral body exported")),
             }
         }
+        let ped_joints = j.len();
         j.extend(info.skeleton.iter().map(|b| joint(b, n_ped)));
+        // Helper bones (`GM_U01_*`) are roots of the drawable's skeleton that
+        // name their parent in the shared skeleton (`Bone::parent_hash`);
+        // their binds are relative to it. Hang them under that bone and put
+        // their bind (and body-shape pose) in model space, so they follow
+        // the body when it moves.
+        let mut unattached = 0;
+        for (k, b) in info.skeleton.iter().enumerate() {
+            // the drawable root this bone hangs from, and its shared parent
+            let mut r = k;
+            while let Some(q) = info.skeleton[r].parent.map(|q| q as usize).filter(|&q| q < info.skeleton.len() && q != r) {
+                r = q;
+            }
+            let Some(&pi) = info.skeleton[r].parent_hash.and_then(|h| p.by_hash.get(&h)) else {
+                unattached += 1;
+                continue;
+            };
+            let jt = &mut j[ped_joints + k];
+            if b.parent.is_none() {
+                jt.parent = Some(pi);
+            }
+            let (pb, pp) = (j[pi].bind, j[pi].pose);
+            let jt = &mut j[ped_joints + k];
+            let local = jt.bind;
+            jt.bind = crate::gltf::mat_mul(&pb, &local);
+            if let Some(pp) = pp {
+                jt.pose = Some(crate::gltf::mat_mul(&pp, &local));
+            }
+        }
+        if unattached > 0 {
+            item.warnings.push(format!("ped clothing skin: {unattached} of the drawable's own bones name no parent in the shared skeleton; they are left at their stored (parent-relative) bind"));
+        }
         out.joints = j;
     } else {
         item.warnings.push(format!("ped clothing skin: shared ped skeleton ({}) not found in the packs index; only the drawable's own bones are bound", crate::pedskel::source_name(female)));

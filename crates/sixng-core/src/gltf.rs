@@ -75,7 +75,8 @@ fn yup_mat(m: &[f32; 16]) -> [f32; 16] {
     o
 }
 
-fn mat_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+/// Product of two column-major 4x4 matrices (a · b).
+pub fn mat_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     let mut o = [0f32; 16];
     for r in 0..4 {
         for c in 0..4 {
@@ -221,7 +222,13 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
         let ibm: Vec<u8> = binds.iter().flat_map(|m| crate::drawable::affine_inverse(m)).flat_map(|f| f.to_le_bytes()).collect();
         let bv = b.view(&ibm, None);
         b.accessors.push(json!({"bufferView": bv, "componentType": 5126, "count": skeleton.len(), "type": "MAT4"}));
-        Some(json!({"name": "skeleton", "joints": (0..skeleton.len()).collect::<Vec<_>>(), "inverseBindMatrices": b.accessors.len() - 1, "skeleton": joint_roots.first().copied().unwrap_or(0)}))
+        let mut sk = json!({"name": "skeleton", "joints": (0..skeleton.len()).collect::<Vec<_>>(), "inverseBindMatrices": b.accessors.len() - 1});
+        // `skeleton` must be a common root of all joints; with several joint
+        // roots there is none among the joints, so it is left out.
+        if joint_roots.len() == 1 {
+            sk["skeleton"] = json!(joint_roots[0]);
+        }
+        Some(sk)
     };
     let mut meshes = Vec::new();
     let mut group_nodes = Vec::new();
@@ -314,6 +321,12 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
                     if sum != 255 {
                         let top = (0..4 * sets).max_by_key(|&k| ww[k]).unwrap_or(0);
                         ww[top] = (ww[top] as u32 + 255u32.saturating_sub(sum)).min(255) as u8;
+                    }
+                    // unused slots point at joint 0 (glTF: zero weight, joint 0)
+                    for k in 0..4 * sets {
+                        if ww[k] == 0 {
+                            jj[k] = 0;
+                        }
                     }
                     for s in 0..sets {
                         for k in 4 * s..4 * s + 4 {

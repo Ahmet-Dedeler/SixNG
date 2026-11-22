@@ -141,8 +141,9 @@ pub struct DrawableInfo {
 }
 
 /// One bone record (0x50 bytes): +0x00 rotation quaternion (x,y,z,w),
-/// +0x10 translation (+ u32 hash), +0x20 scale, +0x30 name ptr, +0x40 8×u16
-/// (flags, ?, next sibling, parent, index, name hash, index, ?).
+/// +0x10 translation (+ u32 joaat of the name), +0x20 scale (+ u32 parent
+/// hash, see `parent_hash`), +0x30 name ptr, +0x40 8×u16 (flags, ?, next
+/// sibling, parent, index, name hash, index, ?).
 /// The skeleton header (found by its pointer to the bone array) is followed
 /// by pointers to the inverse bind matrices (+0x08, 4x4 f32, row-vector
 /// convention: p_bone = p_model · M), local bind matrices (+0x10) and u16
@@ -169,6 +170,14 @@ pub struct Bone {
     /// Translation part of `bind_matrix` (the pivot, model space).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pivot: Option<[f32; 3]>,
+    /// joaat of the parent bone in another skeleton (u32 at +0x2C, after
+    /// the scale; 0 = none). Ped clothing helper bones (`GM_U01_*`) are
+    /// roots of the drawable's own skeleton and name their parent in the
+    /// shared ped skeleton here (`SKEL_Spine3`, `RB_L_Thigh01` …); their
+    /// translation and bind are relative to that parent. Bones of full
+    /// skeletons have 0. Only read for root bones.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_hash: Option<u32>,
 }
 
 /// Invert an affine 4x4 column-major matrix (last row 0,0,0,1).
@@ -223,6 +232,7 @@ pub fn find_skeleton(r: &Resource) -> Vec<Bone> {
             scale: [r.f32(q + 0x20), r.f32(q + 0x24), r.f32(q + 0x28)],
             bind_matrix: None,
             pivot: None,
+            parent_hash: Some(r.u32(q + 0x2c)).filter(|&h| h != 0 && r.u16(q + 0x46) == 0xffff),
         })
     };
     let mut p = 0usize;
@@ -542,13 +552,15 @@ pub struct Mesh {
     /// Skin joints per vertex (skeleton bone indices). Stream 8: format
     /// 0x25 = 4 x u8 blend indices; format 0x00 is sized per vertex:
     /// 1 byte = one u8 bone, 2 = one u16 bone (rigid), 4 = 4 x u8,
-    /// 8 = 4 x u16 blend indices.
+    /// 8 = 4 x u16 blend indices. Format 0x8C (ped heads) = 4 x u32 per
+    /// vertex, the joint index in the low u16 of each (the high halves of
+    /// stream 8 hold other per-vertex data; those of stream 9 are 0).
     pub joints: Option<Vec<[u16; 4]>>,
     /// Skin weights per vertex (u8, sum 255). Stream 6 (format 0x26) when
     /// stream 8 has 4 indices; otherwise (255, 0, 0, 0).
     pub weights: Option<Vec<[u8; 4]>>,
     /// Second influence set (influences 5-8): stream 9 (format 0x25, 4 x u8
-    /// joint indices) and stream 7 (format 0x26, weights). Seen on ped
+    /// joint indices, or 0x8C next to a 0x8C stream 8) and stream 7 (format 0x26, weights). Seen on ped
     /// meshes; the 8 weights together sum to 255 and are sorted descending.
     pub joints1: Option<Vec<[u16; 4]>>,
     pub weights1: Option<Vec<[u8; 4]>>,
@@ -708,9 +720,12 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
         if v == 0 { 0 } else { (next.min(blob.len()) - o) / v }
     };
     let u16le = |c: &[u8]| u16::from_le_bytes([c[0], c[1]]);
+    let quad_u32 = |b: &[u8]| -> Vec<[u16; 4]> { b.chunks_exact(16).map(|c| [u16le(&c[0..]), u16le(&c[4..]), u16le(&c[8..]), u16le(&c[12..])]).collect() };
     let jw = width(8);
     let joints: Option<Vec<[u16; 4]>> = match stream(8) {
         Some((o, 0x25)) => blob.get(o..o + 4 * v).map(|b| b.chunks_exact(4).map(|c| [c[0] as u16, c[1] as u16, c[2] as u16, c[3] as u16]).collect()),
+        // 4 x u32 (ped heads): joint index in the low u16 of each
+        Some((o, 0x8c)) => blob.get(o..o + 16 * v).map(quad_u32),
         // one u16 bone per vertex (rigid, skeletons over 255 bones)
         Some((o, 0x00)) if (2..4).contains(&jw) => blob.get(o..o + 2 * v).map(|b| b.chunks_exact(2).map(|c| [u16le(c), 0, 0, 0]).collect()),
         // 4 x u16 blend indices
@@ -720,7 +735,7 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
         Some((o, 0x00)) if jw < 2 => blob.get(o..o + v).map(|b| b.iter().map(|&j| [j as u16, 0, 0, 0]).collect()),
         _ => None,
     };
-    let blend = joints.is_some() && (matches!(stream(8).map(|s| s.1), Some(0x25)) || (4..16).contains(&jw));
+    let blend = joints.is_some() && (matches!(stream(8).map(|s| s.1), Some(0x25 | 0x8c)) || (4..16).contains(&jw));
     let weights: Option<Vec<[u8; 4]>> = joints.as_ref().map(|j| {
         if blend {
             stream(6)
@@ -734,8 +749,13 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
     });
     // Influences 5-8 (peds): only next to a 4-index blend set.
     let quad = |slot: u32, fmt: u32| stream(slot).filter(|s| s.1 == fmt).and_then(|s| blob.get(s.0..s.0 + 4 * v)).map(|b| b.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]).collect::<Vec<[u8; 4]>>());
-    let (joints1, weights1) = match (blend && matches!(stream(8).map(|s| s.1), Some(0x25)), quad(9, 0x25), quad(7, 0x26)) {
-        (true, Some(j), Some(w)) if w.iter().any(|x| x.iter().any(|&y| y > 0)) => (Some(j.iter().map(|c| c.map(|x| x as u16)).collect::<Vec<_>>()), Some(w)),
+    let second = match stream(8).map(|s| s.1) {
+        Some(0x25) if blend => quad(9, 0x25).map(|j| j.iter().map(|c| c.map(|x| x as u16)).collect::<Vec<_>>()),
+        Some(0x8c) if blend => stream(9).filter(|s| s.1 == 0x8c).and_then(|s| blob.get(s.0..s.0 + 16 * v)).map(quad_u32),
+        _ => None,
+    };
+    let (joints1, weights1) = match (second, quad(7, 0x26)) {
+        (Some(j), Some(w)) if w.iter().any(|x| x.iter().any(|&y| y > 0)) => (Some(j), Some(w)),
         _ => (None, None),
     };
     if std::env::var_os("SIXNG_DEBUG_SKIN").is_some() {
