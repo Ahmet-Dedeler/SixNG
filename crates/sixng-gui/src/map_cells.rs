@@ -113,7 +113,11 @@ pub struct Cells {
 /// Static [near, far) range of a placement (m, default LOD scale): the
 /// per-placement LOD rules of map3d with every model loaded. None when it
 /// is never drawn with default settings.
-fn static_range(data: &MapData, cs: &[u32], d: &Detail, i: usize) -> Option<(f32, f32)> {
+/// Range [lo, hi) of placement `i` at the default LOD scale, and, for a
+/// coverage fallback (unlinked LOD, or LOD whose children all lack a model),
+/// the nearest distance it fills in at (it draws as a fallback from there to
+/// `lo`).
+fn static_range(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, i: usize) -> Option<(f32, f32, Option<f32>)> {
     let n = data.ents.len();
     let k = d.radii[0] / 330.0;
     let rn: Vec<f32> = d.radii.iter().map(|r| r / k).collect();
@@ -139,7 +143,8 @@ fn static_range(data: &MapData, cs: &[u32], d: &Detail, i: usize) -> Option<(f32
     let rad = rad_of(e);
     let has_parent = (e.parent as usize) < n;
     let has_children = cs[i] < cs[i + 1];
-    let (lo, mut hi) = if has_parent || has_children {
+    let mut fb: Option<f32> = None;
+    let (mut lo, mut hi) = if has_parent || has_children {
         let mut lim = outer(e, rad);
         if has_parent {
             let p = &data.ents[e.parent as usize];
@@ -153,12 +158,20 @@ fn static_range(data: &MapData, cs: &[u32], d: &Detail, i: usize) -> Option<(f32
             }
         }
         let lo = if has_children && e.child_lod_dist > 0.0 { e.child_lod_dist } else { 0.0 };
+        if lo > 0.0 && !cl[cs[i] as usize..cs[i + 1] as usize].iter().any(|&c| drawable(&data.ents[c as usize])) {
+            fb = Some(0.0);
+        }
         (lo, lim)
     } else {
+        let (lo, hi) = band(e, rad);
         if d.hd_fallback && e.lod == 1 {
+            // the large HD placements stand in for this level
             return None;
         }
-        band(e, rad)
+        if e.lod >= 1 {
+            fb = Some(0.0);
+        }
+        (lo, hi)
     };
     // screen-size cut
     if d.min_size > 0.0 {
@@ -172,21 +185,29 @@ fn static_range(data: &MapData, cs: &[u32], d: &Detail, i: usize) -> Option<(f32
     if dens < 1.0 && (map3d::hash32(i as u32) as f32 / u32::MAX as f32) > dens {
         return None;
     }
-    (lo < hi).then_some((lo, hi))
+    if let Some(f) = fb {
+        lo = lo.max(0.0);
+        return (hi > f).then_some((lo, hi, fb));
+    }
+    (lo < hi).then_some((lo, hi, None))
 }
+
+/// Cell format prefix of the cache directories (older ones are deleted).
+const TAG_FORMAT: &str = "v7_";
 
 fn tag_of(d: &Detail) -> String {
-    format!("v4_{:.0}_{:.4}_{:.2}_{:.2}_{}", d.radii[0], d.min_size, d.prop_density, d.veg_density, d.hd_fallback as u8)
+    format!("{TAG_FORMAT}{:.0}_{:.4}_{:.2}_{:.2}_{}", d.radii[0], d.min_size, d.prop_density, d.veg_density, d.hd_fallback as u8)
 }
 
-fn build_index(data: &MapData, cs: &[u32], d: &Detail, tag: String) -> Index {
+fn build_index(data: &MapData, cs: &[u32], cl: &[u32], d: &Detail, tag: String) -> Index {
     let t0 = Instant::now();
     let k = d.radii[0] / 330.0;
     // placements that can never be outside the near ring when drawn stay per placement
     let near_n = NEAR * 0.85 * 330.0;
     let mut by_cell: HashMap<CellKey, (Vec<u32>, f32, f32)> = HashMap::new();
     for i in 0..data.ents.len() {
-        let Some((lo, hi)) = static_range(data, cs, d, i) else { continue };
+        let Some((lo, hi, fb)) = static_range(data, cs, cl, d, i) else { continue };
+        let lo = fb.unwrap_or(lo);
         if hi <= near_n {
             continue;
         }
@@ -208,13 +229,13 @@ fn build_index(data: &MapData, cs: &[u32], d: &Detail, tag: String) -> Index {
             .map(|&i| {
                 ent_cell[i as usize] = cells.len() as u32;
                 let e = &data.ents[i as usize];
-                let (lo, hi) = static_range(data, cs, d, i as usize).unwrap();
+                let (lo, hi, fb) = static_range(data, cs, cl, d, i as usize).unwrap();
                 let (s, c) = e.yaw.sin_cos();
                 let lc = [(e.lo[0] + e.hi[0]) * 0.5, (e.lo[1] + e.hi[1]) * 0.5, (e.lo[2] + e.hi[2]) * 0.5];
                 let ctr = [e.pos[0] + lc[0] * c - lc[1] * s, e.pos[1] + lc[0] * s + lc[1] * c, e.pos[2] + lc[2]];
                 // about two pixels (1/500 of the distance) where the cell first draws it
-                let grid = (lo * k).max(NEAR * 0.85 * d.radii[0]) * 0.002;
-                CellEnt { model: data.name(e.model).to_string(), pos: e.pos, yaw: e.yaw, ctr, lo, hi, grid }
+                let grid = (fb.unwrap_or(lo) * k).max(NEAR * 0.85 * d.radii[0]) * 0.002;
+                CellEnt { model: data.name(e.model).to_string(), pos: e.pos, yaw: e.yaw, ctr, lo, hi, grid, fb }
             })
             .collect();
         cells.push(Info { key, ents: Arc::new(ents), lo, hi });
@@ -281,6 +302,16 @@ impl Cells {
                         }
                     }
                     n
+                }
+                // cells of an older format are never read again: drop them so
+                // they do not hold the cap
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.filter_map(|e| e.ok()) {
+                        let name = e.file_name().to_string_lossy().to_string();
+                        if e.path().is_dir() && !name.starts_with(TAG_FORMAT) {
+                            let _ = std::fs::remove_dir_all(e.path());
+                        }
+                    }
                 }
                 let mut files = HashSet::new();
                 cells::CELL_BYTES.store(walk(&dir, &mut files), Ordering::Relaxed);
@@ -377,7 +408,7 @@ impl Cells {
     }
 
     /// Make sure the index matches the detail setting (built on a thread).
-    fn ensure_index(&mut self, data: &Arc<MapData>, cs: &Arc<Vec<u32>>, d: &Detail) -> bool {
+    fn ensure_index(&mut self, data: &Arc<MapData>, cs: &Arc<(Vec<u32>, Vec<u32>)>, d: &Detail) -> bool {
         let tag = tag_of(d);
         if let Some((t, rx)) = &self.building {
             if let Ok(ix) = rx.try_recv() {
@@ -397,7 +428,7 @@ impl Cells {
             let (tx, rx) = mpsc::channel();
             let (data, cs, d, t) = (data.clone(), cs.clone(), d.clone(), tag.clone());
             std::thread::spawn(move || {
-                let _ = tx.send(build_index(&data, &cs, &d, t));
+                let _ = tx.send(build_index(&data, &cs.0, &cs.1, &d, t));
             });
             self.building = Some((tag, rx));
         }
@@ -425,7 +456,7 @@ impl Cells {
     /// While the camera `moving`, HD cells not on disk yet are not built
     /// (they are the heavy ones: building them would slow the streaming of
     /// the models the camera is flying into).
-    pub fn update(&mut self, data: &Arc<MapData>, cs: &Arc<Vec<u32>>, d: &Detail, work: &str, eye: [f32; 3], moving: bool, seen: &dyn Fn([f32; 4]) -> bool) {
+    pub fn update(&mut self, data: &Arc<MapData>, cs: &Arc<(Vec<u32>, Vec<u32>)>, d: &Detail, work: &str, eye: [f32; 3], moving: bool, seen: &dyn Fn([f32; 4]) -> bool) {
         if !self.on || !self.ensure_index(data, cs, d) {
             self.state.clear();
             self.drawn.clear();

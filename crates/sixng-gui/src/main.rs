@@ -184,7 +184,7 @@ fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
         let base = c.device_descriptor.clone();
         c.device_descriptor = std::sync::Arc::new(move |adapter| {
             let mut d = base(adapter);
-            d.required_features |= adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
+            d.required_features |= adapter.features() & (wgpu::Features::TEXTURE_COMPRESSION_BC | wgpu::Features::DEPTH32FLOAT_STENCIL8);
             // smaller device-memory blocks: the 3D map frees and allocates
             // many buffers and textures of mixed sizes while it streams
             d.memory_hints = wgpu::MemoryHints::MemoryUsage;

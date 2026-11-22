@@ -503,7 +503,8 @@ impl World {
             self.shared.inflight.lock().unwrap().remove(&k);
             any = true;
             let tex = m.images.first().map(|i| i.key.clone()).unwrap_or_default();
-            let gm = ren.upload_shared(rs, &m, &[], Some(&mut self.tex_cache));
+            let mut gm = ren.upload_shared(rs, &m, &[], Some(&mut self.tex_cache));
+            gm.stencil = 0; // far field: coverage fallbacks may draw over it
             if !tex.is_empty() && self.tex_cache.contains_key(&tex) {
                 *self.tex_refs.entry(tex.clone()).or_insert(0) += 1;
                 self.tex_keys.lock().unwrap().insert(tex.clone());
@@ -566,7 +567,10 @@ impl World {
             let fy = (r[1] - er[1]).abs().max((r[3] - er[1]).abs());
             let far = (fx * fx + fy * fy).sqrt();
             let err_px = k.cell() / near * k_px;
-            let straddles = near < v.ground_r && far > v.ground_r;
+            // the ground/roof boundary is followed closely only where a node
+            // is still large on screen (a long boundary far away would need
+            // more nodes than the budget)
+            let straddles = near < v.ground_r && far > v.ground_r && k.span() / near * k_px > 48.0;
             // below the data level only the ground/roof boundary splits further
             let split = (k.l < DATA_LEVEL && err_px > v.tau) || (k.l < MAX_LEVEL && straddles && k.l >= 4);
             let prio = near / k.span();
@@ -644,7 +648,9 @@ impl World {
     /// The selected nodes plus a sea plane to the horizon.
     pub fn models(&mut self, rs: &egui_wgpu::RenderState, ren: &Renderer3D) -> Vec<&GpuModel> {
         if self.ocean.is_none() {
-            self.ocean = Some(ren.upload(rs, &ocean_model(), &[]));
+            let mut o = ren.upload(rs, &ocean_model(), &[]);
+            o.stencil = 0;
+            self.ocean = Some(o);
         }
         let mut v: Vec<&GpuModel> = self.ocean.iter().collect();
         for k in &self.selected {

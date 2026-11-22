@@ -162,6 +162,8 @@ pub struct Auto {
     fly_end: Option<Instant>,
     /// Slowest fly frames: (ms, [ui total, stream, update, upload, apply, terrain, render cpu, draws]).
     fly_slow: Vec<(f32, [f32; 11])>,
+    /// Last timed snapshot taken (s after open).
+    snap_done: f32,
 }
 
 /// Timings for the perf log (open time, frame times).
@@ -300,7 +302,8 @@ pub struct Map3D {
     slow_uploads: Vec<(f32, f32, f32, usize, usize, usize, usize, usize)>,
     /// Placements beyond the near ring, merged per area (map_cells).
     cells: crate::map_cells::Cells,
-    children_arc: Arc<Vec<u32>>,
+    /// (children_start, children_list) for the cell index thread.
+    children_arc: Arc<(Vec<u32>, Vec<u32>)>,
 }
 
 /// Seconds of camera motion to load ahead, and the cap on that distance (m).
@@ -331,6 +334,9 @@ struct VisAcc {
     pend: HashMap<u32, u32>,
     /// Placements drawn by their cell.
     in_cells: usize,
+    n_fb: usize,
+    /// Fallbacks per LOD level, unlinked then linked (debug).
+    fb_lvl: [[u32; 6]; 2],
 }
 
 impl VisAcc {
@@ -363,6 +369,12 @@ impl VisAcc {
             *a.pend.entry(c).or_insert(0) += n;
         }
         a.in_cells += b.in_cells;
+        a.n_fb += b.n_fb;
+        for r in 0..2 {
+            for l in 0..6 {
+                a.fb_lvl[r][l] += b.fb_lvl[r][l];
+            }
+        }
         a
     }
 }
@@ -403,6 +415,8 @@ struct Stats {
     evict_ms: f32,
     /// Placements drawn by map cells.
     in_cells: usize,
+    n_fb: usize,
+    fb_lvl: [[u32; 6]; 2],
 }
 
 impl Map3D {
@@ -441,7 +455,7 @@ impl Map3D {
             kinds: [true; 6],
             lods: [true; 6],
             speed: 1.0,
-            auto: Auto { screenshot: None, exit: false, frames: 0, quiet_frames: 0, ui_shot: None, started: None, picks: Vec::new(), fly: Vec::new(), fly_from: None, fly_leg: 0, fly_done: false, fly_ms: Vec::new(), fly_holes: Vec::new(), fly_end: None, fly_slow: Vec::new() },
+            auto: Auto { screenshot: None, exit: false, frames: 0, quiet_frames: 0, ui_shot: None, started: None, picks: Vec::new(), fly: Vec::new(), fly_from: None, fly_leg: 0, fly_done: false, fly_ms: Vec::new(), fly_holes: Vec::new(), fly_end: None, fly_slow: Vec::new(), snap_done: 0.0 },
             open_model: None,
             status: String::new(),
             renderer: None,
@@ -500,7 +514,7 @@ impl Map3D {
             gpu_cap: None,
             gpu_real: (0, 0),
             cells: crate::map_cells::Cells::new(),
-            children_arc: Arc::new(Vec::new()),
+            children_arc: Arc::new((Vec::new(), Vec::new())),
         };
         m.set_quality(2);
         m
@@ -715,7 +729,7 @@ impl Map3D {
         buckets.sort_by_key(|b| (b.level, b.dist, b.size));
         eprintln!("[map3d] {} entity buckets in {:.0} ms", buckets.len(), t0.elapsed().as_secs_f32() * 1000.0);
         self.buckets = buckets;
-        self.children_arc = Arc::new(count.clone());
+        self.children_arc = Arc::new((count.clone(), list.clone()));
         self.children_start = count;
         self.children_list = list;
     }
@@ -810,7 +824,9 @@ impl Map3D {
             bld_ready.get(&c).is_some_and(|&(w, l)| l < w)
         };
         // 0 = in range, 1 = out of range, 2 = replaced (by its loaded parent
-        // or children, or a skipped level)
+        // or children, or a skipped level), 3 = coverage fallback (a LOD
+        // nearer than its range with nothing finer to replace it: drawn only
+        // on pixels no real surface covers)
         let range = |i: u32, e: &EntRec, rad: f32, dist: f32, o: [f32; 3]| -> u8 {
             let l = e.lod.min(5) as usize;
             // a little hysteresis for what is on screen now
@@ -842,7 +858,11 @@ impl Map3D {
                 }
                 if has_children && e.child_lod_dist > 0.0 && dist < e.child_lod_dist * k {
                     // hand over only when every drawable child is loaded
-                    let all = cl[cs[i as usize] as usize..cs[i as usize + 1] as usize].iter().all(|&c| {
+                    let kids = &cl[cs[i as usize] as usize..cs[i as usize + 1] as usize];
+                    if !kids.iter().any(|&c| drawable(&data.ents[c as usize])) {
+                        return 3;
+                    }
+                    let all = kids.iter().all(|&c| {
                         let ce = &data.ents[c as usize];
                         !drawable(ce) || cache.contains_key(&ce.model) || by_cell(c)
                     });
@@ -852,12 +872,18 @@ impl Map3D {
                 }
                 0
             } else {
+                let (lo_r, hi_r) = band(e, rad);
+                if dist >= hi_r * hy {
+                    return 1;
+                }
                 if d.hd_fallback && l == 1 {
+                    // the large HD placements stand in for this level (LOD
+                    // placements are many: as fallbacks they cost more
+                    // draws than they fill)
                     return 2;
                 }
-                let (lo_r, hi_r) = band(e, rad);
-                if dist >= hi_r * hy || dist < lo_r / hy {
-                    return 1;
+                if dist < lo_r / hy {
+                    return if l >= 1 { 3 } else { 1 };
                 }
                 0
             }
@@ -882,8 +908,10 @@ impl Map3D {
             let dist = dist_from(e, eye);
             let mut draw = true;
             let mut dd = dist;
+            let mut fb = false;
             match range(i, e, rad, dist, eye) {
                 0 => {}
+                3 => fb = true,
                 2 => {
                     acc.handoffs += 1;
                     return;
@@ -894,7 +922,7 @@ impl Map3D {
                     } else if look_ahead {
                         // not in range here: load it if it is where we are heading
                         let da = dist_from(e, eye_a);
-                        if range(i, e, rad, da, eye_a) != 0 {
+                        if !matches!(range(i, e, rad, da, eye_a), 0 | 3) {
                             return;
                         }
                         draw = false;
@@ -939,7 +967,13 @@ impl Map3D {
             acc.n_ent += 1;
             acc.per_band[l] += 1;
             let m = Mat4::from_translation(gl(e.pos)) * Mat4::from_rotation_y(e.yaw);
-            acc.want.entry(e.model).or_default().push(Instance::new(m, false));
+            let inst = Instance::new(m, false);
+            acc.want.entry(e.model).or_default().push(if fb { inst.fallback() } else { inst });
+            if fb {
+                acc.n_fb += 1;
+                let linked = (e.parent != u32::MAX || cs[i as usize] < cs[i as usize + 1]) as usize;
+                acc.fb_lvl[linked][l] += 1;
+            }
             acc.visible.push((i, e.model));
         };
         // one task per (bucket, grid row) of the query box around both eyes
@@ -965,11 +999,13 @@ impl Map3D {
             })
             .reduce(VisAcc::default, VisAcc::merge);
         self.stats.upd_parts[0] = t0.elapsed().as_secs_f32() * 1000.0;
-        let VisAcc { want, prio, near, visible, per_band, n_ent, keep, visited, handoffs, hidden, grace, pend, in_cells } = acc;
+        let VisAcc { want, prio, near, visible, per_band, n_ent, keep, visited, handoffs, hidden, grace, pend, in_cells, n_fb, fb_lvl } = acc;
         if self.cells.after_pass(&pend) {
             self.dirty_next = true;
         }
         self.stats.in_cells = in_cells;
+        self.stats.n_fb = n_fb;
+        self.stats.fb_lvl = fb_lvl;
         // grace clocks: start for new ones, forget the rest
         let now = Instant::now();
         let mut retire_new = HashMap::with_capacity(grace.len());
@@ -1351,6 +1387,22 @@ impl Map3D {
                 // prefer small boxes on ties (a prop on a ground tile)
                 let vol = (e.hi[0] - e.lo[0]) * (e.hi[1] - e.lo[1]) * (e.hi[2] - e.lo[2]);
                 let key = t0 + vol.cbrt() * 0.05;
+                if std::env::var_os("SIXNG_PICK_ALL").is_some() && t0 < 600.0 {
+                    let hidden = match self.cache.get(&e.model) {
+                        Some(Slot::Ready { gm, .. }) => gm.mat_summary().iter().filter(|l| l.contains("alpha 1") && l.ends_with(", 0.0]")).count().to_string() + "/" + &gm.mat_summary().len().to_string(),
+                        _ => "not loaded".into(),
+                    };
+                    eprintln!("  hit t {:.0} ent {} {} model {} lod {} kind {} hidden mats {}", t0, i, data.name(e.name), data.name(e.model), e.lod, e.kind, hidden);
+                    if let Some(Slot::Ready { gm, tex, .. }) = self.cache.get(&e.model) {
+                        eprintln!("    tex cap {tex}, cell use {}", self.cells.view().use_of(i));
+                        for (k, l) in gm.mat_summary().iter().enumerate() {
+                            let n: u32 = gm.meshes.iter().filter(|m| m.material == k).map(|m| m.n_idx / 3).sum();
+                            if n > 0 {
+                                eprintln!("    {n} tris: {l}");
+                            }
+                        }
+                    }
+                }
                 if best.map_or(true, |b| key < b.0) {
                     best = Some((key, i));
                 }
@@ -1601,6 +1653,7 @@ impl Map3D {
         ren.decal_bias = self.decal_bias;
         ren.cells = cell_list;
         ren.lod_k = lod_k;
+        ren.map_glass = true;
         let tr = Instant::now();
         let tid = ren.render(rs, px, &self.cam, &look, &models, &under, &top);
         self.stats.render_ms = tr.elapsed().as_secs_f32() * 1000.0;
@@ -1675,16 +1728,18 @@ impl Map3D {
 
     fn ground_radius(&self) -> f32 {
         // out to here the far field lies flat under the streamed buildings
-        // (the HD band of large buildings); beyond it shows them as blocks
-        let d = &self.detail;
-        if d.hd_fallback { d.radii[1].min(d.radii[0] * 1.75).max(d.radii[0]) } else { d.radii[0] }
+        // and their LODs (every level up to the last-but-one band is drawn,
+        // with coverage fallbacks near the camera); beyond it shows them as
+        // blocks. Areas whose buildings are still loading keep the blocks.
+        self.detail.radii[4]
     }
 
     fn update_building_readiness(&mut self, data: &MapData) {
         let mut m: HashMap<(i32, i32), (u32, u32)> = HashMap::new();
         for &(i, model) in &self.visible {
             let e = &data.ents[i as usize];
-            if e.kind != 1 {
+            // buildings and building LODs
+            if e.kind != 1 && e.kind != 4 {
                 continue;
             }
             let k = (((e.pos[0] - crate::mapbake::X0) / 128.0).floor() as i32, ((crate::mapbake::Y1 - e.pos[1]) / 128.0).floor() as i32);
@@ -2013,7 +2068,7 @@ impl Map3D {
                     format!("{} {} {}", r[0].swap(0, Ordering::Relaxed) / n, r[1].swap(0, Ordering::Relaxed) / n, r[2].swap(0, Ordering::Relaxed) / n).replace(' ', "|")
                 }
             );
-            let line = format!("{line} | draws {} | {} ({} placements)", self.stats.draws, self.cells.summary(), self.stats.in_cells);
+            let line = format!("{line} | draws {} | {} ({} placements) | {} fallbacks ({:?} draws, by level unlinked/linked {:?}) | wait: terrain idle {}, keep missing {}, inflight {}", self.stats.draws, self.cells.summary(), self.stats.in_cells, self.stats.n_fb, self.renderer.as_ref().map_or([0, 0], |r| r.fb_draws), self.stats.fb_lvl, self.world.idle(), self.keep.iter().filter(|m| !self.cache.contains_key(m)).count(), self.stats.inflight);
             eprintln!("{line}");
         }
         if self.perf.near_s.is_none() && self.frame > 5 && !self.want.is_empty() && self.want.keys().all(|m| self.near_dist.get(m).map_or(true, |&d| d >= 250.0) || self.cache.contains_key(m)) {
@@ -2021,6 +2076,19 @@ impl Map3D {
         }
         if self.perf.coarse_s.is_none() && self.frame > 5 && self.stats.queued <= self.stats.upgrades && !self.keep.is_empty() && self.keep.iter().all(|m| self.cache.contains_key(m)) {
             self.perf.coarse_s = self.perf.t_open.map(|t| t.elapsed().as_secs_f32());
+        }
+        // automation: frames saved at set times after open (SIXNG_MAP_SNAPS="2,4,8" seconds)
+        if let (Some(path), Some(t_open)) = (self.auto.screenshot.clone(), self.perf.t_open) {
+            let el = t_open.elapsed().as_secs_f32();
+            let due = std::env::var("SIXNG_MAP_SNAPS").ok().and_then(|v| v.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).filter(|&t| t <= el && t > self.auto.snap_done).fold(None, |a: Option<f32>, t| Some(a.map_or(t, |a| a.max(t)))));
+            if let Some(t) = due {
+                self.auto.snap_done = t;
+                if let Some((w, h, px)) = self.renderer.as_ref().and_then(|r| r.read_back(rs)) {
+                    let p = path.with_file_name(format!("{}_t{:03}.png", path.file_stem().unwrap_or_default().to_string_lossy(), t as u32));
+                    let _ = render3d::save_png(&p, w, h, &px);
+                    eprintln!("[map3d] snap {} at {:.1} s, eye {:?}", p.display(), el, rage(self.cam.eye()));
+                }
+            }
         }
         if let Some(path) = self.auto.screenshot.clone() {
             self.auto.frames += 1;
@@ -2097,8 +2165,73 @@ impl Map3D {
                             Some(i) => {
                                 let e = &data.ents[i as usize];
                                 eprintln!("pick {:.2},{:.2}: {} model {} at {:.0},{:.0},{:.0}", f[0], f[1], data.name(e.name), data.name(e.model), e.pos[0], e.pos[1], e.pos[2]);
+                                if let Some(Slot::Ready { gm, .. }) = self.cache.get(&e.model) {
+                                    for l in gm.mat_summary() {
+                                        eprintln!("    mat {l}");
+                                    }
+                                }
                             }
                             None => eprintln!("pick {:.2},{:.2}: nothing", f[0], f[1]),
+                        }
+                        // what covers the ground there, and why it is or is not drawn
+                        let (ro, rd) = (rage(self.cam.eye()), rage((b - a).normalize()));
+                        // every placement whose box the ray crosses (drawn or not)
+                        let vis_all: HashSet<u32> = self.visible.iter().map(|v| v.0).collect();
+                        for (i, e) in data.ents.iter().enumerate() {
+                            let (sn, cs) = (-e.yaw).sin_cos();
+                            let (px, py) = (ro[0] - e.pos[0], ro[1] - e.pos[1]);
+                            let lo = [px * cs - py * sn, px * sn + py * cs, ro[2] - e.pos[2]];
+                            let ld = [rd[0] * cs - rd[1] * sn, rd[0] * sn + rd[1] * cs, rd[2]];
+                            let (mut t0, mut t1) = (0.0f32, 1500.0f32);
+                            for k in 0..3 {
+                                if ld[k].abs() < 1e-9 {
+                                    if lo[k] < e.lo[k] || lo[k] > e.hi[k] { t0 = 1e9; }
+                                } else {
+                                    let (p, q) = ((e.lo[k] - lo[k]) / ld[k], (e.hi[k] - lo[k]) / ld[k]);
+                                    t0 = t0.max(p.min(q));
+                                    t1 = t1.min(p.max(q));
+                                }
+                            }
+                            if t0 > t1 || e.lod > 1 {
+                                continue;
+                            }
+                            let st = match self.cache.get(&e.model) {
+                                Some(Slot::Ready { .. }) => "ready".to_string(),
+                                Some(Slot::Failed(m)) => format!("FAILED {}", m.chars().take(120).collect::<String>()),
+                                None => "not loaded".to_string(),
+                            };
+                            eprintln!("  ray t {:.0} ent {i} {} model '{}' lod {} kind {} rflags {:#x} drawn {} {}", t0, data.name(e.name), data.name(e.model), e.lod, e.kind, e.rflags, vis_all.contains(&(i as u32)), st);
+                        }
+                        let mut t = 1.0f32;
+                        let mut hit = None;
+                        while t < 20000.0 {
+                            let q = [ro[0] + rd[0] * t, ro[1] + rd[1] * t, ro[2] + rd[2] * t];
+                            if q[2] <= data.height(q[0], q[1]).unwrap_or(0.0) {
+                                hit = Some(q);
+                                break;
+                            }
+                            t += 2.0;
+                        }
+                        if let Some(q) = hit {
+                            let eye = rage(self.cam.eye());
+                            let vis: HashSet<u32> = self.visible.iter().map(|v| v.0).collect();
+                            eprintln!("  ground {:.0},{:.0},{:.0} ({:.0} m away)", q[0], q[1], q[2], t);
+                            for (i, e) in data.ents.iter().enumerate() {
+                                let (sn, cs) = (-e.yaw).sin_cos();
+                                let (px, py) = (q[0] - e.pos[0], q[1] - e.pos[1]);
+                                let l = [px * cs - py * sn, px * sn + py * cs];
+                                if l[0] < e.lo[0] - 1.0 || l[0] > e.hi[0] + 1.0 || l[1] < e.lo[1] - 1.0 || l[1] > e.hi[1] + 1.0 {
+                                    continue;
+                                }
+                                let rad = 0.5 * ((e.hi[0] - e.lo[0]).powi(2) + (e.hi[1] - e.lo[1]).powi(2) + (e.hi[2] - e.lo[2]).powi(2)).sqrt();
+                                if rad > 3000.0 {
+                                    continue;
+                                }
+                                let d = ((e.pos[0] - eye[0]).powi(2) + (e.pos[1] - eye[1]).powi(2) + (e.pos[2] - eye[2]).powi(2)).sqrt();
+                                let ready = matches!(self.cache.get(&e.model), Some(Slot::Ready { .. }));
+                                let failed = match self.cache.get(&e.model) { Some(Slot::Failed(m)) => m.chars().take(60).collect::<String>(), _ => String::new() };
+                                eprintln!("    ent {i} {} model {} lod {} kind {} rflags {} rad {:.0} dist {:.0} lod_dist {:.0} cld {:.0} parent {} children {} | drawn {} ready {} cell {} {}", data.name(e.name), data.name(e.model), e.lod, e.kind, e.rflags, rad, d, e.lod_dist, e.child_lod_dist, if e.parent == u32::MAX { -1 } else { e.parent as i64 }, self.children_start.get(i + 1).zip(self.children_start.get(i)).map_or(0, |(a, b)| a - b), vis.contains(&(i as u32)), ready, self.cells.view().use_of(i as u32), failed);
+                            }
                         }
                     }
                 }
@@ -2184,7 +2317,7 @@ impl Map3D {
             glb::TEX_T[3].load(Ordering::Relaxed) as f32 / 1024.0 / glb::TEX_T[1].load(Ordering::Relaxed).max(1) as f32,
             glb::TEX_T[4].load(Ordering::Relaxed) as f32 / 1000.0 / LOAD_T[3].load(Ordering::Relaxed).max(1) as f32
         );
-        let line = format!("{line} | {} ({} placements)", self.cells.summary(), self.stats.in_cells);
+        let line = format!("{line} | {} ({} placements) | {} fallbacks", self.cells.summary(), self.stats.in_cells, self.stats.n_fb);
         eprintln!("{line}");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(Path::new(&self.work).join("map3d_perf.log")) {
             use std::io::Write;

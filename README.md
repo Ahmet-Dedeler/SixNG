@@ -497,17 +497,31 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   large HD models stay visible out to 1.75× the HD distance and the LOD
   level is skipped. SLOD placements mostly carry a placeholder unit-cube
   bbox, so they are never culled by screen size.
+- **Coverage fallbacks** (no holes near the camera): a SLOD placement (or
+  a LOD with HD fallback off) with nothing finer to hand over to (no LOD
+  link, or children that all lack a model) keeps drawing nearer than its
+  own band, but only on pixels no real surface has covered. Real surfaces write a stencil
+  mark as they draw; the fallbacks draw after them and only where the
+  mark is missing (far-field terrain, ocean or sky), with back faces
+  culled so a coarse block the camera is inside stays invisible. Before,
+  such areas showed flat far-field terrain next to the camera while the
+  same LODs farther away were drawn. Needs the 32-bit depth + stencil
+  format (most desktop GPUs); without it the fallbacks draw plainly.
+- **Building glass**: glazing materials carry only a light dirt texture
+  (the game adds reflections and interiors behind them), so on the map
+  they are drawn as dark, mostly opaque reflective glass; the model viewer
+  keeps the see-through look.
 - **Whole-map terrain** (far field): the whole map is always drawn, out to
   the horizon, as a quadtree of tiles over the baked 8 m top-surface
   heights, coloured with the 2D map's terrain tiles (coarse tiles for
   coarse nodes, so the colour sharpens as nodes refine). Nodes refine by
   screen-space error (**terrain error**, px) and frustum; children replace
   a parent only once all four are loaded, so nothing pops out. Beyond the
-  HD building range the tiles keep the roofs (max-pooled heights), so
-  buildings without a loaded model show as blocks instead of a void; near
-  the camera a tile switches to ground heights (a morphological opening
-  that removes buildings) once at least 90 % of the building models on it
-  have loaded. Built in the background from the map data already in
+  SLOD3 band the tiles keep the roofs (max-pooled heights), so buildings
+  show as blocks instead of a void; nearer, where buildings or their LODs
+  are drawn, a tile switches to ground heights (a morphological opening
+  that removes buildings) once at least 90 % of the building and LOD
+  models on it have loaded, so coarse blocks do not swallow the LODs. Built in the background from the map data already in
   memory (about 0.3 s); no extra bake. A sea plane fills the rest.
 - Overlays: roads (by speed) and exterior lights (by hour) as lines; a
   draggable **Minimap** window (click to move there) and a **Stream**

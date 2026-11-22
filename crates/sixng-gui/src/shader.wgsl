@@ -181,6 +181,14 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     } else if (cls == 5u || cls == 6u) {
         rough = 0.04; metal = 0.0;
         alpha = min(alpha, 0.45);
+        if (F.misc3.z > 0.5) {
+            // map: building glass reads as dark reflective glass (the
+            // game's reflections and interiors behind it are not drawn; the
+            // texture is only a light dirt layer, so pale and see-through
+            // otherwise)
+            albedo = albedo * 0.12 + vec3(0.025, 0.03, 0.04);
+            alpha = 0.9;
+        }
     } else if (cls == 8u) {
         albedo = vec3(0.04, 0.12, 0.16); rough = 0.05; alpha = 0.7;
     } else if (cls == 7u) {
@@ -355,13 +363,29 @@ struct COut {
 
 @vertex
 fn vs_cell(v: CIn) -> COut {
+    return cell_vert(v, false);
+}
+
+// Coverage fallbacks: placements flagged in table slot 5 also draw nearer
+// than their own range (no finer LOD replaces them); the pipeline's stencil
+// test keeps them to pixels no real surface covers.
+@vertex
+fn vs_cell_fb(v: CIn) -> COut {
+    return cell_vert(v, true);
+}
+
+fn cell_vert(v: CIn, fb: bool) -> COut {
     var o: COut;
     let w = v.pos + v.origin.xyz;
     let e0 = CE[v.le.y * 2u];
     let e1 = CE[v.le.y * 2u + 1u];
     let d = distance(e0.xyz + v.origin.xyz, F.cam_pos.xyz);
     let k = F.misc3.y;
-    if (d < e0.w * k || d >= e1.x * k) {
+    var cull = d < e0.w * k || d >= e1.x * k;
+    if (fb) {
+        cull = e1.y < 0.5 || d >= min(e0.w, e1.x) * k || d < e1.z * k;
+    }
+    if (cull) {
         // outside the placement's range: every vertex of it lands outside
         // the clip volume, so its triangles are culled
         o.clip = vec4(2.0, 2.0, 2.0, 1.0);
@@ -395,6 +419,11 @@ fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
     if (cls == 5u || cls == 6u) {
         rough = 0.04;
         alpha = min(alpha, 0.45);
+        if (F.misc3.z > 0.5) {
+            // dark reflective building glass (see fs_mesh)
+            albedo = albedo * 0.12 + vec3(0.025, 0.03, 0.04);
+            alpha = 0.9;
+        }
     } else if (cls == 8u) {
         albedo = vec3(0.04, 0.12, 0.16); rough = 0.05; alpha = 0.7;
     } else if (cls == 7u) {

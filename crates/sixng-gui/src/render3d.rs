@@ -11,6 +11,10 @@ use wgpu::util::DeviceExt;
 
 pub const COLOR_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 pub const DEPTH_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+/// Depth with stencil (needs the DEPTH32FLOAT_STENCIL8 feature): the stencil
+/// marks pixels covered by a real surface, so coarse fallback LODs fill only
+/// the pixels nothing else covers.
+pub const DEPTH_STENCIL_FMT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32FloatStencil8;
 pub const MSAA: u32 = 4;
 
 #[repr(C)]
@@ -49,6 +53,15 @@ pub struct Instance {
 impl Instance {
     pub fn new(m: Mat4, skinned: bool) -> Self {
         Instance { m: m.to_cols_array_2d(), extra: [if skinned { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0] }
+    }
+    /// A coverage fallback: a coarse LOD drawn near the camera only where no
+    /// real surface covers the pixel (extra.w = 1).
+    pub fn fallback(mut self) -> Self {
+        self.extra[3] = 1.0;
+        self
+    }
+    pub fn is_fallback(&self) -> bool {
+        self.extra[3] > 0.5
     }
 }
 
@@ -273,8 +286,27 @@ pub struct GpuModel {
     pub frame_bg: wgpu::BindGroup,
     pub instances: wgpu::Buffer,
     pub n_instances: u32,
+    /// The last `n_fb` instances are coverage fallbacks (see `Instance::fallback`).
+    pub n_fb: u32,
     pub instance_cap: u32,
     pub bbox: [Vec3; 2],
+    /// Stencil value its opaque surfaces write: 1 = real surface, 0 = far
+    /// field (terrain, ocean), which coverage fallbacks may draw over.
+    pub stencil: u32,
+    /// Material names and shaders (inspection).
+    pub mat_names: Vec<String>,
+}
+
+impl GpuModel {
+    /// One line per material: name, class, alpha mode, texture bits, base factor.
+    pub fn mat_summary(&self) -> Vec<String> {
+        self.mat_cpu.iter().enumerate().map(|(k, u)| format!("{} class {} alpha {} has {:#x} base {:?}", self.mat_names.get(k).map(|s| s.as_str()).unwrap_or("?"), u.flags[1], u.flags[2], u.flags[0], u.base)).collect()
+    }
+
+    /// Instances drawn normally (the fallbacks come after them).
+    pub fn n_normal(&self) -> u32 {
+        self.n_instances - self.n_fb.min(self.n_instances)
+    }
 }
 
 /// Spacing of the material uniforms in a model's buffer (the uniform offset alignment).
@@ -334,11 +366,20 @@ pub struct Renderer3D {
     pub draws: u32,
     /// Map cells: opaque, decal, decal blend, blend pipelines.
     pipe_cell: [wgpu::RenderPipeline; 4],
+    /// Coverage fallbacks (models, cells): depth-tested, drawn only where
+    /// the stencil is still 0. Without stencil support they draw plainly.
+    pipe_fb: wgpu::RenderPipeline,
+    pipe_cell_fb: wgpu::RenderPipeline,
+    depth_fmt: wgpu::TextureFormat,
     bgl_cell: wgpu::BindGroupLayout,
     /// Cells to draw this frame, each with the batches that are in range.
     pub cells: Vec<(std::sync::Arc<CellGpu>, Vec<u16>)>,
     /// LOD distance scale of the cell ranges (detail setting).
     pub lod_k: f32,
+    /// Map view: building glass drawn dark and mostly opaque (misc3.z).
+    pub map_glass: bool,
+    /// Draw calls of the coverage fallbacks in the last frame: models, cells.
+    pub fb_draws: [u32; 2],
 }
 
 /// A map cell on the GPU (see cells.rs).
@@ -352,6 +393,8 @@ pub struct CellGpu {
     pub batches: Vec<crate::cells::Batch>,
     pub groups: Vec<crate::cells::Group>,
     pub bytes: u64,
+    /// Any placement with a coverage-fallback range (table slot 5).
+    pub has_fb: bool,
 }
 
 
@@ -455,13 +498,31 @@ impl Renderer3D {
         let lattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4];
         let lbufs = [wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<LineV>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &lattrs }];
         let ms = wgpu::MultisampleState { count: MSAA, mask: !0, alpha_to_coverage_enabled: false };
-        let depth = |write: bool, cmp: wgpu::CompareFunction| Some(wgpu::DepthStencilState { format: DEPTH_FMT, depth_write_enabled: write, depth_compare: cmp, stencil: Default::default(), bias: Default::default() });
-        let mk = |label: &str, layout: &wgpu::PipelineLayout, vs: &str, fs: &str, bufs: &[wgpu::VertexBufferLayout], topo: wgpu::PrimitiveTopology, blend: Option<wgpu::BlendState>, ds: Option<wgpu::DepthStencilState>| {
+        let has_stencil = device.features().contains(wgpu::Features::DEPTH32FLOAT_STENCIL8);
+        let depth_fmt = if has_stencil { DEPTH_STENCIL_FMT } else { DEPTH_FMT };
+        let face = |compare: wgpu::CompareFunction, pass_op: wgpu::StencilOperation| wgpu::StencilFaceState { compare, fail_op: wgpu::StencilOperation::Keep, depth_fail_op: wgpu::StencilOperation::Keep, pass_op };
+        // opaque surfaces write their stencil reference where they pass the depth test
+        let st_write = if has_stencil {
+            let f = face(wgpu::CompareFunction::Always, wgpu::StencilOperation::Replace);
+            wgpu::StencilState { front: f, back: f, read_mask: 0xff, write_mask: 0xff }
+        } else {
+            Default::default()
+        };
+        // fallbacks: only where nothing real was drawn (stencil 0)
+        let st_fb = if has_stencil {
+            let f = face(wgpu::CompareFunction::Equal, wgpu::StencilOperation::Keep);
+            wgpu::StencilState { front: f, back: f, read_mask: 0xff, write_mask: 0 }
+        } else {
+            Default::default()
+        };
+        let depth = |write: bool, cmp: wgpu::CompareFunction| Some(wgpu::DepthStencilState { format: depth_fmt, depth_write_enabled: write, depth_compare: cmp, stencil: Default::default(), bias: Default::default() });
+        let depth_st = |st: &wgpu::StencilState| Some(wgpu::DepthStencilState { format: depth_fmt, depth_write_enabled: true, depth_compare: wgpu::CompareFunction::Greater, stencil: st.clone(), bias: Default::default() });
+        let mkp = |label: &str, layout: &wgpu::PipelineLayout, vs: &str, fs: &str, bufs: &[wgpu::VertexBufferLayout], topo: wgpu::PrimitiveTopology, blend: Option<wgpu::BlendState>, ds: Option<wgpu::DepthStencilState>, cull: Option<wgpu::Face>| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
                 vertex: wgpu::VertexState { module: &shader, entry_point: Some(vs), compilation_options: Default::default(), buffers: bufs },
-                primitive: wgpu::PrimitiveState { topology: topo, ..Default::default() },
+                primitive: wgpu::PrimitiveState { topology: topo, cull_mode: cull, ..Default::default() },
                 depth_stencil: ds,
                 multisample: ms,
                 fragment: Some(wgpu::FragmentState { module: &shader, entry_point: Some(fs), compilation_options: Default::default(), targets: &[Some(wgpu::ColorTargetState { format: COLOR_FMT, blend, write_mask: wgpu::ColorWrites::ALL })] }),
@@ -469,10 +530,13 @@ impl Renderer3D {
                 cache: None,
             })
         };
-        let pipe_opaque = mk("opaque", &layout, "vs_mesh", "fs_mesh", &vbufs, wgpu::PrimitiveTopology::TriangleList, None, depth(true, wgpu::CompareFunction::Greater));
+        let mk = |label: &str, layout: &wgpu::PipelineLayout, vs: &str, fs: &str, bufs: &[wgpu::VertexBufferLayout], topo: wgpu::PrimitiveTopology, blend: Option<wgpu::BlendState>, ds: Option<wgpu::DepthStencilState>| mkp(label, layout, vs, fs, bufs, topo, blend, ds, None);
+        let pipe_opaque = mk("opaque", &layout, "vs_mesh", "fs_mesh", &vbufs, wgpu::PrimitiveTopology::TriangleList, None, depth_st(&st_write));
+        // back faces culled: a coarse block the camera is inside stays invisible
+        let pipe_fb = mkp("fallback", &layout, "vs_mesh", "fs_mesh", &vbufs, wgpu::PrimitiveTopology::TriangleList, None, depth_st(&st_fb), Some(wgpu::Face::Back));
         let biased = |write: bool| {
             Some(wgpu::DepthStencilState {
-                format: DEPTH_FMT,
+                format: depth_fmt,
                 depth_write_enabled: write,
                 depth_compare: wgpu::CompareFunction::GreaterEqual,
                 stencil: Default::default(),
@@ -533,12 +597,13 @@ impl Renderer3D {
             wgpu::VertexBufferLayout { array_stride: 16, step_mode: wgpu::VertexStepMode::Instance, attributes: &ciattrs },
         ];
         let pipe_cell = [
-            mk("cell opaque", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, None, depth(true, wgpu::CompareFunction::Greater)),
+            mk("cell opaque", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, None, depth_st(&st_write)),
             mk("cell decal", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, None, biased(true)),
             mk("cell decal blend", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, Some(wgpu::BlendState::ALPHA_BLENDING), biased(false)),
             mk("cell blend", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, Some(wgpu::BlendState::ALPHA_BLENDING), depth(false, wgpu::CompareFunction::Greater)),
         ];
-        Renderer3D { pipe_opaque, pipe_blend, pipe_decal, pipe_decal_blend, decal_bias: true, pipe_wire, pipe_lines, pipe_lines_top, pipe_sky, bgl_frame, bgl_mat, frame_ub, sampler, white, dummy_joints, default_frame_bg, target: None, draws: 0, pipe_cell, bgl_cell, cells: Vec::new(), lod_k: 1.0 }
+        let pipe_cell_fb = mkp("cell fallback", &layout_cell, "vs_cell_fb", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, None, depth_st(&st_fb), Some(wgpu::Face::Back));
+        Renderer3D { pipe_fb, pipe_cell_fb, depth_fmt, pipe_opaque, pipe_blend, pipe_decal, pipe_decal_blend, decal_bias: true, pipe_wire, pipe_lines, pipe_lines_top, pipe_sky, bgl_frame, bgl_mat, frame_ub, sampler, white, dummy_joints, default_frame_bg, target: None, draws: 0, pipe_cell, bgl_cell, cells: Vec::new(), lod_k: 1.0, map_glass: false, fb_draws: [0, 0] }
     }
 
     /// Upload a CPU model (meshes, materials, textures, skeleton).
@@ -633,7 +698,7 @@ impl Uploader {
             chunk_bg.push(device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("cell bg"), layout: &self.bgl_cell, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: eb.as_entire_binding() }] }));
             tex.push(t);
         }
-        CellGpu { vb, ib, inst, chunk_bg, _tex: tex, batches: c.batches.clone(), groups: c.groups.clone(), bytes }
+        CellGpu { vb, ib, inst, chunk_bg, _tex: tex, batches: c.batches.clone(), groups: c.groups.clone(), bytes, has_fb: c.ents.iter().any(|e| e[5] > 0.5) }
     }
 
     /// Upload a model; `get_tex` gives each image's texture (shared or new).
@@ -735,7 +800,7 @@ impl Uploader {
         });
         let inst = [Instance::new(Mat4::IDENTITY, !m.joints.is_empty())];
         let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("inst"), contents: bytemuck::cast_slice(&inst), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST });
-        GpuModel { meshes, mat_bg, mat_alpha, mat_class, mat_decal, mat_ub, mat_cpu, _textures: textures, joints_buf, frame_bg, instances, n_instances: 1, instance_cap: 1, bbox: [Vec3::from(m.bbox[0]), Vec3::from(m.bbox[1])] }
+        GpuModel { meshes, mat_bg, mat_alpha, mat_class, mat_decal, mat_ub, mat_cpu, _textures: textures, joints_buf, frame_bg, instances, n_instances: 1, n_fb: 0, instance_cap: 1, bbox: [Vec3::from(m.bbox[0]), Vec3::from(m.bbox[1])], stencil: 1, mat_names: mats.iter().map(|mt| format!("{} [{}] {}", mt.name, mt.shader_hash, mt.class)).collect() }
     }
 }
 
@@ -762,8 +827,16 @@ impl Renderer3D {
             gm.instances = rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inst"), size: (cap * std::mem::size_of::<Instance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
             gm.instance_cap = cap as u32;
         }
-        rs.queue.write_buffer(&gm.instances, 0, bytemuck::cast_slice(inst));
+        let n_fb = inst.iter().filter(|i| i.is_fallback()).count();
+        if n_fb == 0 || n_fb == inst.len() {
+            rs.queue.write_buffer(&gm.instances, 0, bytemuck::cast_slice(inst));
+        } else {
+            // normal instances first, fallbacks after them
+            let v: Vec<Instance> = inst.iter().filter(|i| !i.is_fallback()).chain(inst.iter().filter(|i| i.is_fallback())).copied().collect();
+            rs.queue.write_buffer(&gm.instances, 0, bytemuck::cast_slice(&v));
+        }
         gm.n_instances = inst.len() as u32;
+        gm.n_fb = n_fb as u32;
     }
 
 
@@ -810,7 +883,7 @@ impl Renderer3D {
             })
         };
         let msaa = mk(MSAA, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
-        let depth = mk(MSAA, DEPTH_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
+        let depth = mk(MSAA, self.depth_fmt, wgpu::TextureUsages::RENDER_ATTACHMENT).create_view(&Default::default());
         let resolve = mk(1, COLOR_FMT, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC);
         let resolve_view = resolve.create_view(&Default::default());
         let mut r = rs.renderer.write();
@@ -840,22 +913,30 @@ impl Renderer3D {
             paint2: [look.pearl[0], look.pearl[1], look.pearl[2], look.pearl_amount],
             misc: [look.wet, look.emissive, time, look.ambient],
             misc2: [look.fog, look.paint2nd[0], look.paint2nd[1], look.paint2nd[2]],
-            misc3: [look.tint as u32 as f32, self.lod_k, 0.0, 0.0],
+            misc3: [look.tint as u32 as f32, self.lod_k, self.map_glass as u32 as f32, 0.0],
         }
     }
 
     /// Render models (each with its own instances) and lines into the
     /// offscreen target; returns the egui texture to show.
     /// Opaque and cutout draws of `models` into a render pass or bundle.
-    fn record_opaque<'a, E: wgpu::util::RenderEncoder<'a>>(pipe: &'a wgpu::RenderPipeline, default_frame_bg: &'a wgpu::BindGroup, decal_bias: bool, be: &mut E, models: &[&'a GpuModel], mode: u32) -> u32 {
+    /// `fb`: draw the coverage-fallback instances instead of the normal ones.
+    fn record_opaque(pipe: &wgpu::RenderPipeline, default_frame_bg: &wgpu::BindGroup, decal_bias: bool, be: &mut wgpu::RenderPass<'_>, models: &[&GpuModel], mode: u32, fb: bool) -> u32 {
         let mut n = 0u32;
         be.set_pipeline(pipe);
+        let mut sref = u32::MAX;
         // static models share the default frame bind group (their joints
         // buffer is never read), so it is bound once
         let mut shared_bound = false;
         for gm in models {
-            if gm.n_instances == 0 {
+            let range = if fb { gm.n_normal()..gm.n_instances } else { 0..gm.n_normal() };
+            if range.is_empty() {
                 continue;
+            }
+            let want = if fb { 0 } else { gm.stencil };
+            if sref != want {
+                be.set_stencil_reference(want);
+                sref = want;
             }
             if gm.meshes.iter().any(|m| m.skinned) {
                 be.set_bind_group(0, Some(&gm.frame_bg), &[]);
@@ -890,7 +971,7 @@ impl Renderer3D {
                 }
                 let first = (me.ib_range.start / 4) as u32;
                 let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
-                be.draw_indexed(first..first + me.n_idx, base, 0..gm.n_instances);
+                be.draw_indexed(first..first + me.n_idx, base, range.clone());
                 n += 1;
             }
         }
@@ -898,10 +979,13 @@ impl Renderer3D {
     }
 
     /// Draw the cell batches of one pass (see `cells::PASS_*`).
-    fn draw_cells(pass: &mut wgpu::RenderPass<'_>, pipe: &wgpu::RenderPipeline, fbg: &wgpu::BindGroup, cells: &[(std::sync::Arc<CellGpu>, Vec<u16>)], which: u8) -> u32 {
+    fn draw_cells(pass: &mut wgpu::RenderPass<'_>, pipe: &wgpu::RenderPipeline, fbg: &wgpu::BindGroup, cells: &[(std::sync::Arc<CellGpu>, Vec<u16>)], which: u8, fb: bool) -> u32 {
         let mut n = 0;
         let mut set = false;
         for (c, active) in cells {
+            if fb && !c.has_fb {
+                continue;
+            }
             let mut bound = false;
             for &bi in active {
                 let Some(b) = c.batches.get(bi as usize) else { continue };
@@ -950,7 +1034,7 @@ impl Renderer3D {
                     resolve_target: Some(&t.resolve_view),
                     ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r: c[0] as f64, g: c[1] as f64, b: c[2] as f64, a: 1.0 }), store: wgpu::StoreOp::Store },
                 })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &t.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }), stencil_ops: None }),
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: &t.depth, depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Discard }), stencil_ops: (self.depth_fmt == DEPTH_STENCIL_FMT).then_some(wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Discard }) }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
@@ -962,14 +1046,22 @@ impl Renderer3D {
             // opaque + mask
             // no render bundles: wgpu 24 never frees a bundle, and with it
             // everything it draws (evicted models stayed in GPU memory)
-            draws += Self::record_opaque(&self.pipe_opaque, &self.default_frame_bg, self.decal_bias, &mut pass, models, look.mode);
-            draws += Self::draw_cells(&mut pass, &self.pipe_cell[0], &self.default_frame_bg, &self.cells, crate::cells::PASS_OPAQUE);
+            draws += Self::record_opaque(&self.pipe_opaque, &self.default_frame_bg, self.decal_bias, &mut pass, models, look.mode, false);
+            pass.set_stencil_reference(1);
+            draws += Self::draw_cells(&mut pass, &self.pipe_cell[0], &self.default_frame_bg, &self.cells, crate::cells::PASS_OPAQUE, false);
+            // coverage fallbacks: after every real opaque surface, only on
+            // pixels still showing far field or sky
+            let fm = Self::record_opaque(&self.pipe_fb, &self.default_frame_bg, self.decal_bias, &mut pass, models, 0, true);
+            pass.set_stencil_reference(0);
+            let fc = Self::draw_cells(&mut pass, &self.pipe_cell_fb, &self.default_frame_bg, &self.cells, crate::cells::PASS_OPAQUE, true);
+            self.fb_draws = [fm, fc];
+            draws += fm + fc;
             if self.decal_bias {
-                draws += Self::draw_cells(&mut pass, &self.pipe_cell[1], &self.default_frame_bg, &self.cells, crate::cells::PASS_DECAL);
-                draws += Self::draw_cells(&mut pass, &self.pipe_cell[2], &self.default_frame_bg, &self.cells, crate::cells::PASS_DECAL_BLEND);
+                draws += Self::draw_cells(&mut pass, &self.pipe_cell[1], &self.default_frame_bg, &self.cells, crate::cells::PASS_DECAL, false);
+                draws += Self::draw_cells(&mut pass, &self.pipe_cell[2], &self.default_frame_bg, &self.cells, crate::cells::PASS_DECAL_BLEND, false);
             }
             if look.mode == 0 {
-                draws += Self::draw_cells(&mut pass, &self.pipe_cell[3], &self.default_frame_bg, &self.cells, crate::cells::PASS_BLEND);
+                draws += Self::draw_cells(&mut pass, &self.pipe_cell[3], &self.default_frame_bg, &self.cells, crate::cells::PASS_BLEND, false);
             }
             // decals: after all opaque surfaces, by layer order; opaque-mode
             // decals (terrain blend layers) write depth, blended ones do not
@@ -998,7 +1090,7 @@ impl Renderer3D {
                     pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
                     pass.set_vertex_buffer(0, me.vslice());
                     pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
+                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_normal());
                     draws += 1;
                 }
             }
@@ -1024,7 +1116,7 @@ impl Renderer3D {
                     pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
                     pass.set_vertex_buffer(0, me.vslice());
                     pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
-                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
+                    pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_normal());
                     draws += 1;
                 }
             }
@@ -1038,7 +1130,7 @@ impl Renderer3D {
                             pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
                             pass.set_vertex_buffer(0, me.vslice());
                             pass.set_index_buffer(eb.slice(..), wgpu::IndexFormat::Uint32);
-                            pass.draw_indexed(0..me.n_edge, 0, 0..gm.n_instances);
+                            pass.draw_indexed(0..me.n_edge, 0, 0..gm.n_normal());
                         }
                     }
                 }

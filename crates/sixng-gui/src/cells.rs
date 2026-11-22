@@ -180,6 +180,9 @@ pub struct CellEnt {
     /// Simplification grid (m): about one pixel at the nearest distance
     /// the cell draws it; 0 keeps every vertex.
     pub grid: f32,
+    /// Coverage fallback: also drawn from this distance to `lo` (nothing
+    /// finer replaces it there), only on pixels no real surface covers.
+    pub fb: Option<f32>,
 }
 
 fn gl(p: [f32; 3]) -> Vec3 {
@@ -286,9 +289,9 @@ pub fn build(key: CellKey, ents: &[CellEnt], max_layers: u32, load: &mut dyn FnM
         }
         let ent = table.len() as u16;
         let c = gl(e.ctr) - origin;
-        table.push([c.x, c.y, c.z, e.lo, e.hi, 0.0, 0.0, 0.0]);
+        table.push([c.x, c.y, c.z, e.lo, e.hi, if e.fb.is_some() { 1.0 } else { 0.0 }, e.fb.unwrap_or(0.0), 0.0]);
         // group by quantised range (rounded outwards: the shader does the exact test)
-        let gk = (class_of(e.lo), (class_of(e.hi) + 1).min(BOUNDS.len() as u8 - 1));
+        let gk = (class_of(e.fb.unwrap_or(e.lo)), (class_of(e.hi) + 1).min(BOUNDS.len() as u8 - 1));
         let gi = *group_of.entry(gk).or_insert_with(|| {
             groups.push(Group { lo: BOUNDS[gk.0 as usize], hi: BOUNDS[gk.1 as usize], bb: [[f32::MAX; 3], [f32::MIN; 3]] });
             groups.len() - 1
@@ -518,7 +521,7 @@ mod tests {
         let mat = glb::Material { name: String::new(), class: "opaque".into(), alpha_mode: "OPAQUE".into(), base_factor: [1.0; 4], base: Some(0), normal: None, packed: None, emissive: None, slots: vec![], gap: "ok".into(), shader_hash: String::new(), decal: None };
         let model = Arc::new(glb::Model { path: Default::default(), meshes: vec![mesh], materials: vec![mat], joints: vec![], images: vec![img], bbox: [[0.0; 3]; 2], triangles: 1, vertices: 3, extras: serde_json::Value::Null });
         let p = [crate::mapbake::X0 + 10.0, crate::mapbake::Y1 - 10.0, 5.0];
-        let ents = vec![CellEnt { model: "m".into(), pos: p, yaw: 0.5, ctr: p, lo: 0.0, hi: 300.0, grid: 0.0 }; 2];
+        let ents = vec![CellEnt { model: "m".into(), pos: p, yaw: 0.5, ctr: p, lo: 0.0, hi: 300.0, grid: 0.0, fb: None }; 2];
         let key = CellKey::of(0, ents[0].pos[0], ents[0].pos[1]);
         let c = build(key, &ents, 256, &mut |_, _| Some(model.clone()));
         assert_eq!(c.verts.len(), 6);
