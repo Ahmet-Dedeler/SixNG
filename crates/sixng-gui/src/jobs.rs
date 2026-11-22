@@ -100,6 +100,8 @@ pub struct Jobs {
     pub jobs: Vec<Job>,
     next_id: u32,
     catalog: Option<Result<Vec<CmdSpec>, String>>,
+    /// The command list loads in the background (one `--help` call per command).
+    catalog_pending: Option<std::sync::Arc<std::sync::Mutex<Option<Result<Vec<CmdSpec>, String>>>>>,
     sel_cmd: Option<usize>,
     form: Vec<String>,
     form_flags: Vec<bool>,
@@ -198,13 +200,27 @@ fn parse_command(name: &str, help: &str) -> CmdSpec {
 
 fn load_catalog(cli: &Path) -> Result<Vec<CmdSpec>, String> {
     let run = |args: &[&str]| -> Result<String, String> {
-        let o = Command::new(cli).args(args).output().map_err(|e| format!("cannot run {}: {e}", cli.display()))?;
+        let mut cmd = Command::new(cli);
+        cmd.args(args);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        }
+        let o = cmd.output().map_err(|e| format!("cannot run {}: {e}", cli.display()))?;
         Ok(String::from_utf8_lossy(&o.stdout).to_string())
     };
     let top = run(&["--help"])?;
+    // one process per command, run side by side
+    let names: Vec<String> = parse_commands(&top).into_iter().map(|(n, _)| n).collect();
+    let helps: Vec<Result<String, String>> = std::thread::scope(|s| {
+        let run = &run;
+        let hs: Vec<_> = names.iter().map(|n| s.spawn(move || run(&[n.as_str(), "--help"]))).collect();
+        hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("help call crashed".into()))).collect()
+    });
     let mut v = Vec::new();
-    for (n, _) in parse_commands(&top) {
-        v.push(parse_command(&n, &run(&[n.as_str(), "--help"])?));
+    for (n, h) in names.iter().zip(helps) {
+        v.push(parse_command(n, &h?));
     }
     if v.is_empty() {
         return Err("no commands found in `sixng --help`".into());
@@ -236,7 +252,7 @@ fn split_values(s: &str) -> Vec<String> {
 
 impl Jobs {
     pub fn new(game: &str, work: &str) -> Self {
-        Jobs { game: game.into(), work: work.into(), cli: cli_path(), jobs: Vec::new(), next_id: 1, catalog: None, sel_cmd: None, form: Vec::new(), form_flags: Vec::new(), sel_job: None, finished: Vec::new() }
+        Jobs { game: game.into(), work: work.into(), cli: cli_path(), jobs: Vec::new(), next_id: 1, catalog: None, catalog_pending: None, sel_cmd: None, form: Vec::new(), form_flags: Vec::new(), sel_job: None, finished: Vec::new() }
     }
 
     pub fn set_folders(&mut self, game: &str, work: &str) {
@@ -382,7 +398,31 @@ impl Jobs {
             return;
         }
         if self.catalog.is_none() {
-            self.catalog = Some(load_catalog(&self.cli));
+            // never on the UI thread: ~30 process starts take seconds on a busy disk
+            let slot = self.catalog_pending.get_or_insert_with(|| {
+                let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let (out, cli, ctx) = (slot.clone(), self.cli.clone(), ui.ctx().clone());
+                std::thread::spawn(move || {
+                    let r = load_catalog(&cli);
+                    *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                    ctx.request_repaint();
+                });
+                slot
+            });
+            let done = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+            match done {
+                Some(r) => {
+                    self.catalog = Some(r);
+                    self.catalog_pending = None;
+                }
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("reading the command list …");
+                    });
+                    return;
+                }
+            }
         }
         let cat = match self.catalog.as_ref().unwrap() {
             Ok(c) => c.clone(),
