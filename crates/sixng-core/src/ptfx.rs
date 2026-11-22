@@ -11,9 +11,9 @@
 //! keyframe properties (id hash and keys over normalised time; the property
 //! names are not recovered) and each particle rule's keyframe texture.
 //! Behaviour types and most scalar fields are not decoded. The sprite
-//! sheets are not embedded, and no 64-bit or 32-bit texture-store hash of
-//! any `.ttpf` store occurs in the dictionaries, so how a rule names its
-//! sprite is still open.
+//! sheets are not embedded: a particle rule names its textures by
+//! texture-store hash (`texture_refs`), and they live in
+//! `data/ttdb/vfx/ttdb_vfx.ttpf`.
 use crate::drawable::DrawableInfo;
 use crate::resource::Resource;
 use serde::Serialize;
@@ -245,9 +245,10 @@ pub struct PtfxParticle {
     /// Behaviours (list at +0x188) that hold keyframe properties.
     pub behaviours: Vec<PtfxBehaviour>,
     /// Non-zero 64-bit values in the slot row at +0x300..+0x360 as
-    /// (slot, hash): probably the sprite / texture references (they differ
-    /// per particle and repeat across particles), with a hash function that
-    /// is not known; no texture store holds them.
+    /// (slot, hash): the particle's textures as 64-bit texture-store hashes
+    /// (sprite and flipbook atlases, masks, lighting maps and colour ramps).
+    /// 237 of the 242 distinct values in data.rpf are textures of
+    /// `data/ttdb/vfx/ttdb_vfx.ttpf`.
     pub texture_refs: Vec<(u32, String)>,
 }
 

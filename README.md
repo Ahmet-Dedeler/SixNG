@@ -308,9 +308,15 @@ names each behaviour's class. The colour over life is in two unnamed
 `ptxu_Colour` properties (RGBA, min/max pair; marked with `role`). The
 keyframe textures are not the behaviour curves (no row matches one); they
 look like the particle shader's variables. All 146 dictionaries decode (2,816 effects, 11,228
-events, 8,224 particle rules). `texture_refs` lists the 64-bit values that
-probably name each particle's sprite; no texture store holds them (hash
-function unknown) and the sprite sheets are not embedded.
+events, 8,224 particle rules). **Sprites** (since 2026-11-22): `texture_refs` are
+texture-store hashes, and 237 of the 242 distinct values are textures in
+`data/ttdb/vfx/ttdb_vfx.ttpf` (99 % of the 10,817 references). With `-o`,
+`particles[].sprites` gives each one's slot, hash, store, size and format,
+and `--sprites` also writes them to `<out>/ptfx/<archive>/sprites/<hash>.png`
+(237 PNGs, 277 MB for data.rpf, a few seconds). By format the slots hold
+flipbook atlases and colour sprites (BC7, BC6H), masks (BC4), normal or
+lighting maps (BC5) and 4-pixel-high colour ramps; which slot does what is
+inferred from formats only, and the flipbook frame layout is not read.
 
 **UI fonts** (`sixng fonts`): the Scaleform font libraries in data.rpf
 (`fontlib_efigs`, Chinese, Japanese and Korean) hold their fonts as SWF

@@ -469,8 +469,10 @@ enum Cmd {
     /// <offset>.json with the keyframe curves (16 RGBA samples x 4 rows per
     /// keyframe texture) and the rules: each effect's events (emitter rule +
     /// particle rule), keyframe properties (name, keys over time), behaviour
-    /// classes and each particle rule's keyframe texture. Sprite links are
-    /// not resolved.
+    /// classes, each particle rule's keyframe texture and its sprite
+    /// textures (`particles[].sprites`: texture-store hash, store, size and
+    /// format; the sprites live in data/ttdb/vfx/ttdb_vfx.ttpf). With
+    /// --sprites, also writes each sprite to <out>/ptfx/<archive>/sprites/<hash>.png.
     Ptfx {
         #[arg(default_value = "data")]
         archive: String,
@@ -479,6 +481,9 @@ enum Cmd {
         name: Option<String>,
         #[arg(long, short)]
         out: Option<PathBuf>,
+        /// With -o: decode the referenced sprite textures to PNG.
+        #[arg(long)]
+        sprites: bool,
     },
     /// Fonts of the UI movies (Scaleform font libraries in data.rpf:
     /// DefineFont3 outlines, code table, layout). Lists them as JSON; with
@@ -1340,7 +1345,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let v = sixng_core::vehicles::export(&a, &metas, &names, po)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
         }
-        Cmd::Ptfx { archive, name, out: po } => {
+        Cmd::Ptfx { archive, name, out: po, sprites } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
@@ -1368,10 +1373,55 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             if let Some(po) = po {
                 let dir = po.join("ptfx").join(a.id.trim_end_matches(".rpf").replace(['/', '\\'], "_"));
                 std::fs::create_dir_all(&dir)?;
+                let set = sixng_core::ttpf::global(&ws.game);
+                let mut wanted: std::collections::BTreeSet<u64> = Default::default();
                 for (d, kf) in &found {
                     let off = d.id.rsplit('@').next().unwrap_or("x");
-                    let kf = kf.clone().unwrap_or_default();
-                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&json!({"dictionary": d, "keyframes": kf["keyframes"], "rules": kf["rules"], "rules_note": "effects[].events pair an emitter rule with a particle rule. Keyframe properties: id = joaat of the lower-cased `<class>:m_<member>KFP`, name where it resolved (all effect and emitter properties, about 70 % of behaviour ones; ptxu_Velocity:m_angleKFP is less certain), keys = [time 0..1, value vec4]; min/max pairs are separate properties or x/y of one. Scalars such as sizeScalar look like percentages (medians 70-100; unverified). Particle props are grouped by behaviour, with the behaviour class taken from its property names. particles[].keyframe_texture indexes `keyframes` (probably the particle shader's variables, not colour or size: those are the behaviour properties, colour in the two ptxu_Colour props with a `role`); particles[].texture_refs are the 64-bit values that probably name the sprite (hash function unknown)."}))?)?;
+                    let mut kf = kf.clone().unwrap_or_default();
+                    // Sprite textures: texture_refs are texture-store hashes
+                    // (237 of the 242 distinct values in data.rpf are in the vfx store).
+                    if let Some(ps) = kf["rules"]["particles"].as_array_mut() {
+                        for pt in ps {
+                            let refs = pt["texture_refs"].as_array().cloned().unwrap_or_default();
+                            let sp: Vec<serde_json::Value> = refs
+                                .iter()
+                                .filter_map(|r| {
+                                    let slot = r[0].as_u64()?;
+                                    let hs = r[1].as_str()?;
+                                    let h = u64::from_str_radix(hs, 16).ok()?;
+                                    Some(match set.get(h) {
+                                        Some((st, t)) => {
+                                            if *sprites {
+                                                wanted.insert(h);
+                                            }
+                                            let store = st.path.strip_prefix(&ws.game).unwrap_or(&st.path).to_string_lossy().replace('\\', "/");
+                                            json!({"slot": slot, "hash": hs, "store": store, "w": t.width, "h": t.height, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "png": if *sprites { json!(format!("sprites/{hs}.png")) } else { serde_json::Value::Null }})
+                                        }
+                                        None => json!({"slot": slot, "hash": hs, "store": null}),
+                                    })
+                                })
+                                .collect();
+                            pt["sprites"] = json!(sp);
+                        }
+                    }
+                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&json!({"dictionary": d, "keyframes": kf["keyframes"], "rules": kf["rules"], "rules_note": "effects[].events pair an emitter rule with a particle rule. Keyframe properties: id = joaat of the lower-cased `<class>:m_<member>KFP`, name where it resolved (all effect and emitter properties, about 70 % of behaviour ones; ptxu_Velocity:m_angleKFP is less certain), keys = [time 0..1, value vec4]; min/max pairs are separate properties or x/y of one. Scalars such as sizeScalar look like percentages (medians 70-100; unverified). Particle props are grouped by behaviour, with the behaviour class taken from its property names. particles[].keyframe_texture indexes `keyframes` (probably the particle shader's variables, not colour or size: those are the behaviour properties, colour in the two ptxu_Colour props with a `role`); particles[].sprites resolve particles[].texture_refs (slot offset, 64-bit texture-store hash) to textures in the vfx store: by format the slots hold flipbook atlases and colour sprites (BC7 / BC6H), masks (BC4), normal or lighting maps (BC5) and 4-pixel-high colour ramps (BC6H); the role of each slot is inferred from formats only."}))?)?;
+                }
+                if !wanted.is_empty() {
+                    let sd = dir.join("sprites");
+                    std::fs::create_dir_all(&sd)?;
+                    use rayon::prelude::*;
+                    let fails: Vec<String> = wanted
+                        .par_iter()
+                        .filter_map(|&h| {
+                            let (st, t) = set.get(h)?;
+                            let p = sd.join(format!("{h:016x}.png"));
+                            let r = st.data_ex(t).and_then(|(data, _)| sixng_core::ttpf::decode_rgba_slice(t, &data, 0, 0)).and_then(|(rgba, w, hh)| sixng_core::texture::save_png(&p, &rgba, w, hh));
+                            r.err().map(|e| format!("{h:016x}: {e}"))
+                        })
+                        .collect();
+                    if !fails.is_empty() {
+                        eprintln!("sprites not decoded: {}", fails.join("; "));
+                    }
                 }
                 std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }
