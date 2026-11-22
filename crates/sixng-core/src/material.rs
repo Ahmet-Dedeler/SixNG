@@ -224,17 +224,20 @@ pub fn is_paint(name_hash: &str) -> bool {
 ///   B and A vary. Two-channel maps (BC1): R = 0, G/B vary and are
 ///   anti-correlated. Meanings unverified.
 pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
-    // (colour, normal, data, two-channel) for base and layer 2, overlay, extra data
-    let (base, l2, overlay, extra): ([usize; 4], [usize; 4], usize, usize) = match name_hash {
-        "b217b263" | "1251cae5" | "cd8ceb5e" | "77d8ab27" => ([0, 6, 7, 9], [4, 10, 5, 2], 8, 11),
-        "4f0b809b" => ([2, 10, 3, 0], [7, 4, 5, 9], 6, 11),
-        _ => return None,
-    };
     let tex = |p: usize| -> Value {
         match entries.iter().find(|e| e["param"].as_u64() == Some(p as u64)) {
             Some(e) => json!({"param": p, "png": e.get("png").cloned().unwrap_or(Value::Null), "status": e.get("status").cloned().unwrap_or(Value::Null)}),
             None => json!({"param": p, "png": null, "status": "no texture bound"}),
         }
+    };
+    if matches!(name_hash, "61e09df7" | "b21f1ba5" | "360e396b") {
+        return Some(four_layer(name_hash, &tex));
+    }
+    // (colour, normal, data, two-channel) for base and layer 2, overlay, extra data
+    let (base, l2, overlay, extra): ([usize; 4], [usize; 4], usize, usize) = match name_hash {
+        "b217b263" | "1251cae5" | "cd8ceb5e" | "77d8ab27" => ([0, 6, 7, 9], [4, 10, 5, 2], 8, 11),
+        "4f0b809b" => ([2, 10, 3, 0], [7, 4, 5, 9], 6, 11),
+        _ => return None,
     };
     let layer = |name: &str, s: [usize; 4], uv: &str, weight: &str| {
         json!({"name": name, "colour": tex(s[0]), "normal": tex(s[1]), "data": tex(s[2]), "two_channel": tex(s[3]), "uv_set": uv, "weight": weight})
@@ -252,6 +255,40 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
     }))
 }
 
+/// The 17-slot 4-layer ground shaders (`standard_uber_4lyr_dpm_dm_hbb`
+/// 61e09df7, `…_pxm_hbb_fixuv1` b21f1ba5, `…_spx_dm_hbb` 360e396b), same
+/// slot layout in all three. Slot names are recovered parameter names
+/// (`diffusetexture_layer0` …); the unnamed data maps were paired with
+/// their layer by co-occurrence (each data-map hash goes with exactly one
+/// layer's diffuse over 200 materials). Weights: the section-wide
+/// `lookuptexture`, sampled with TEXCOORD_0 (= section position / 512 m);
+/// R, G, B weight layers 0, 1, 2 (seam-continuity test across material
+/// borders: the slot a channel drives agrees across the border 66 / 74 /
+/// 92 % of the time where that channel dominates), the rest goes to layer 3.
+fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
+    // (colour, normal, data) per layer
+    const SLOTS: [[usize; 3]; 4] = [[14, 15, 4], [12, 10, 0], [9, 11, 5], [13, 7, 1]];
+    let weight = ["lookup.r", "lookup.g", "lookup.b", "1 - (lookup.r + lookup.g + lookup.b)"];
+    let layers: Vec<Value> = SLOTS
+        .iter()
+        .enumerate()
+        .map(|(i, s)| json!({"name": format!("layer{i}"), "colour": tex(s[0]), "normal": tex(s[1]), "data": tex(s[2]), "uv_set": "TEXCOORD_0", "uv_scale": 64.0, "weight": weight[i]}))
+        .collect();
+    let alt_uv = if name_hash == "b21f1ba5" { Value::Null } else { json!("TEXCOORD_1") };
+    json!({
+        "family": "four_layer",
+        "layers": layers,
+        "weights": {"texture": tex(2), "uv_set": "TEXCOORD_0", "channels": {"r": "layer0", "g": "layer1", "b": "layer2", "remainder": "layer3"}, "note": "R+G+B <= 1 (BC7 rounding up to 258/255: clamp); the remainder weights layer 3"},
+        "macro": {"uv_set": "TEXCOORD_0", "tint": tex(16), "tint_normal": tex(8), "grass_mask": tex(3), "note": "section-wide maps (one 512 m section per texture): colour variation, large-scale normal, grass placement mask"},
+        "detail_uv": {"default": "TEXCOORD_0 * 64 (world-planar, one repeat per 8 m)", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. Per-layer tiling factors sit in the shader's constant block and are not decoded; scale per layer by eye"},
+        "vertex_color_channels": {"rgb": "unverified: varies 50..230, mean ~155, not weights (does not sum to a constant); baked shading or tint", "a": "always 0"},
+        "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
+        "height_blend": "the shader names end in hbb (height-based blend): each layer's data map B channel looks like a height map; sharpen the weights by height for the game's look",
+        "confidence": {"slots": "high (recovered names)", "data_map_pairing": "high", "weights_uv": "high", "channel_rgb_to_layer012": "medium", "layer3_remainder": "low", "detail_uv_scale": "low"},
+        "note": "Derived from recovered parameter names, texture co-occurrence and UV/seam statistics, not from shader code. Normal maps: DirectX green.",
+    })
+}
+
 #[cfg(test)]
 mod paint_tests {
     use super::*;
@@ -264,6 +301,20 @@ mod paint_tests {
         assert!((c[0] - 0.2158).abs() < 1e-3);
         assert_eq!(parse_paint("fff"), None);
         assert_eq!(parse_paint("zzzzzz"), None);
+    }
+
+    #[test]
+    fn four_layer_slots() {
+        let entries: Vec<Value> = [14usize, 15, 4, 2, 16].iter().map(|&p| json!({"param": p, "png": format!("t{p}.png"), "status": "ok"})).collect();
+        let l = layers("61e09df7", &entries).unwrap();
+        assert_eq!(l["layers"][0]["colour"]["png"], "t14.png");
+        assert_eq!(l["layers"][0]["normal"]["png"], "t15.png");
+        assert_eq!(l["layers"][0]["data"]["png"], "t4.png");
+        assert_eq!(l["layers"][3]["colour"]["param"], 13);
+        assert_eq!(l["layers"][3]["colour"]["status"], "no texture bound");
+        assert_eq!(l["weights"]["texture"]["png"], "t2.png");
+        assert_eq!(l["macro"]["tint"]["png"], "t16.png");
+        assert!(layers("b21f1ba5", &entries).unwrap()["detail_uv"]["alt_uv_set"].is_null());
     }
 
     #[test]

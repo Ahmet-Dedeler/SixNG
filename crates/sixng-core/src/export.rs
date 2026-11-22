@@ -1048,7 +1048,13 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             }
             g
         },
-        extras: serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback}),
+        extras: {
+            let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback});
+            if let Some(l) = crate::material::layers(&s.name_hash, &st.entries) {
+                x["multilayer"] = l;
+            }
+            x
+        },
     }).collect();
     BuiltDrawable { lod_groups, part_groups, materials: mats, joints: skin.joints, mesh_meta, shader_tex, head }
 }
