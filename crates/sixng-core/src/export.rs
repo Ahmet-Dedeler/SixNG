@@ -846,7 +846,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
-                    if let Some(l) = crate::material::layers(&s.name_hash, &st.entries) {
+                    if let Some(l) = crate::material::multilayer(s, &st.entries) {
                         m["multilayer"] = l;
                     }
                     if m["classification"]["class"] == "car_paint" {
@@ -1050,7 +1050,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         },
         extras: {
             let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback});
-            if let Some(l) = crate::material::layers(&s.name_hash, &st.entries) {
+            if let Some(l) = crate::material::multilayer(s, &st.entries) {
                 x["multilayer"] = l;
             }
             x

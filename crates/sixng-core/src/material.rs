@@ -255,6 +255,59 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
     }))
 }
 
+/// `layers` plus, for the 4-layer ground family, the shader's constants
+/// (`params`).
+pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value]) -> Option<Value> {
+    let mut l = layers(&s.name_hash, entries)?;
+    if l["family"] == "four_layer" {
+        l["params"] = four_layer_params(&s.constants);
+    }
+    Some(l)
+}
+
+/// Constants of a 4-layer ground material. Vec4s whose component k follows
+/// layer k's texture (seam test: equal across a material border whenever
+/// that layer's texture is equal there) are split per layer; their meaning
+/// is not known, so they keep their hash (and name when one resolved).
+pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
+    // per-layer vec4s (component k = layer k) with the seam agreement found
+    const PER_LAYER: &[(&str, &str)] = &[
+        ("c35e27af", "equal across seams 100 % for the same texture (44 % otherwise); values 1.0-1.7: a per-texture factor (tiling or intensity, not decided)"),
+        ("627ce8ae", "99 % / 71 %; values 1 or 2"),
+        ("781f7100", "98 % / 10 %; values 0.35-0.75"),
+        ("9a4a3781", "92 % / 14 %; values 0-0.175 (parallax or height depth?)"),
+        ("f354f896", "85 % / 13 %; values about 1-16"),
+        ("9ede7c13", "83 % / 23 %; values about 1-14"),
+        ("b25b6656", "100 % / 86 %; mostly 1.0"),
+        ("30bf5bed", "mostly 0.5"),
+    ];
+    let name = |h: &str| crate::names::param(h);
+    let mut layers: Vec<serde_json::Map<String, Value>> = vec![serde_json::Map::new(); 4];
+    let mut per_layer_notes = serde_json::Map::new();
+    let mut other = serde_json::Map::new();
+    for c in consts {
+        let Some(v) = c.values else { continue };
+        if v.iter().any(|x| !x.is_finite() || x.abs() > 1e6) {
+            continue; // the block's first words are not constants (pointer-like)
+        }
+        if let Some((_, note)) = PER_LAYER.iter().find(|(h, _)| *h == c.hash) {
+            for (k, l) in layers.iter_mut().enumerate() {
+                l.insert(c.hash.clone(), json!(v[k]));
+            }
+            per_layer_notes.insert(c.hash.clone(), json!(note));
+        } else if v.iter().any(|x| *x != 0.0) {
+            let key = match name(&c.hash) { Some(n) => format!("{n} ({})", c.hash), None => c.hash.clone() };
+            other.insert(key, json!(v));
+        }
+    }
+    json!({
+        "per_layer": layers,
+        "per_layer_notes": per_layer_notes,
+        "material": other,
+        "note": "Constant block values (vec4, float offset from the parameter table). Names: joaat dictionary hits only (blendsoftness, tintintensity, tintblendamount, bumpiness …); the rest are hashes. Meanings are not decoded.",
+    })
+}
+
 /// The 17-slot 4-layer ground shaders (`standard_uber_4lyr_dpm_dm_hbb`
 /// 61e09df7, `…_pxm_hbb_fixuv1` b21f1ba5, `…_spx_dm_hbb` 360e396b), same
 /// slot layout in all three. Slot names are recovered parameter names
