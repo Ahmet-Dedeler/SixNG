@@ -11,7 +11,7 @@
 //!              (codec: 0x20 zlib; 0x04 BC1, 0x0C/0x10 BC3/BC4?, 0x14 BC5, 0x18 BC6H,
 //!              0x1C BC7 = per-format BCPack, the Xbox Series hardware texture codec;
 //!              BC1 decodes with `bcpack-rs`, BC3 with `bc3pack`, BC4/BC5 with `bc45pack`,
-//!              BC7 with `bc7pack`, BC6H not yet; 0x00 stored),
+//!              BC6H with `bc6pack`, BC7 with `bc7pack`; 0x00 stored),
 //!              bits 30-31 = 4 KiB pages added to the virtual offset
 //!       u32 b: virtual offset = 0x1000 + (b & 0xFFFFF) * 0x4000 + (a >> 30) * 0x1000
 //!              (the 0x1000 is the header page); b >> 20 = bytes of padding after
