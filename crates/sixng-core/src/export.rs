@@ -299,6 +299,47 @@ struct ShaderTextures {
 /// Shader slot of the per-model tint palette.
 const TINT_PALETTE: &str = "2c8d7182";
 
+/// Referenced textures that no store or resource of the install holds and
+/// that stand for an engine default: (hash, value, note). `5d7a3a87cc19967d`
+/// is the white vehicle colour slot (body colour = runtime paint);
+/// `1e2c9340e14a7d07` (19 % of all unresolved references) sits in base
+/// colour and other colour slots of every shader family, with and without a
+/// tint palette, so it is taken as white too.
+const ENGINE_DEFAULTS: &[(&str, [f64; 4], &str)] = &[
+    ("5d7a3a87cc19967d", [255.0, 255.0, 255.0, 255.0], "engine default texture (white; vehicle paint slot)"),
+    ("1e2c9340e14a7d07", [255.0, 255.0, 255.0, 255.0], "engine default texture, assumed white (used in colour slots of every shader family)"),
+];
+
+/// Typical value of data slots (median mean colour of the decoded textures
+/// in that slot over 3,000 sampled map models), for unresolved references.
+const SLOT_TYPICAL: &[(&str, [f64; 4])] = &[
+    ("c6f46e79", [0.0, 150.0, 224.0, 255.0]),
+    ("739e3d0d", [0.0, 0.0, 0.0, 255.0]),
+    ("38ebcdb3", [85.0, 84.0, 91.0, 255.0]),
+    ("3c4af3d4", [0.0, 0.0, 123.0, 255.0]),
+    ("2bb2ede8", [0.0, 172.0, 128.0, 255.0]),
+    ("4d56d7fe", [0.0, 176.0, 129.0, 255.0]),
+];
+
+/// Role of a texture slot whose texture is not in the install (no format to
+/// go by): from the known slots.
+fn unresolved_role(param_hash: &str) -> &'static str {
+    let sr = crate::material::slot_role(param_hash).unwrap_or("");
+    if param_hash == TINT_PALETTE {
+        "tint palette"
+    } else if ALBEDO_PARAMS.contains(&param_hash) {
+        "base_color"
+    } else if NORMAL_PARAMS.contains(&param_hash) || sr.starts_with("normal") {
+        "normal"
+    } else if sr.contains("sRGB") {
+        "colour (sRGB)"
+    } else {
+        "data (linear)"
+    }
+}
+
+const UNRESOLVED: &str = "not in the install: no store or resource holds this hash";
+
 /// Per-vertex tint from a palette: entry `colour.b` of row 0 (the default
 /// tint), as linear RGBA8 for glTF COLOR_0. Indices past the palette are
 /// white (no tint).
@@ -378,7 +419,15 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                                 Err(err) => e["status"] = format!("embedded in the model, not decoded: {err}").into(),
                             }
                         }
-                        None => e["status"] = "not in any ttpf store".into(),
+                        None => {
+                            e["status"] = "not in any ttpf store".into();
+                            let role = unresolved_role(&t.param_hash);
+                            e["role_guess"] = role.into();
+                            if let Some(sr) = crate::material::slot_role(&t.param_hash) {
+                                e["slot_role"] = sr.into();
+                            }
+                            e["texture_fallback"] = serde_json::json!({"reason": UNRESOLVED, "pending_role": role});
+                        }
                     }
                     st.entries.push(e);
                     continue;
@@ -489,18 +538,34 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
         }
         a.map(|x| x.round())
     });
-    for st in out.iter_mut() {
+    for (st, s) in out.iter_mut().zip(shaders) {
         let mut base_fb = None;
+        let tinted = st.tint_palette.is_some();
+        let decal = crate::material::classify(&s.name_hash, &s.flags)["class"] == "decal";
         for e in st.entries.iter_mut() {
             let Some(role) = e["texture_fallback"]["pending_role"].as_str().map(|x| x.to_string()) else { continue };
+            let unresolved = e["texture_fallback"]["reason"] == UNRESOLVED;
             let colour = matches!(role.as_str(), "base_color" | "colour (sRGB)");
-            let (rgba, source) = match (colour, role.as_str(), avg) {
+            let dflt = ENGINE_DEFAULTS.iter().find(|d| e["hash64"] == d.0);
+            let typical = SLOT_TYPICAL.iter().find(|d| e["param_hash"] == d.0);
+            let white = [255.0; 4];
+            let (mut rgba, mut source) = match (colour, role.as_str(), avg) {
+                (_, _, _) if unresolved && dflt.is_some() => (dflt.unwrap().1, dflt.unwrap().2.to_string()),
+                (_, "tint palette", _) => (white, "white (no tint)".to_string()),
+                (true, "base_color", _) if unresolved && tinted => (white, "white: the model's tint palette gives the colour".to_string()),
                 (true, _, Some(a)) => (a, format!("average of {} decoded colour textures in this model", decoded.len())),
                 (true, _, None) => ([128.0, 128.0, 128.0, 255.0], "neutral grey (no decoded colour texture in this model)".to_string()),
                 (false, "normal", _) => ([128.0, 128.0, 255.0, 255.0], "flat normal".to_string()),
+                _ if unresolved && typical.is_some() => (typical.unwrap().1, "typical value of this slot (median over decoded textures in it)".to_string()),
                 _ => ([128.0, 128.0, 128.0, 255.0], "neutral mid value (linear data map)".to_string()),
             };
-            let fb = serde_json::json!({"reason": "BCPack: no mip outside BCPack chunks (Xbox hardware texture codec; only BC1 decodes so far)", "role": role, "rgba": rgba, "source": source});
+            // A decal without its colour texture would paint a flat patch.
+            if role == "base_color" && decal && unresolved {
+                rgba[3] = 0.0;
+                source += "; alpha 0: decal hidden without its texture";
+            }
+            let reason = if unresolved { UNRESOLVED } else { "BCPack: no mip outside BCPack chunks (Xbox hardware texture codec; only BC1 decodes so far)" };
+            let fb = serde_json::json!({"reason": reason, "role": role, "rgba": rgba, "source": source});
             e["texture_fallback"] = fb.clone();
             if role == "base_color" && base_fb.is_none() {
                 base_fb = Some((rgba, fb));
