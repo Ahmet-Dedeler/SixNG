@@ -46,7 +46,8 @@ pub struct Loaded {
     pub base: String,
 }
 
-type Pending = Arc<Mutex<Option<Result<Loaded, String>>>>;
+/// A finished load, tagged with the request it answers.
+type Pending = Arc<Mutex<Option<(u64, Result<Loaded, String>)>>>;
 
 /// Face variant the viewer exports ped heads with (`ExportOptions::head_skin`).
 pub static HEAD_SKIN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -59,6 +60,8 @@ pub struct Automation {
     pub exit: bool,
     pub frames: u32,
     pub ui_shot: Option<PathBuf>,
+    /// Model to open once the first one is shown (`--then`, tests switching).
+    pub then: Option<String>,
 }
 
 /// Shared-wheel scale per unit of the car's wheelScale: fitted by eye on
@@ -69,6 +72,10 @@ pub struct ModelView {
     pub query: String,
     pub status: String,
     pending: Pending,
+    /// Number of the newest load request: a load that finishes after a
+    /// newer one was requested is dropped, so the viewport never shows an
+    /// older model under the newer name.
+    load_gen: Arc<std::sync::atomic::AtomicU64>,
     loading: bool,
     pub loaded: Option<Loaded>,
     gpu: Option<GpuModel>,
@@ -173,6 +180,7 @@ impl ModelView {
                 "Type an entry id (levels.rpf@219c8b010), a name regex (^phoenix) or open a .glb."
                     .into(),
             pending: Arc::new(Mutex::new(None)),
+            load_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             loading: false,
             loaded: None,
             gpu: None,
@@ -384,7 +392,7 @@ impl ModelView {
 
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
-        if !self.hair.settled() {
+        if !self.hair.settled() || self.auto.then.is_some() {
             return false;
         }
         let Some(l) = self
@@ -425,11 +433,12 @@ impl ModelView {
         let ws = Workspace::new(&self.game, &self.work);
         let cache = self.cache_dir();
         let slot = self.pending.clone();
+        let (gen, latest) = self.next_load();
         let idx = self.indexes.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = load_query(&ws, &cache, &q, lod, &idx).map_err(|e| format!("{e:#}"));
-            *slot.lock().unwrap() = Some(r);
+            finish_load(&slot, &latest, gen, r);
             ctx.request_repaint();
         });
     }
@@ -588,6 +597,7 @@ impl ModelView {
         let (parts, selected, base) = (l.parts.clone(), l.selected.clone(), l.base.clone());
         self.loading = true;
         let slot = self.pending.clone();
+        let (gen, latest) = self.next_load();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let r = glb::load(&p, &root)
@@ -603,15 +613,25 @@ impl ModelView {
                     base,
                 })
                 .map_err(|e| format!("{e:#}"));
-            *slot.lock().unwrap() = Some(r);
+            finish_load(&slot, &latest, gen, r);
             ctx.request_repaint();
         });
     }
 
+    /// Start a new load request: its number and the shared newest number.
+    fn next_load(&self) -> (u64, Arc<std::sync::atomic::AtomicU64>) {
+        let gen = self.load_gen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        (gen, self.load_gen.clone())
+    }
+
     fn poll(&mut self, rs: &egui_wgpu::RenderState) {
-        let Some(r) = self.pending.lock().unwrap().take() else {
+        let Some((gen, r)) = self.pending.lock().unwrap().take() else {
             return;
         };
+        if gen != self.load_gen.load(std::sync::atomic::Ordering::SeqCst) {
+            // answer to an older request; the newest one is still loading
+            return;
+        }
         self.loading = false;
         match r {
             Ok(l) => {
@@ -659,7 +679,12 @@ impl ModelView {
                 self.frames_since_load = 0;
                 self.apply_paint(rs);
             }
-            Err(e) => self.status = format!("error: {e}"),
+            Err(e) => {
+                // do not keep showing the previous model under the new name
+                self.gpu = None;
+                self.loaded = None;
+                self.status = format!("error: {e}");
+            }
         }
     }
 
@@ -1195,9 +1220,7 @@ impl ModelView {
                     want = self.picker.ui(ui, ws, idx, current.as_deref());
                 });
             if let Some(id) = want {
-                if !self.loading {
-                    self.open(&id, 0, &ctx);
-                }
+                self.open(&id, 0, &ctx);
             }
         }
         egui::Panel::right("model_side")
@@ -1366,7 +1389,11 @@ impl ModelView {
             }
             ctx.request_repaint();
         }
-        if self.loading || resp.dragged() || self.cam.fly {
+        if self.auto.then.is_some() && self.gpu.is_some() && !self.loading && self.frames_since_load >= 3 {
+            let q = self.auto.then.take().unwrap();
+            self.open(&q, 0, &ctx);
+        }
+        if self.loading || resp.dragged() || self.cam.fly || self.auto.then.is_some() {
             ctx.request_repaint();
         }
     }
@@ -2185,5 +2212,14 @@ mod tests {
         for (level, index) in [(0, 0), (2, 0), (3, 1), (4, 1), (5, 2), (7, 2)] {
             assert_eq!(lod_index(&lods, level), index);
         }
+    }
+}
+
+/// Hand a finished load to the viewer, unless a newer request was made
+/// meanwhile.
+fn finish_load(slot: &Pending, latest: &std::sync::atomic::AtomicU64, gen: u64, r: Result<Loaded, String>) {
+    let mut s = slot.lock().unwrap();
+    if latest.load(std::sync::atomic::Ordering::SeqCst) == gen {
+        *s = Some((gen, r));
     }
 }

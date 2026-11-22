@@ -1570,6 +1570,7 @@ impl App {
             self.tab = Tab::Model;
             let lod = c.u("lod").unwrap_or(0) as usize;
             m.open(q, lod, ctx);
+            m.auto.then = c.get("then").map(str::to_string);
         }
         if c.has("no-picker") {
             m.show_picker = false;
