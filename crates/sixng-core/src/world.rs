@@ -16,6 +16,7 @@ pub const STEPS: &[(&str, &str, &str)] = &[
     ("lights", "Lights", "light emitters in world space"),
     ("interiors", "Interiors", "interior instances + collision links (after Collision)"),
     ("surfaces", "Surfaces", "inferred surface categories (after Collision, Lane graph, Batches)"),
+    ("names", "Names", "surface material and street names (after Collision, Lane graph, Surfaces)"),
 ];
 
 fn sel_meta(ix: &[Entry]) -> Vec<&Entry> {
@@ -76,6 +77,10 @@ pub fn run_step(ws: &Workspace, step: &str, out: &Path, pr: Progress) -> Result<
                     };
                     let s = crate::surface::surface_categories(&inp, out, &*pr)?;
                     Ok(format!("surfaces: {} ids, {:.1} % of collision area categorised", s.ids, 100.0 * s.area_covered))
+                }
+                "names" => {
+                    let s = crate::gamenames::annotate(ws, &levels.id, out, pr)?;
+                    Ok(format!("names: {s}"))
                 }
                 _ => Err(anyhow::anyhow!("unknown step {step}")),
             }

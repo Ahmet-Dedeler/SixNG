@@ -353,6 +353,15 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Names in the world exports, from common.rpf's XML: collision surface ids -> physics material names (`surface_names.json`, `names_by_surface_id` in surfaces.json, `name` in surface_categories.json) and road-node street hashes -> location key, street label and text (`street_key`, `street_label`, `street_text` on the nodes of graph.json). Run after `collision`, `surfaces` and `paths`; needs common (and data for the street text) indexed.
+    Annotate {
+        /// Archive the exports came from (default levels).
+        #[arg(default_value = "levels")]
+        archive: String,
+        /// Output directory (the same one the other exports wrote to).
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// Inferred collision surface categories (needs `collision`; uses `paths`, `placements --batches` and the navmeshes archive when present): <out>/collision/<archive>/surface_categories.json.
     Surfaces {
         /// Archive (default levels).
@@ -1179,6 +1188,12 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let msg = sixng_core::world::run_step(&ws, s, po, pr.clone())?;
                 out.print(&json!({"ok": true, "step": s, "result": msg, "seconds": t.elapsed().as_secs_f64()}));
             }
+        }
+        Cmd::Annotate { archive, out: po } => {
+            let a = ws.resolve(archive)?;
+            let t = Instant::now();
+            let s = sixng_core::gamenames::annotate(&ws, &a.id, po, pr)?;
+            out.print(&json!({"ok": true, "archive": a.id, "result": s, "seconds": t.elapsed().as_secs_f64()}));
         }
         Cmd::Surfaces { archive, navmeshes, out: po } => {
             let a = ws.resolve(archive)?;

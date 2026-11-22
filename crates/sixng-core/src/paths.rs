@@ -61,7 +61,8 @@ pub struct Node {
     pub address: [u16; 2],
     /// Speed limit, m/s (half float at +0x24).
     pub speed: f32,
-    /// Street-name hash (0 = none; names not resolved).
+    /// Street hash (0 = none): joaat of the lower-case location key;
+    /// `sixng annotate` adds the key, label and text (`gamenames`).
     pub street: String,
     pub flags: String,
     /// Named node flags (`PNF_` names without the prefix; `bitN` = unnamed).

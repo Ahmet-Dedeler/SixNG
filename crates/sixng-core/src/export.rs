@@ -1752,7 +1752,7 @@ pub fn export_collision(a: &ArchiveInfo, entries: &[&Entry], out: &Path, progres
     fs::write(dir.join("index.jsonl"), s)?;
     let census = census.into_inner().unwrap();
     fs::write(dir.join("surfaces.json"), serde_json::to_vec_pretty(&serde_json::json!({
-        "note": "surface id = u16 at +0 of each 8-byte bound material: a 15-bit hash of the surface-type name (names listed in common.rpf's material XML; hash function unknown). Values: triangles using it.",
+        "note": "surface id = u16 at +0 of each 8-byte bound material: 18 + elf(material name) % 32749, the material names being those of common.rpf's material XML (`sixng annotate` adds them as names_by_surface_id). Values: triangles using it.",
         "triangles_by_surface_id": census,
     }))?)?;
     Ok((n, census))
@@ -2228,7 +2228,7 @@ pub fn export_paths(a: &ArchiveInfo, entries: &[&Entry], out: &Path, progress: P
     let doc = serde_json::json!({
         "node_file": nf, "link_file": lf,
         "coordinate_system": "RAGE world space, Z-up, metres",
-        "note": "GTA V nodes*.ynd equivalent. speed: m/s from a half float (10/30/40/50 mph values). lanes_to/lanes_from per link direction; almost every link has its reverse. street: unresolved name hash. Nodes at z = 0.3 are boat paths.",
+        "note": "GTA V nodes*.ynd equivalent. speed: m/s from a half float (10/30/40/50 mph values). lanes_to/lanes_from per link direction; almost every link has its reverse. street: joaat of a lower-case location key (`sixng annotate` adds street_key, street_label and street_text). Nodes at z = 0.3 are boat paths.",
         "junction_file": jid,
         "junction_note": "junctions: node = junction node index; entrances with their node and turn paths (start/end points, length, target node); phases = traffic-light phases (duration s, lights as u64 hash + boxId). A junction with phases is signalised.",
         "flags_note": "Node flag_names come from the PNF_ enum value hashes (34 of 51 recovered); unnamed bits are bitN. Link flag_names: GpsCanGoBothWays, ShortCut, LeadsToDeadEnd, LeadsFromDeadEnd are the game's PNLF_ names; [unpaved/track] (bit 5) and [two-way road] (bit 10) are inferred from geometry; [no ambient traffic?] (bit 6) is inferred from node traffic density (set on every link touching a density-0 node).",
