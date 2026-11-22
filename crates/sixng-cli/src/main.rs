@@ -450,6 +450,21 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Particle effect dictionaries (unnamed resources with keyframe
+    /// textures; data.rpf has 147): per dictionary its name (scr_arc_tl),
+    /// effect/emitter rule names and keyframe-texture count, as JSON. With
+    /// -o, also <out>/ptfx/<archive>/index.json and per dictionary
+    /// <offset>.json with the keyframe curves (16 RGBA samples x 4 rows per
+    /// keyframe texture). Rule parameters and sprite links are not decoded.
+    Ptfx {
+        #[arg(default_value = "data")]
+        archive: String,
+        /// Regex on the dictionary name or any rule name.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// Bink videos in movies.rpf (stored uncompressed, so the stream index has none): lists every video with size, resolution, frame rate, duration and audio tracks in <out>/movies/movies.json. With --extract, writes the .bk2 files as they are (playable in any Bink 2 player); all of them take about 8.8 GB, so --only picks some.
     Movies {
         /// Archive (default movies).
@@ -1294,6 +1309,42 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = sixng_core::vehicles::export(&a, &metas, &names, po)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+        }
+        Cmd::Ptfx { archive, name, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
+            use rayon::prelude::*;
+            let cands: Vec<&sixng_core::scan::Entry> = ix.entries.iter().filter(|e| e.kind == Kind::RageObj && e.rtype.is_none()).collect();
+            let mut found: Vec<(sixng_core::ptfx::PtfxDict, Option<serde_json::Value>)> = cands
+                .par_iter()
+                .filter_map(|e| {
+                    let r = sixng_core::resource::Resource::load(&a.path, e).ok()?;
+                    let info = sixng_core::drawable::describe(&r);
+                    if !sixng_core::ptfx::is_ptfx(&info) {
+                        return None;
+                    }
+                    let d = sixng_core::ptfx::describe(&e.id, e.usize, &info);
+                    if let Some(re) = &re {
+                        if !d.name.iter().chain(d.rules.iter()).any(|s| re.is_match(s)) {
+                            return None;
+                        }
+                    }
+                    let kf = po.as_ref().map(|_| json!(sixng_core::ptfx::keyframes(&r, &info)));
+                    Some((d, kf))
+                })
+                .collect();
+            found.sort_by(|x, y| x.0.id.cmp(&y.0.id));
+            if let Some(po) = po {
+                let dir = po.join("ptfx").join(a.id.trim_end_matches(".rpf").replace(['/', '\\'], "_"));
+                std::fs::create_dir_all(&dir)?;
+                for (d, kf) in &found {
+                    let off = d.id.rsplit('@').next().unwrap_or("x");
+                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&json!({"dictionary": d, "keyframes": kf}))?)?;
+                }
+                std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
+            }
+            out.print(&json!({"ok": true, "archive": a.id, "count": found.len(), "dictionaries": found.iter().map(|x| &x.0).collect::<Vec<_>>()}));
         }
         Cmd::Movies { archive, out: po, extract, only } => {
             let a = ws.resolve(archive)?;
