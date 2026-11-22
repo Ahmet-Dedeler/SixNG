@@ -200,6 +200,22 @@ pub fn embedded_hash(r: &Resource, t: &TexInfo) -> Option<u64> {
     (o + 16 <= r.sys.len()).then(|| r.u64(o + 8)).filter(|&h| h != 0)
 }
 
+/// Row layout of a tint palette `width` texels wide: (entries per row, rows).
+/// The width is a power of two `p` plus `k` extra texels; a row holds
+/// `256 >> k` entries (at most `p`). Placements pick the row with their
+/// tint value (`Entity::tint_row`). Derived from our own data: the largest
+/// tint value placed with each palette width is rows - 1, and later rows
+/// start on these boundaries.
+pub fn tint_layout(width: u32) -> (u32, u32) {
+    if width == 0 {
+        return (0, 0);
+    }
+    let p = 1u32 << (31 - width.leading_zeros());
+    let k = width - p;
+    let len = if k >= 8 { 1 } else { (256u32 >> k).min(p) };
+    (len, p / len)
+}
+
 /// RGBA8 pixels of mip 0 of an embedded texture. One-row textures (the
 /// per-model tint palettes) are stored linear.
 pub fn embedded_rgba(r: &Resource, t: &TexInfo) -> Result<Vec<u8>> {
@@ -510,5 +526,15 @@ fn f16(h: u16) -> f32 {
         31 if m == 0.0 => f32::INFINITY,
         31 => 0.0,
         _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+    }
+}
+
+#[cfg(test)]
+mod tint_tests {
+    #[test]
+    fn tint_layouts() {
+        for (w, l) in [(13, (8, 1)), (37, (8, 4)), (131, (32, 4)), (256, (256, 1)), (513, (128, 4)), (1024, (256, 4)), (1028, (16, 64)), (8194, (64, 128))] {
+            assert_eq!(super::tint_layout(w), l, "width {w}");
+        }
     }
 }

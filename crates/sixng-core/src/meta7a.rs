@@ -357,6 +357,12 @@ pub struct Entity {
     /// 64-bit hash at +8 (unknown function; differs per archetype).
     pub hash64: String,
     pub guid: String,
+    /// Tint palette row of this instance (field `3c852527`; absent = 0):
+    /// the colour is palette entry `tint_row * row_length + COLOR0.b`, with
+    /// the row layout from the model's model.json (rows past the last one
+    /// are assumed to clamp to it).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub tint_row: u32,
     /// `false` when the placement should not be drawn by default (proxy,
     /// placeholder); absent otherwise. See `render_reason`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -368,6 +374,10 @@ pub struct Entity {
     pub lod: serde_json::Value,
     /// Every other scalar field, keyed by field name or hash.
     pub fields: BTreeMap<String, serde_json::Value>,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Why a placement should not be rendered by default, or None.
@@ -508,6 +518,7 @@ pub fn map_file(r: &Resource, names: &HashMap<u32, (String, String)>) -> Option<
                 flags: r.u32(o + 0x48),
                 hash64: format!("{:016x}", r.u64(o + 8)),
                 guid: format!("{:016x}", r.u64(o + 0x20)),
+                tint_row: fields.get("3c852527").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
                 lod: entity_lod(&fields),
                 fields,
             }

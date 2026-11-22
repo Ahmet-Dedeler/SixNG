@@ -84,7 +84,7 @@ pub const SLOTS: &[(&str, &str)] = &[
     ("b9f4bdac", "vehicle grime"),
     ("84d22f74", "vehicle scratches"),
     ("fb03ae36", "vehicle mask pack (green-dominant)"),
-    ("2c8d7182", "tint palette (embedded in the model: one row of RGBA8 colours)"),
+    ("2c8d7182", "tint palette (embedded in the model: rows of RGBA8 colours, picked per instance by the placement tint row)"),
 ];
 
 pub fn slot_role(param_hash: &str) -> Option<&'static str> {
@@ -227,7 +227,7 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
         ],
         "overlay": {"colour_alpha": tex(overlay), "uv_set": null, "weight": "texture alpha (grime/dirt); UV set unknown"},
         "extra_data": tex(extra),
-        "vertex_color_channels": {"r": "mostly 255 (unknown, maybe AO/tint)", "g": "0..45 (unknown)", "b": "few distinct values (unknown, maybe a variant index)", "a": "layer 2 weight"},
+        "vertex_color_channels": {"r": "mostly 255 (unknown, maybe AO/tint)", "g": "0..45 (unknown)", "b": "tint palette index (entry within the palette row)", "a": "layer 2 weight"},
         "confidence": {"grouping": "high", "weight_channel": "medium", "uv_layer2": "medium", "uv_base": "low", "data_channels": "unknown"},
         "note": "Derived from texture-size grouping and vertex/UV statistics, not from shader code. Blend: lerp(base, layer2, COLOR0.a), then the overlay by its alpha. Normal maps: DirectX green.",
     }))

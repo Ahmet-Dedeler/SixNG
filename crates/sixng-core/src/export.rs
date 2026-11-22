@@ -361,7 +361,10 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                                 Ok(rgba) => {
                                     if t.param_hash == TINT_PALETTE && et.height == 1 {
                                         st.tint_palette = Some(rgba.chunks(4).map(|p| [p[0], p[1], p[2], p[3]]).collect());
-                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour".into();
+                                        let (len, rows) = texture::tint_layout(et.width);
+                                        e["tint_row_length"] = len.into();
+                                        e["tint_rows"] = rows.into();
+                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour. Placed instances pick a row: entry tint_row * tint_row_length + COLOR0.b (tint_row from the placement, assumed to clamp at tint_rows - 1)".into();
                                     }
                                     e["status"] = "ok (embedded in the model)".into();
                                     if o.png {
