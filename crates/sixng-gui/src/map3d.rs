@@ -76,7 +76,31 @@ struct Shared {
 }
 
 /// (model, texture size cap used, result)
-type LoadResult = (u32, u32, Result<glb::Model, String>);
+type LoadResult = (u32, u32, Result<Loaded, String>);
+
+/// A model loaded and uploaded by a worker: the frame only books it in.
+struct Loaded {
+    gm: GpuModel,
+    /// Texture keys with their GPU bytes.
+    keys: Vec<(String, usize)>,
+    tris: usize,
+    /// Geometry and texture bytes, meshes / materials / images, upload ms.
+    vb: usize,
+    tb: usize,
+    nm: (usize, usize, usize),
+    up_ms: f32,
+}
+
+/// GPU objects shared with the workers: device, queue and upload state.
+#[derive(Clone)]
+struct Gpu {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    up: crate::render3d::Uploader,
+}
+
+/// Texture cache (key -> texture, shared between models and with the workers).
+type TexCache = Arc<Mutex<HashMap<String, wgpu::Texture>>>;
 
 /// Detail settings (the "detail" slider sets them all; each can be tuned).
 #[derive(Clone, PartialEq)]
@@ -147,6 +171,8 @@ struct Perf {
     first_idle_s: Option<f32>,
     /// Every in-range model loaded at least with small textures.
     coarse_s: Option<f32>,
+    /// Every on-screen model within 250 m loaded.
+    near_s: Option<f32>,
     last_frame: Option<Instant>,
     frame_ms: std::collections::VecDeque<f32>,
     /// Peaks: process RAM, map estimate (bytes).
@@ -194,7 +220,10 @@ pub struct Map3D {
     pub status: String,
     renderer: Option<Renderer3D>,
     cache: HashMap<u32, Slot>,
-    tex_cache: HashMap<String, wgpu::Texture>,
+    tex_cache: TexCache,
+    /// Replaced and evicted models go to a thread that drops them (freeing
+    /// many GPU objects takes milliseconds).
+    dropper: Option<mpsc::Sender<GpuModel>>,
     /// Estimated GPU bytes of the cached textures.
     tex_bytes: usize,
     children_start: Vec<u32>,
@@ -401,7 +430,8 @@ impl Map3D {
             status: String::new(),
             renderer: None,
             cache: HashMap::new(),
-            tex_cache: HashMap::new(),
+            tex_cache: Arc::new(Mutex::new(HashMap::new())),
+            dropper: None,
             tex_bytes: 0,
             tex_refs: HashMap::new(),
             model_texs: HashMap::new(),
@@ -478,22 +508,72 @@ impl Map3D {
         self.dirty = true;
     }
 
-    fn start_workers(&mut self) {
+    fn start_workers(&mut self, gpu: Gpu) {
         if self.workers_started {
             return;
         }
         self.workers_started = true;
-        let (tx, rx) = mpsc::channel::<LoadResult>();
+        {
+            let (dtx, drx) = mpsc::channel::<GpuModel>();
+            std::thread::spawn(move || {
+                mem::lower_thread_priority();
+                for gm in drx {
+                    drop(gm);
+                }
+            });
+            self.dropper = Some(dtx);
+        }
+        let (main_tx, rx) = mpsc::channel::<LoadResult>();
         self.rx = Some(rx);
+        // Loaded models go through one upload thread at normal priority:
+        // creating GPU objects takes locks the frame's render pass also
+        // takes, and a low-priority worker preempted while holding one
+        // stalled the frame (60 ms render passes).
+        let (tx, up_rx) = mpsc::channel::<(u32, u32, Result<glb::Model, String>)>();
+        {
+            let gpu = gpu.clone();
+            let tex_cache = self.tex_cache.clone();
+            std::thread::spawn(move || {
+                for (m, used, res) in up_rx {
+                    let res = res.map(|model| {
+                        let tu = Instant::now();
+                        let gm = gpu.up.upload_with(&gpu.device, &gpu.queue, &model, &[], &mut |i| {
+                            if let Some(t) = tex_cache.lock().unwrap().get(&i.key) {
+                                return Some(t.clone());
+                            }
+                            if !crate::render3d::has_pixels(i) {
+                                return None;
+                            }
+                            let t = crate::render3d::tex_rgba(&gpu.device, &gpu.queue, i);
+                            Some(tex_cache.lock().unwrap().entry(i.key.clone()).or_insert(t).clone())
+                        });
+                        Loaded {
+                            gm,
+                            keys: model.images.iter().map(|i| (i.key.clone(), i.bytes())).collect(),
+                            tris: model.triangles,
+                            vb: model.meshes.iter().map(|me| me.verts.len() * std::mem::size_of::<glb::Vertex>() + me.indices.len() * 4).sum(),
+                            tb: model.images.iter().map(|i| i.bytes()).sum(),
+                            nm: (model.meshes.len(), model.materials.len(), model.images.len()),
+                            up_ms: tu.elapsed().as_secs_f32() * 1000.0,
+                        }
+                    });
+                    if main_tx.send((m, used, res)).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
         {
             // size of the reduced-texture cache, so it stays under its cap
             let dir = self.cache_dir();
             glb::LOWTEX_BYTES.store(u64::MAX / 2, Ordering::Relaxed);
             glb::LOWTEX128_BYTES.store(u64::MAX / 2, Ordering::Relaxed);
+            glb::BC64_BYTES.store(u64::MAX / 2, Ordering::Relaxed);
             std::thread::spawn(move || {
                 let size = |d: &str| -> u64 { std::fs::read_dir(dir.join(d)).map(|rd| rd.filter_map(|e| e.ok()?.metadata().ok()).map(|m| m.len()).sum()).unwrap_or(0) };
                 glb::LOWTEX128_BYTES.store(size("lowtex128"), Ordering::Relaxed);
                 glb::LOWTEX_BYTES.store(size("lowtex"), Ordering::Relaxed);
+                glb::BC64_BYTES.store(size("bc64"), Ordering::Relaxed);
             });
         }
         let idx: Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -551,15 +631,8 @@ impl Map3D {
                     }
                     let max_tex = if sh.tex_over.load(Ordering::Relaxed) { max_tex.min(64) } else { max_tex };
                     // first, distant loads: base colour only (sharper reloads get all maps)
-                    let opts = glb::LoadOpts { max_tex, skip_keys: Some(keys.clone()), no_textures: !textures, hide_placeholders: true, small_cache: true, base_only: max_tex <= FIRST_TEX };
-                    let res = load_model(&ws, &Path::new(&work).join(crate::GUI_CACHE), &id, lod, &opts, &idx, &offs, &arcs).map(merge_meshes).map(|mut m| {
-                        if sh.bc.load(Ordering::Relaxed) {
-                            for i in &mut m.images {
-                                i.compress();
-                            }
-                        }
-                        m
-                    });
+                    let opts = glb::LoadOpts { max_tex, skip_keys: Some(keys.clone()), no_textures: !textures, hide_placeholders: true, small_cache: true, base_only: max_tex <= FIRST_TEX, bc: sh.bc.load(Ordering::Relaxed) };
+                    let res = load_model(&ws, &Path::new(&work).join(crate::GUI_CACHE), &id, lod, &opts, &idx, &offs, &arcs).map(merge_meshes);
                     sh.unread.fetch_add(1, Ordering::SeqCst);
                     sh.inflight.lock().unwrap().remove(&req.model);
                     let used = if textures { max_tex } else { u32::MAX };
@@ -809,10 +882,12 @@ impl Map3D {
             acc.keep.insert(e.model);
             let nd = acc.near.entry(e.model).or_insert(f32::MAX);
             *nd = nd.min(dd);
-            // load order: big and near first, on screen before off screen,
-            // what lies ahead between the two
+            // load order: nearest surface first (size only breaks near-ties,
+            // so a big building far off does not beat a prop next to the
+            // camera), on screen before off screen, what lies ahead between
+            let surf = (dd - rad.min(200.0)).max(1.0);
             let p = acc.prio.entry(e.model).or_insert(f32::MAX);
-            *p = p.min(dd / rad.clamp(1.0, 400.0).sqrt() * if seen { 1.0 } else if draw { 3.0 } else { 2.0 });
+            *p = p.min(surf / rad.clamp(1.0, 400.0).powf(0.25) * if seen { 1.0 } else if draw { 3.0 } else { 2.0 });
             if !seen {
                 return;
             }
@@ -901,6 +976,14 @@ impl Map3D {
             })
             .map(|(&m, &p)| Req { model: m, id: format!("{}|{}|{}|{}", data.name(m), d.drawable_lod, tex_for(near.get(&m).copied().unwrap_or(0.0)).min(FIRST_TEX), tx_on), prio: p })
             .collect();
+        // sharper reloads wait until every wanted model has its first load:
+        // a complete view first, then detail (full-size decodes are ~10x the
+        // cost of a first load)
+        if !reqs.is_empty() {
+            for u in &mut upgrades {
+                u.prio += 1.0e9;
+            }
+        }
         reqs.extend(upgrades);
         reqs.sort_by(|a, b| a.prio.partial_cmp(&b.prio).unwrap_or(std::cmp::Ordering::Equal));
         reqs.truncate(4000);
@@ -950,37 +1033,34 @@ impl Map3D {
         any
     }
 
-    /// Upload finished loads within a time budget.
+    /// Book in finished loads (the workers already uploaded them).
     fn poll_loads(&mut self, rs: &egui_wgpu::RenderState) -> bool {
         let Some(rx) = &self.rx else { return false };
         let t0 = Instant::now();
         let mut any = false;
         let ren = self.renderer.as_ref().unwrap();
-        while t0.elapsed().as_millis() < 12 {
+        while t0.elapsed().as_millis() < 4 {
             let Ok((m, tex, res)) = rx.try_recv() else { break };
             self.shared.unread.fetch_sub(1, Ordering::SeqCst);
             any = true;
             match res {
-                Ok(model) => {
-                    let tu = Instant::now();
-                    let mut gm = ren.upload_shared(rs, &model, &[], Some(&mut self.tex_cache));
-                    let up_ms = tu.elapsed().as_secs_f32() * 1000.0;
+                Ok(Loaded { mut gm, keys, tris, vb, tb, nm, up_ms }) => {
                     {
                         let mut k = self.tex_keys.lock().unwrap();
-                        let mut keys = Vec::new();
-                        for i in &model.images {
-                            let bytes: usize = i.bytes();
-                            let r = self.tex_refs.entry(i.key.clone()).or_insert((0, 0));
+                        let mut cache = self.tex_cache.lock().unwrap();
+                        let mut names = Vec::with_capacity(keys.len());
+                        for (key, bytes) in keys {
+                            let r = self.tex_refs.entry(key.clone()).or_insert((0, 0));
                             r.0 += 1;
                             if bytes > 0 && r.1 == 0 {
                                 r.1 = bytes;
                                 self.tex_bytes += bytes;
-                                k.insert(i.key.clone());
+                                k.insert(key.clone());
                             }
-                            keys.push(i.key.clone());
+                            names.push(key);
                         }
-                        if let Some(old) = self.model_texs.insert(m, keys) {
-                            Self::release_keys(&mut self.tex_refs, &mut self.tex_cache, &mut k, &mut self.tex_bytes, old);
+                        if let Some(old) = self.model_texs.insert(m, names) {
+                            Self::release_keys(&mut self.tex_refs, &mut cache, &mut k, &mut self.tex_bytes, old);
                         }
                     }
                     if let Some(v) = self.want.get(&m) {
@@ -989,11 +1069,11 @@ impl Map3D {
                         gm.n_instances = 0;
                     }
                     let td = Instant::now();
-                    self.cache.insert(m, Slot::Ready { gm, used: self.frame, tris: model.triangles, tex });
-                    let vb: usize = model.meshes.iter().map(|me| me.verts.len() * std::mem::size_of::<glb::Vertex>() + me.indices.len() * 4).sum();
-                    let tb: usize = model.images.iter().map(|i| i.bytes()).sum();
-                    let nm = (model.meshes.len(), model.materials.len(), model.images.len());
-                    drop(model);
+                    if let Some(Slot::Ready { gm: old, .. }) = self.cache.insert(m, Slot::Ready { gm, used: self.frame, tris, tex }) {
+                        if let Some(d) = &self.dropper {
+                            let _ = d.send(old);
+                        }
+                    }
                     let rest = td.elapsed().as_secs_f32() * 1000.0;
                     if up_ms + rest > self.slow_uploads.last().map_or(0.0, |s| s.0) || self.slow_uploads.len() < 5 {
                         self.slow_uploads.push((up_ms + rest, up_ms, rest, vb, tb, nm.0, nm.1, nm.2));
@@ -1027,10 +1107,13 @@ impl Map3D {
     }
 
     fn remove_model(&mut self, m: u32) {
-        self.cache.remove(&m);
+        if let (Some(Slot::Ready { gm, .. }), Some(d)) = (self.cache.remove(&m), &self.dropper) {
+            let _ = d.send(gm);
+        }
         if let Some(keys) = self.model_texs.remove(&m) {
             let mut k = self.tex_keys.lock().unwrap();
-            Self::release_keys(&mut self.tex_refs, &mut self.tex_cache, &mut k, &mut self.tex_bytes, keys);
+            let mut cache = self.tex_cache.lock().unwrap();
+            Self::release_keys(&mut self.tex_refs, &mut cache, &mut k, &mut self.tex_bytes, keys);
         }
     }
 
@@ -1260,7 +1343,6 @@ impl Map3D {
             self.perf.data_s = Some(t_open.elapsed().as_secs_f32());
         }
         self.frame += 1;
-        self.start_workers();
         if self.renderer.is_none() {
             let ai = rs.adapter.get_info();
             eprintln!("[map3d] adapter {} ({:?}, {:?}) present {:?}", ai.name, ai.backend, ai.device_type, rs.target_format);
@@ -1269,6 +1351,8 @@ impl Map3D {
             self.shared.bc.store(bc, Ordering::Relaxed);
             eprintln!("[map3d] block-compressed textures: {}", if bc { "on" } else { "off" });
         }
+        let gpu = Gpu { device: rs.device.clone(), queue: rs.queue.clone(), up: self.renderer.as_ref().unwrap().uploader() };
+        self.start_workers(gpu);
         // side panel
         egui::SidePanel::right("map3d_side").resizable(true).default_width(300.0).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_ui(ui));
@@ -1306,7 +1390,7 @@ impl Map3D {
             let lod_changed = self.last_detail.as_ref().map_or(false, |d| d.drawable_lod != self.detail.drawable_lod || d.textures != self.detail.textures || d.max_tex != self.detail.max_tex);
             if lod_changed {
                 self.cache.clear();
-                self.tex_cache.clear();
+                self.tex_cache.lock().unwrap().clear();
                 self.tex_bytes = 0;
                 self.tex_refs.clear();
                 self.model_texs.clear();
@@ -1355,7 +1439,7 @@ impl Map3D {
             self.stats.queued = queued;
             self.stats.models_ready = self.cache.values().filter(|s| matches!(s, Slot::Ready { .. })).count();
             self.stats.failed = self.cache.values().filter(|s| matches!(s, Slot::Failed(_))).count();
-            self.stats.textures = self.tex_cache.len();
+            self.stats.textures = self.tex_cache.lock().unwrap().len();
             self.stats.tex_gb = self.tex_bytes as f32 / (1u64 << 30) as f32;
         }
 
@@ -1827,11 +1911,11 @@ impl Map3D {
             let wc = rs.device.get_internal_counters();
             let n_mesh: usize = self.cache.values().map(|s| if let Slot::Ready { gm, .. } = s { gm.meshes.len() } else { 0 }).sum();
             let line = format!(
-                "[map3d] tick t {:.0} s | models {} ({} meshes) | textures {} | est tex {:.2} + rest {:.2} GB | GPU real {:.2} + {:.2} shared | process {:.2} GB | pressure {} | queued {} | wgpu live: {} buffers {:.2} GB, {} textures {:.2} GB, {} bind groups, {} memory blocks",
+                "[map3d] tick t {:.0} s | models {} ({} meshes) | textures {} | est tex {:.2} + rest {:.2} GB | GPU real {:.2} + {:.2} shared | process {:.2} GB | pressure {} | queued {} | wgpu live: {} buffers {:.2} GB, {} textures {:.2} GB, {} bind groups, {} memory blocks | render µs/frame pass|finish|submit {}",
                 self.perf.t_open.map_or(0.0, |t| t.elapsed().as_secs_f32()),
                 self.stats.models_ready,
                 n_mesh,
-                self.tex_cache.len(),
+                self.tex_cache.lock().unwrap().len(),
                 mem::gb(self.tex_bytes as u64),
                 mem::gb(self.gpu_bytes().saturating_sub(self.tex_bytes as u64)),
                 mem::gb(self.gpu_real.0),
@@ -1844,9 +1928,17 @@ impl Map3D {
                 wc.hal.textures.read(),
                 wc.hal.texture_memory.read() as f32 / (1u64 << 30) as f32,
                 wc.hal.bind_groups.read(),
-                wc.hal.memory_allocations.read()
+                wc.hal.memory_allocations.read(),
+                {
+                    let r = &crate::render3d::RTIME;
+                    let n = r[3].swap(0, Ordering::Relaxed).max(1);
+                    format!("{} {} {}", r[0].swap(0, Ordering::Relaxed) / n, r[1].swap(0, Ordering::Relaxed) / n, r[2].swap(0, Ordering::Relaxed) / n).replace(' ', "|")
+                }
             );
             eprintln!("{line}");
+        }
+        if self.perf.near_s.is_none() && self.frame > 5 && !self.want.is_empty() && self.want.keys().all(|m| self.near_dist.get(m).map_or(true, |&d| d >= 250.0) || self.cache.contains_key(m)) {
+            self.perf.near_s = self.perf.t_open.map(|t| t.elapsed().as_secs_f32());
         }
         if self.perf.coarse_s.is_none() && self.frame > 5 && self.stats.queued <= self.stats.upgrades && !self.keep.is_empty() && self.keep.iter().all(|m| self.cache.contains_key(m)) {
             self.perf.coarse_s = self.perf.t_open.map(|t| t.elapsed().as_secs_f32());
@@ -1981,7 +2073,7 @@ impl Map3D {
         let er = rage(self.cam.eye());
         let ws = self.world.stats.clone();
         let line = format!(
-            "[map3d] {what} | map est {:.2} GB (peak {:.2}, process peak {:.2}) | GPU real {:.2} + {:.2} shared GB (peak {:.2}, spill peak {:.2}, budget {}) | coarse {} | terrain {} tiles ({} ground, level <= {}, {} resident, {} queued, {:.1} M tris) | t {:.1} s (data {:.1} s, first view {}) | eye ({:.0}, {:.0}, {:.0}) | RAM {:.2} GB | GPU est {:.2} GB (textures {:.2}, far field {:.2}) | models {} | inst {} | {:.1} M tris | update {:.1} ms ({} tested) | draws {} | render cpu {:.1} ms | stream {:.1} ms | terrain {:.1} ms | windows {:.1} ms | ui total {:.1} ms | size cut x{:.2} | loads {}: lookup {:.0} ms, export {} x {:.0} ms, glb {:.0} ms avg | textures: {} small hits, {} full decodes ({:.0} ms avg, {:.2} Mpx avg), image step {:.0} ms per model",
+            "[map3d] {what} | map est {:.2} GB (peak {:.2}, process peak {:.2}) | GPU real {:.2} + {:.2} shared GB (peak {:.2}, spill peak {:.2}, budget {}) | coarse {} (near 250 m {}) | terrain {} tiles ({} ground, level <= {}, {} resident, {} queued, {:.1} M tris) | t {:.1} s (data {:.1} s, first view {}) | eye ({:.0}, {:.0}, {:.0}) | RAM {:.2} GB | GPU est {:.2} GB (textures {:.2}, far field {:.2}) | models {} | inst {} | {:.1} M tris | update {:.1} ms ({} tested) | draws {} | render cpu {:.1} ms | stream {:.1} ms | terrain {:.1} ms | windows {:.1} ms | ui total {:.1} ms | size cut x{:.2} | loads {}: lookup {:.0} ms, export {} x {:.0} ms, glb {:.0} ms avg | textures: {} small hits, {} full decodes ({:.0} ms avg, {:.2} Mpx avg), image step {:.0} ms per model",
             mem::gb(self.mem_est),
             mem::gb(self.perf.peak_est),
             mem::gb(self.perf.peak_ram),
@@ -1991,6 +2083,7 @@ impl Map3D {
             mem::gb(self.perf.peak_gpu_shared),
             self.gpu_cap.map_or("-".to_string(), |c| format!("{:.1} GB", mem::gb(c))),
             self.perf.coarse_s.map_or("-".to_string(), |v| format!("{v:.1} s")),
+            self.perf.near_s.map_or("-".to_string(), |v| format!("{v:.1} s")),
             ws.drawn, ws.ground, ws.max_level, ws.resident, ws.queued, ws.tris as f32 / 1e6,
             self.perf.t_open.map_or(0.0, |t| t.elapsed().as_secs_f32()),
             self.perf.data_s.unwrap_or(0.0),

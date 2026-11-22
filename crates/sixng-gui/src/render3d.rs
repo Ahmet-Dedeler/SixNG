@@ -335,7 +335,7 @@ pub struct Renderer3D {
 }
 
 
-fn tex_rgba(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image) -> wgpu::Texture {
+pub fn tex_rgba(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image) -> wgpu::Texture {
     if let Some(bc) = &img.bc {
         return tex_bc(device, queue, img, bc);
     }
@@ -504,23 +504,53 @@ impl Renderer3D {
     /// image whose key is cached reuses that texture; images that arrive
     /// without pixels (skipped by the loader) must be in the cache.
     pub fn upload_shared(&self, rs: &egui_wgpu::RenderState, m: &glb::Model, overrides: &[Option<[f32; 4]>], mut cache: Option<&mut std::collections::HashMap<String, wgpu::Texture>>) -> GpuModel {
-        let device = &rs.device;
-        let queue = &rs.queue;
+        let (device, queue) = (&rs.device, &rs.queue);
+        self.uploader().upload_with(device, queue, m, overrides, &mut |i| match cache.as_deref_mut() {
+            Some(c) => match c.get(&i.key) {
+                Some(t) => Some(t.clone()),
+                None if has_pixels(i) => {
+                    let t = tex_rgba(device, queue, i);
+                    c.insert(i.key.clone(), t.clone());
+                    Some(t)
+                }
+                None => None,
+            },
+            None => has_pixels(i).then(|| tex_rgba(device, queue, i)),
+        })
+    }
+
+    /// What uploading needs, for loader threads (wgpu objects can be made on
+    /// any thread).
+    pub fn uploader(&self) -> Uploader {
+        Uploader { bgl_mat: self.bgl_mat.clone(), bgl_frame: self.bgl_frame.clone(), frame_ub: self.frame_ub.clone(), sampler: self.sampler.clone(), white: self.white.clone() }
+    }
+}
+
+/// An image with pixels to upload (not one skipped as already on the GPU).
+pub fn has_pixels(i: &glb::Image) -> bool {
+    !i.mips.is_empty() && (i.bc.is_some() || !i.mips[0].2.is_empty())
+}
+
+/// Render timing totals (µs): pass recording (incl. pass end), encoder
+/// finish, submit; then frames.
+pub static RTIME: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[derive(Clone)]
+pub struct Uploader {
+    bgl_mat: wgpu::BindGroupLayout,
+    bgl_frame: wgpu::BindGroupLayout,
+    frame_ub: wgpu::Buffer,
+    sampler: wgpu::Sampler,
+    white: wgpu::TextureView,
+}
+
+impl Uploader {
+    /// Upload a model; `get_tex` gives each image's texture (shared or new).
+    pub fn upload_with(&self, device: &wgpu::Device, queue: &wgpu::Queue, m: &glb::Model, overrides: &[Option<[f32; 4]>], get_tex: &mut dyn FnMut(&glb::Image) -> Option<wgpu::Texture>) -> GpuModel {
         let mut textures: Vec<wgpu::Texture> = Vec::new();
         let mut views: Vec<Option<wgpu::TextureView>> = Vec::new();
         for i in &m.images {
-            let t = match cache.as_deref_mut() {
-                Some(c) => match c.get(&i.key) {
-                    Some(t) => Some(t.clone()),
-                    None if !i.mips.is_empty() && (i.bc.is_some() || !i.mips[0].2.is_empty()) => {
-                        let t = tex_rgba(device, queue, i);
-                        c.insert(i.key.clone(), t.clone());
-                        Some(t)
-                    }
-                    None => None,
-                },
-                None => (!i.mips.is_empty() && (i.bc.is_some() || !i.mips[0].2.is_empty())).then(|| tex_rgba(device, queue, i)),
-            };
+            let t = get_tex(i);
             views.push(t.as_ref().map(|t| t.create_view(&Default::default())));
             if let Some(t) = t {
                 textures.push(t);
@@ -616,6 +646,9 @@ impl Renderer3D {
         let instances = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("inst"), contents: bytemuck::cast_slice(&inst), usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST });
         GpuModel { meshes, mat_bg, mat_alpha, mat_class, mat_decal, mat_ub, mat_cpu, _textures: textures, joints_buf, frame_bg, instances, n_instances: 1, instance_cap: 1, bbox: [Vec3::from(m.bbox[0]), Vec3::from(m.bbox[1])] }
     }
+}
+
+impl Renderer3D {
 
     /// Build wireframe edge buffers (on first use).
     pub fn ensure_edges(&self, rs: &egui_wgpu::RenderState, gm: &mut GpuModel, m: &glb::Model) {
@@ -774,6 +807,7 @@ impl Renderer3D {
     }
 
     pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, look: &Look, models: &[&GpuModel], lines: &[LineV], lines_on_top: &[LineV]) -> egui::TextureId {
+        let t_r = std::time::Instant::now();
         let size = [size[0].max(16), size[1].max(16)];
         self.ensure_target(rs, size);
         let device = &rs.device;
@@ -892,8 +926,15 @@ impl Renderer3D {
                 pass.set_vertex_buffer(0, lt.slice(..));
                 pass.draw(0..lines_on_top.len() as u32, 0..1);
             }
+            RTIME[0].fetch_add(t_r.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        queue.submit([enc.finish()]);
+        let t_e = std::time::Instant::now();
+        let cb = enc.finish();
+        RTIME[1].fetch_add(t_e.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        let t_s = std::time::Instant::now();
+        queue.submit([cb]);
+        RTIME[2].fetch_add(t_s.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        RTIME[3].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.draws = draws;
         let _ = &self.dummy_joints;
         t.egui_id

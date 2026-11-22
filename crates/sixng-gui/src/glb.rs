@@ -325,6 +325,52 @@ pub const TINY_TEX: u32 = 128;
 pub static LOWTEX128_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub const LOWTEX128_CAP: u64 = 2 << 30;
 
+/// Block-compressed 64 px copies (with their mips) for the 3D map's first
+/// loads, in `<cache>/bc64`: a few KB each, read straight into GPU format
+/// (no PNG decode, no compression on load). Own byte count and cap.
+pub const BC_TEX: u32 = 64;
+pub static BC64_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub const BC64_CAP: u64 = 1 << 30;
+
+/// Read a `bc64` copy: "SXB1", alpha u8, level count u8, then per level
+/// width u32, height u32, byte length u32 and the blocks.
+fn read_bc(sp: &Path) -> Option<(Vec<(u32, u32, Vec<u8>)>, crate::bc::Bc)> {
+    let b = std::fs::read(sp).ok()?;
+    if b.len() < 6 || &b[..4] != b"SXB1" {
+        return None;
+    }
+    let alpha = b[4] != 0;
+    let n = b[5] as usize;
+    let (mut o, mut dims, mut levels) = (6usize, Vec::with_capacity(n), Vec::with_capacity(n));
+    let u = |o: usize| -> Option<u32> { Some(u32::from_le_bytes(b.get(o..o + 4)?.try_into().ok()?)) };
+    for _ in 0..n {
+        let (w, h, len) = (u(o)?, u(o + 4)?, u(o + 8)? as usize);
+        o += 12;
+        levels.push(b.get(o..o + len)?.to_vec());
+        o += len;
+        dims.push((w, h, Vec::new()));
+    }
+    (n > 0).then_some((dims, crate::bc::Bc { alpha, levels }))
+}
+
+fn write_bc(sp: &Path, mips: &[(u32, u32, Vec<u8>)], bc: &crate::bc::Bc) {
+    let mut out = b"SXB1".to_vec();
+    out.push(bc.alpha as u8);
+    out.push(bc.levels.len() as u8);
+    for (m, l) in mips.iter().zip(&bc.levels) {
+        for v in [m.0, m.1, l.len() as u32] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(l);
+    }
+    let _ = std::fs::create_dir_all(sp.parent().unwrap());
+    let tmp = sp.with_extension("tmp");
+    if std::fs::write(&tmp, &out).is_ok() {
+        BC64_BYTES.fetch_add(out.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::rename(&tmp, sp);
+    }
+}
+
 /// Where the reduced copy of a texture lives (`<cache>/<dir>/<hash>.png`).
 fn small_path_in(out_root: &Path, dir: &str, p: &Path) -> PathBuf {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -378,6 +424,9 @@ pub struct LoadOpts {
     /// Base colour (and emissive) only: no normal or packed-data maps. The
     /// 3D map's first, distant loads use this; sharper reloads get all maps.
     pub base_only: bool,
+    /// Block-compress textures here and, at `BC_TEX` px, read and write the
+    /// `bc64` copies.
+    pub bc: bool,
 }
 
 pub fn load(path: &Path, out_root: &Path) -> Result<Model> {
@@ -408,6 +457,14 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         }
         use std::sync::atomic::Ordering::Relaxed;
         let t_img = std::time::Instant::now();
+        let spbc = (opts.bc && opts.small_cache && opts.max_tex == BC_TEX).then(|| small_path_in(out_root, "bc64", &p).with_extension("bc"));
+        if let Some((mips, bc)) = spbc.as_ref().and_then(|sp| read_bc(sp)) {
+            TEX_T[0].fetch_add(1, Relaxed);
+            TEX_T[4].fetch_add(t_img.elapsed().as_micros() as u64, Relaxed);
+            images.push(Image { key: key.clone(), mips, srgb, bc: Some(bc) });
+            img_by_key.insert(key, images.len() - 1);
+            return Some(images.len() - 1);
+        }
         // reduced copies: <= 128 px (lowtex128) for small requests, <= 256 px
         // (lowtex) otherwise; a 256 px copy also feeds the 128 px one
         let small = opts.small_cache && opts.max_tex > 0 && opts.max_tex <= SMALL_TEX;
@@ -455,8 +512,17 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             cur = reduce_to(cur, opts.max_tex);
         }
         let mips = mip_chain(cur.0, cur.1, cur.2);
+        let mut im = Image { key: key.clone(), mips, srgb, bc: None };
+        if opts.bc {
+            im.compress();
+            if let (Some(sp), Some(bc)) = (spbc.as_ref(), im.bc.as_ref()) {
+                if BC64_BYTES.load(Relaxed) < BC64_CAP {
+                    write_bc(sp, &im.mips, bc);
+                }
+            }
+        }
         TEX_T[4].fetch_add(t_img.elapsed().as_micros() as u64, Relaxed);
-        images.push(Image { key: key.clone(), mips, srgb, bc: None });
+        images.push(im);
         img_by_key.insert(key, images.len() - 1);
         Some(images.len() - 1)
     };
@@ -746,4 +812,35 @@ pub fn merge(into: &mut Model, other: Model) {
     }
     into.triangles += other.triangles;
     into.vertices += other.vertices;
+}
+
+#[cfg(test)]
+mod bench {
+    use super::*;
+    /// Per-texture cost of a first (64 px) load: 128 px PNG copy vs `bc64`.
+    /// `SIXNG_WORK=<work> cargo test --release bench_first_tex -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn bench_first_tex() {
+        let Some(work) = std::env::var_os("SIXNG_WORK") else { return };
+        let root = Path::new(&work).join(crate::GUI_CACHE);
+        let take = |d: &str| -> Vec<PathBuf> { std::fs::read_dir(root.join(d)).map(|r| r.filter_map(|e| Some(e.ok()?.path())).take(2000).collect()).unwrap_or_default() };
+        let t = std::time::Instant::now();
+        let pngs = take("lowtex128");
+        let mut n = 0;
+        for p in &pngs {
+            if let Some(v) = load_png(p) {
+                let v = reduce_to(v, BC_TEX);
+                let mut im = Image { key: String::new(), mips: mip_chain(v.0, v.1, v.2), srgb: true, bc: None };
+                im.compress();
+                n += 1;
+            }
+        }
+        let a = t.elapsed().as_secs_f64() * 1000.0 / n.max(1) as f64;
+        let t = std::time::Instant::now();
+        let bcs = take("bc64");
+        let m = bcs.iter().filter(|p| read_bc(p).is_some()).count();
+        let b = t.elapsed().as_secs_f64() * 1000.0 / m.max(1) as f64;
+        println!("png128 -> 64 px BC: {a:.3} ms per texture ({n}); bc64 read: {b:.3} ms per texture ({m})");
+    }
 }

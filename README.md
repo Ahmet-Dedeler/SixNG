@@ -431,13 +431,16 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   speed scales with height above ground.
 - Models are exported on demand into `<work>/gui_cache_v4` (the model
   viewer's cache) by background workers and drawn instanced: one GPU model
-  per model id, all its placements as instances. Loads go on-screen first,
-  then big and near before small and far; placements outside the view
-  (widened a little) are not drawn but stay loaded for turning round.
+  per model id, all its placements as instances. Loads go nearest surface
+  first (size only breaks near-ties), on screen before off screen;
+  placements outside the view (widened a little) are not drawn but stay
+  loaded for turning round. Sharper texture reloads wait until every wanted
+  model has its first load, so a complete view comes first.
   The workers (¾ of the cores, 2–12) run below normal priority so the
-  frame keeps its CPU. A model's meshes share one vertex, one index and
-  one material buffer, so a 130-part building uploads in one step instead
-  of stalling the frame.
+  frame keeps its CPU. GPU uploads run on one upload thread at normal
+  priority, and replaced or evicted models are freed on another thread,
+  so neither stalls the frame. A model's meshes share one vertex, one
+  index and one material buffer.
 - **Smooth streaming**: the visible set is worked out on all cores. While
   the camera moves, models in range of where it will be in 2 s (up to
   800 m ahead) are loaded but not drawn yet. A placement already drawn
@@ -449,9 +452,10 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   in 3 ms slices, not in one burst.
 - **Texture streaming**: a model first loads with 64 px base-colour
   textures only (normal and data maps come with the sharper reload), read
-  from reduced copies kept in `<work>/gui_cache_v4/lowtex128` (≤ 128 px,
-  capped at 2 GB) and `lowtex` (≤ 256 px, capped at 4 GB), both written on
-  first use. It then reloads with sharper textures as the camera comes
+  from block-compressed 64 px copies in `<work>/gui_cache_v4/bc64` (a few
+  KB each, capped at 1 GB; about 20× faster than decoding a PNG), else
+  from reduced PNG copies in `lowtex128` (≤ 128 px, capped at 2 GB) and
+  `lowtex` (≤ 256 px, capped at 4 GB), all written on first use. It then reloads with sharper textures as the camera comes
   closer (full size in the HD band, then 1/2, 1/4, 1/8). Textures are
   shared between models and go to the GPU block-compressed (BC1, or BC3
   with alpha: 4–8× less GPU memory) where the adapter supports it;
