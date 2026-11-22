@@ -267,11 +267,14 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
         out["vertex_color_channels"]["a"] = json!("layer-1 weight as 1 - a: 255 (unpainted) = base layer only");
         out["vertex_color_channels"]["r"] = json!("unverified on props: 0/1 part masks on containers, varies on concrete barriers (lower on upward faces)");
         out["confidence"]["weight_channel"] = json!("medium (direction from where the painting sits, not from shader code)");
-        out["note"] = json!("Derived from recovered slot names, UV tests and where the vertex alpha is painted, not from shader code. Blend: lerp(base, layer2, 1 - COLOR0.a), sharpened by the layers' materialb alpha (height-like), then the dirt overlay by its alpha (overlay UV set unknown). Normal maps: DirectX green.");
+        out["note"] = json!("Derived from recovered slot names, UV tests and where the vertex alpha is painted, not from shader code. Blend: lerp(base, layer2, 1 - COLOR0.a), sharpened by the layers' materialb alpha (height-like), then the dirt overlay by its alpha on TEXCOORD_2. Normal maps: DirectX green.");
+        out["overlay"]["uv_set"] = json!("TEXCOORD_2");
+        out["overlay"]["weight"] = json!("texture alpha (grime/dirt)");
+        out["confidence"]["uv_overlay"] = json!("medium");
         out["prop_2lyr"] = json!({
             "slot_names": {"p0": "lyr0diffusetex", "p6": "lyr0normaltex", "p7": "lyr0materialbtex", "p9": "lyr0materialatex", "p4": "lyr1diffusetex", "p10": "lyr1normaltex", "p5": "lyr1materialbtex", "p2": "lyr1materialatex", "p8": "dirtdiffusetex", "p1": "tintpalettetex (embedded)", "p11": "unnamed (greyscale mask, containers only)"},
             "tint": "the tintpalettetex colour is applied per vertex as COLOR_0 (tint_applied in meshes[]; props with a palette such as containers and barriers, not the rocks); multiply it into the base layer (white paint), not the rust or moss overlay, whose textures are already coloured",
-            "dirt_uv": "unknown: TEXCOORD_2 is parked at (1, 0) on every rock and many props (and the dirt alpha there is not 0, so it is not a no-dirt sentinel); TEXCOORD_0 and TEXCOORD_1 are both full mappings and equal on most rocks and barriers. TEXCOORD_1 is the best guess",
+            "dirt_uv": "TEXCOORD_2. On barriers and most containers it is a mapping of its own with almost no seams (27 against about 560 for TEXCOORD_0 and _1 on one barrier), and the dirt map is continuous across those seams while it reads as random across the other sets' seams. On every rock and on some containers it is parked at one point, (1, 0) or (0, 1), so the dirt there is one uniform sample (with wrap and bilinear filtering, the average of the four corner texels: alpha about 64 of 255 on the rock dirt map); sampling it as-is matches the vertex data. Not checked against shader code",
             "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). materialb alpha looks like a height map in both layers (a height blend would sharpen the COLOR0.a weight). Raw COLOR0 on a container is all 1 and on a large rock R is 0/1, G 1, B about 0 and A varies, so A = 255 means base only and the overlay weight is 1 - A (see layers[].weight).",
         });
     }
@@ -555,6 +558,7 @@ mod paint_tests {
         assert_eq!(l["layers"][1]["colour"]["png"], "t4.png");
         assert_eq!(l["layers"][1]["normal"]["png"], "t10.png");
         assert_eq!(l["overlay"]["colour_alpha"]["png"], "t8.png");
+        assert_eq!(l["overlay"]["uv_set"], "TEXCOORD_2");
         assert!(l["prop_2lyr"].is_object());
         assert_eq!(l["layers"][1]["weight"], "1 - COLOR0.a");
         assert_eq!(layers("b217b263", &entries).unwrap()["layers"][1]["weight"], "COLOR0.a");
