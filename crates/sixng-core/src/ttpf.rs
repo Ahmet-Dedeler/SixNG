@@ -10,8 +10,8 @@
 //!       u32 a: (a & 0xFFFFFF) << 8 = file offset of a zlib stream; bits 24-29 = flags
 //!              (codec: 0x20 zlib; 0x04 BC1, 0x0C/0x10 BC3/BC4?, 0x14 BC5, 0x18 BC6H,
 //!              0x1C BC7 = per-format BCPack, the Xbox Series hardware texture codec;
-//!              BC1 decodes with `bcpack-rs`, BC3 with `bc3pack`, BC7 with `bc7pack`, the others not
-//!              yet; 0x00 stored),
+//!              BC1 decodes with `bcpack-rs`, BC3 with `bc3pack`, BC4/BC5 with `bc45pack`,
+//!              BC7 with `bc7pack`, BC6H not yet; 0x00 stored),
 //!              bits 30-31 = 4 KiB pages added to the virtual offset
 //!       u32 b: virtual offset = 0x1000 + (b & 0xFFFFF) * 0x4000 + (a >> 30) * 0x1000
 //!              (the 0x1000 is the header page); b >> 20 = bytes of padding after
@@ -91,12 +91,17 @@ fn is_bcpack(fl: u8) -> bool {
 
 /// BCPack BC3 codec id.
 const CODEC_BC3: u8 = 0x0C;
+/// BCPack BC4 / BC5 codec ids.
+const CODEC_BC4: u8 = 0x10;
+const CODEC_BC5: u8 = 0x14;
+/// BCPack BC6H codec id.
+const CODEC_BC6H: u8 = 0x18;
 /// BCPack BC7 codec id.
 const CODEC_BC7: u8 = 0x1C;
 
-/// BCPack chunks that SixNG cannot decode: every codec but BC1 (0x04), BC3 (0x0C) and BC7 (0x1C).
+/// BCPack chunks that SixNG cannot decode (a codec id outside the six BC formats).
 fn is_undecoded(fl: u8) -> bool {
-    is_bcpack(fl) && ![bcpack::ttpf::CODEC_BC1, CODEC_BC3, CODEC_BC7].contains(&(fl & 0x3F))
+    is_bcpack(fl) && ![bcpack::ttpf::CODEC_BC1, CODEC_BC3, CODEC_BC4, CODEC_BC5, CODEC_BC6H, CODEC_BC7].contains(&(fl & 0x3F))
 }
 
 /// Decode a BCPack BC1 chunk to plain BC1 blocks (`blocks` x 8 bytes).
@@ -271,6 +276,12 @@ impl Ttpf {
                     crate::bc3pack::decode(&comp, ((v1 - v0) / 16) as usize).map(|o| o.blocks)
                 } else if fl & 0x3F == CODEC_BC7 {
                     crate::bc7pack::decode(&comp, ((v1 - v0) / 16) as usize).map(|o| o.blocks)
+                } else if fl & 0x3F == CODEC_BC4 {
+                    crate::bc45pack::decode_bc4(&comp, ((v1 - v0) / 8) as usize).map(|o| o.blocks)
+                } else if fl & 0x3F == CODEC_BC5 {
+                    crate::bc45pack::decode_bc5(&comp, ((v1 - v0) / 16) as usize).map(|o| o.blocks)
+                } else if fl & 0x3F == CODEC_BC6H {
+                    crate::bc6pack::decode_bc6h(&comp, ((v1 - v0) / 16) as usize).map(|o| o.blocks)
                 } else {
                     decode_bc1(&comp, ((v1 - v0) / 8) as usize)
                 };
@@ -298,7 +309,7 @@ impl Ttpf {
     }
 
     /// Bytes of [virt, virt + len) that fall in BCPack chunks SixNG cannot
-    /// decode (all but BC1; no read).
+    /// decode (a codec outside the six BC formats; no read).
     pub fn bcpack_bytes(&self, virt: u64, len: u64) -> u64 {
         self.bcpack_bytes_where(virt, len, is_undecoded)
     }
@@ -600,15 +611,14 @@ mod tests {
     }
 
     #[test]
-    fn only_bc1_bc3_and_bc7_bcpack_decode() {
+    fn every_bcpack_codec_decodes() {
         // flags byte = codec | (4 KiB page bits << 6)
         assert!(!is_bcpack(0x20) && !is_bcpack(0x00) && !is_bcpack(0xA0));
         assert!(is_bcpack(0x04) && !is_undecoded(0x04) && !is_undecoded(0xC4));
         assert!(is_bcpack(0x0C) && !is_undecoded(0x0C) && !is_undecoded(0x4C));
         assert!(!is_undecoded(0x1C) && !is_undecoded(0x5C));
-        for c in [0x10, 0x14, 0x18] {
-            assert!(is_undecoded(c));
-        }
+        assert!(!is_undecoded(0x10) && !is_undecoded(0x14) && !is_undecoded(0x54));
+        assert!(!is_undecoded(0x18) && !is_undecoded(0x58));
     }
 
     #[test]
