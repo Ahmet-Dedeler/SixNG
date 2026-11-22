@@ -266,14 +266,126 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
     Some(out)
 }
 
-/// `layers` plus, for the 4-layer ground family, the shader's constants
-/// (`params`).
-pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value]) -> Option<Value> {
+/// `layers` plus the material's measured UV mapping (`uv_fit`, from the
+/// primitives that use it) and, for the 4-layer ground family, the shader's
+/// constants (`params`) and a detail-UV recommendation that follows the
+/// measured mapping.
+pub fn multilayer(s: &crate::drawable::Shader, entries: &[Value], fit: impl FnOnce() -> Value) -> Option<Value> {
     let mut l = layers(&s.name_hash, entries)?;
+    let fit = fit();
     if l["family"] == "four_layer" {
         l["params"] = four_layer_params(&s.constants);
+        l["detail_uv"]["recommended"] = four_layer_detail_uv(&fit);
+    }
+    if !fit.is_null() {
+        l["uv_fit"] = fit;
     }
     Some(l)
+}
+
+/// Fit each UV set as a plane over the horizontal model position
+/// (uv = a*x + b*y + c, RAGE Z-up) across the given primitives. Map section
+/// tiles have TEXCOORD_0 = position / 512 m; other models using the same
+/// shaders (set pieces, rock formations) carry their own mappings, which
+/// this measures. Null when there are no vertices.
+pub fn uv_fit<'a>(prims: impl Iterator<Item = &'a crate::gltf::TriPrim>) -> Value {
+    let prims: Vec<&crate::gltf::TriPrim> = prims.collect();
+    let nsets = prims.iter().map(|p| p.uvs.len()).max().unwrap_or(0);
+    let r3 = |x: f64| (x * 1000.0).round() / 1000.0;
+    let mut out = Vec::new();
+    for k in 0..nsets {
+        let mut pts: Vec<([f64; 2], [f64; 2])> = Vec::new();
+        for p in &prims {
+            let Some(uv) = p.uvs.get(k) else { continue };
+            for (pos, t) in p.positions.iter().zip(uv) {
+                pts.push(([pos[0] as f64, pos[1] as f64], [t[0] as f64, t[1] as f64]));
+            }
+        }
+        if pts.is_empty() {
+            continue;
+        }
+        // centre the positions for conditioning, then normal equations of [x y 1]
+        let n = pts.len() as f64;
+        let cx = pts.iter().map(|q| q.0[0]).sum::<f64>() / n;
+        let cy = pts.iter().map(|q| q.0[1]).sum::<f64>() / n;
+        let mut ata = [[0f64; 3]; 3];
+        let mut atb = [[0f64; 2]; 3];
+        let mut lo = [f64::MAX; 2];
+        let mut hi = [f64::MIN; 2];
+        for (r, t) in &pts {
+            let r = [r[0] - cx, r[1] - cy, 1.0];
+            for i in 0..3 {
+                for j in 0..3 {
+                    ata[i][j] += r[i] * r[j];
+                }
+                for c in 0..2 {
+                    atb[i][c] += r[i] * t[c];
+                }
+            }
+            for c in 0..2 {
+                lo[c] = lo[c].min(t[c]);
+                hi[c] = hi[c].max(t[c]);
+            }
+        }
+        let span = [hi[0] - lo[0], hi[1] - lo[1]];
+        let constant = span[0].max(span[1]) < 1e-4;
+        let mut e = json!({"set": format!("TEXCOORD_{k}"), "constant": constant, "span": [r3(span[0]), r3(span[1])]});
+        let coef: Option<Vec<[f64; 3]>> = (0..2).map(|c| solve3(ata, [atb[0][c], atb[1][c], atb[2][c]])).collect();
+        if let (Some(coef), false) = (coef, constant) {
+            let err = pts
+                .iter()
+                .map(|(r, t)| (0..2).map(|c| (coef[c][0] * (r[0] - cx) + coef[c][1] * (r[1] - cy) + coef[c][2] - t[c]).abs()).fold(0.0, f64::max))
+                .fold(0.0, f64::max);
+            let mpu: Vec<Value> = coef
+                .iter()
+                .map(|c| {
+                    let g = (c[0] * c[0] + c[1] * c[1]).sqrt();
+                    if g > 1e-9 { json!(r3(1.0 / g)) } else { Value::Null }
+                })
+                .collect();
+            e["metres_per_unit"] = json!(mpu);
+            e["max_error"] = json!(r3(err));
+            e["planar"] = json!(err <= 0.05 * span[0].max(span[1]));
+        }
+        out.push(e);
+    }
+    if out.is_empty() { Value::Null } else { Value::Array(out) }
+}
+
+fn solve3(m: [[f64; 3]; 3], b: [f64; 3]) -> Option<[f64; 3]> {
+    let det = |m: [[f64; 3]; 3]| {
+        m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1]) - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0]) + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+    };
+    let d = det(m);
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    let mut x = [0f64; 3];
+    for (i, xi) in x.iter_mut().enumerate() {
+        let mut mi = m;
+        for r in 0..3 {
+            mi[r][i] = b[r];
+        }
+        *xi = det(mi) / d;
+    }
+    Some(x)
+}
+
+/// Detail-layer UV for a 4-layer material from its measured mapping:
+/// section tiles (TEXCOORD_0 planar at about 512 m per unit, 430-620 allowing for quantisation on small patches) repeat the layers
+/// 64 times per TEXCOORD_0 unit (every 8 m); other models use the first
+/// planar UV set at a detail scale (0.5-20 m per unit), else position / 8 m.
+fn four_layer_detail_uv(fit: &Value) -> Value {
+    let sets = fit.as_array().cloned().unwrap_or_default();
+    let planar = |e: &Value| e["planar"] == true && e["constant"] == false;
+    let mpu = |e: &Value| e["metres_per_unit"].as_array().map(|a| a.iter().filter_map(|x| x.as_f64()).fold(0.0, f64::max)).unwrap_or(0.0);
+    if sets.first().is_some_and(|e| planar(e) && (430.0..=620.0).contains(&mpu(e))) {
+        return json!({"uv": "TEXCOORD_0", "scale": 64.0, "section_tile": true, "why": "TEXCOORD_0 is section position / 512 m (map section tile)"});
+    }
+    if let Some(e) = sets.iter().skip(1).find(|e| planar(e) && (0.5..=20.0).contains(&mpu(e))) {
+        return json!({"uv": e["set"], "scale": 1.0, "section_tile": false, "metres_per_unit": e["metres_per_unit"], "why": "not a section tile; this set is a planar detail mapping"});
+    }
+    json!({"uv": "position", "scale": 0.125, "section_tile": false, "why": "not a section tile and no planar detail UV: tile from position, one repeat per 8 m"})
 }
 
 /// Constants of a 4-layer ground material. Vec4s whose component k follows
@@ -346,9 +458,9 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
     json!({
         "family": "four_layer",
         "layers": layers,
-        "weights": {"texture": tex(2), "uv_set": "TEXCOORD_0", "channels": {"r": "layer0", "g": "layer1", "b": "layer2", "remainder": "layer3"}, "note": "R+G+B <= 1 (BC7 rounding up to 258/255: clamp); the remainder weights layer 3"},
+        "weights": {"texture": tex(2), "uv_set": "TEXCOORD_0 (on section tiles = section position / 512 m; on other models the model's own UV0, see uv_fit)", "channels": {"r": "layer0", "g": "layer1", "b": "layer2", "remainder": "layer3"}, "note": "R+G+B <= 1 (BC7 rounding up to 258/255: clamp); the remainder weights layer 3"},
         "macro": {"uv_set": "TEXCOORD_0", "tint": tex(16), "tint_normal": tex(8), "grass_mask": tex(3), "note": "section-wide maps (one 512 m section per texture): colour variation, large-scale normal, grass placement mask"},
-        "detail_uv": {"default": "TEXCOORD_0 * 64 (world-planar, one repeat per 8 m)", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). Per-layer tiling factors sit in the shader's constant block and are not decoded; scale per layer by eye"},
+        "detail_uv": {"default": "TEXCOORD_0 * 64 (world-planar, one repeat per 8 m) on map section tiles only; `recommended` follows this material's measured mapping (`uv_fit`): set pieces and rock formations using these shaders have their own UV0 (about 35 m per unit on the street-trash grounds), usually with a planar TEXCOORD_1 at 3 m per unit", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). Per-layer tiling factors sit in the shader's constant block and are not decoded; scale per layer by eye"},
         "vertex_color_channels": {"rgb": "unverified: varies 50..230, mean ~155, not weights (does not sum to a constant); baked shading or tint", "a": "always 0"},
         "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
         "height_blend": "the shader names end in hbb (height-based blend): each layer's data map B channel looks like a height map; sharpen the weights by height for the game's look",
@@ -384,6 +496,42 @@ mod paint_tests {
         assert_eq!(l["macro"]["tint"]["png"], "t16.png");
         assert!(layers("b21f1ba5", &entries).unwrap()["detail_uv"]["alt_uv_set"].is_null());
         assert_eq!(layers("27e5c49d", &entries).unwrap()["detail_uv"]["alt_uv_set"], "TEXCOORD_2");
+    }
+
+    fn prim(f: impl Fn(f32, f32) -> [[f32; 2]; 2]) -> crate::gltf::TriPrim {
+        let mut positions = Vec::new();
+        let (mut u0, mut u1) = (Vec::new(), Vec::new());
+        for i in 0..10 {
+            for j in 0..10 {
+                let (x, y) = (i as f32 * 3.0, j as f32 * 2.0);
+                positions.push([x, y, 0.0]);
+                let t = f(x, y);
+                u0.push(t[0]);
+                u1.push(t[1]);
+            }
+        }
+        crate::gltf::TriPrim {
+            name: String::new(), positions, normals: None, tangents: None, uvs: vec![u0, u1], colors: None, tint: None,
+            indices: vec![], material: Some(0), joints: None, weights: None, joints1: None, weights1: None,
+        }
+    }
+
+    #[test]
+    fn uv_fit_detail() {
+        // section tile: UV0 = position / 512
+        let tile = prim(|x, y| [[x / 512.0, y / 512.0], [0.0, 0.0]]);
+        let f = uv_fit([&tile].into_iter());
+        assert_eq!(f[0]["planar"], true);
+        assert!((f[0]["metres_per_unit"][0].as_f64().unwrap() - 512.0).abs() < 1.0);
+        assert_eq!(f[1]["constant"], true);
+        assert_eq!(four_layer_detail_uv(&f)["section_tile"], true);
+        // set piece: UV0 local at 35 m, UV1 planar at 3 m
+        let piece = prim(|x, y| [[x / 35.0, y / 35.0], [x / 3.0, -y / 3.0]]);
+        let r = four_layer_detail_uv(&uv_fit([&piece].into_iter()));
+        assert_eq!(r["uv"], "TEXCOORD_1");
+        // nothing planar at a detail scale: from position
+        let odd = prim(|x, y| [[(x * y).sin(), x.cos()], [(x * 7.0).sin(), (y * 5.0).cos()]]);
+        assert_eq!(four_layer_detail_uv(&uv_fit([&odd].into_iter()))["uv"], "position");
     }
 
     #[test]

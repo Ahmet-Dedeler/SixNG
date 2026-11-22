@@ -836,7 +836,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "wheel_mounts": info.skeleton.iter().filter(|b| b.name.starts_with("wheel_") && b.name.len() <= 9 && b.pivot.is_some()).map(|b| serde_json::json!({"bone": b.name, "pivot": b.pivot})).collect::<Vec<_>>(),
                 "wheel_mounts_note": "Wheel centres (model space, RAGE Z-up). Rims and tyres are shared models (rim_<class>_NNN, tyre_<class>_NNN) authored for the left-front at unit scale (rim radius 0.5); mirror X for right-hand wheels and scale by the vehicle's wheel size (not decoded yet).",
                 "drawable": info, "buffer_files": bufs, "texture_files": tex_files,
-                "materials": info.shaders.iter().zip(shader_tex.iter()).map(|(s, st)| {
+                "materials": info.shaders.iter().zip(shader_tex.iter()).enumerate().map(|(si, (s, st))| {
                     let c = classify_shader(s, st);
                     let mut m = serde_json::json!({
                         "shader": s.index, "shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": c,
@@ -846,7 +846,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     if let Some(fb) = &st.fallback {
                         m["texture_fallback"] = fb.clone();
                     }
-                    if let Some(l) = crate::material::multilayer(s, &st.entries) {
+                    if let Some(l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                         m["multilayer"] = l;
                     }
                     if m["classification"]["class"] == "car_paint" {
@@ -894,6 +894,12 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
 }
 
 /// A drawable's meshes, materials and skin, ready for `gltf::mesh_glb`.
+/// Measured UV mapping of one material over the first populated LOD.
+fn material_uv_fit(lod_groups: &[Vec<crate::gltf::NodeGroup>], shader: usize) -> serde_json::Value {
+    let lod = lod_groups.iter().find(|g| g.iter().any(|n| !n.prims.is_empty()));
+    crate::material::uv_fit(lod.into_iter().flatten().flat_map(|n| &n.prims).filter(|p| p.material == Some(shader)))
+}
+
 pub(crate) struct BuiltDrawable {
     /// Node groups per LOD (index = LOD level).
     pub lod_groups: Vec<Vec<crate::gltf::NodeGroup>>,
@@ -1020,7 +1026,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         let prims = rest.into_iter().filter_map(|gi| prims_of(gi, None, &mut mesh_meta)).collect();
         lod_groups[0].push(crate::gltf::NodeGroup { name: "unassigned".into(), prims });
     }
-    let mats: Vec<crate::gltf::Material> = info.shaders.iter().zip(shader_tex.iter()).map(|(s, st)| crate::gltf::Material {
+    let mats: Vec<crate::gltf::Material> = info.shaders.iter().zip(shader_tex.iter()).enumerate().map(|(si, (s, st))| crate::gltf::Material {
         name: format!("shader{:02}_{}", s.index, s.name_hash),
         // Paint: the colour slot is the engine-default white; any sRGB
         // fallback (decal layer, masks) would be wrong as albedo.
@@ -1050,7 +1056,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         },
         extras: {
             let mut x = serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback});
-            if let Some(l) = crate::material::multilayer(s, &st.entries) {
+            if let Some(l) = crate::material::multilayer(s, &st.entries, || material_uv_fit(&lod_groups, si)) {
                 x["multilayer"] = l;
             }
             x
