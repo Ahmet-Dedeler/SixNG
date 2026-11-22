@@ -742,108 +742,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             }
             fs::write(dir.join("sys.bin"), &r.sys)?;
             item.files.push(rel(&o.out, &dir.join("sys.bin")));
-            let head = head_skin_shaders(a, e, &info.shaders, o, &mut item);
-            let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), &r, &info.embedded_textures, &dir, o);
-            let slice = |i: usize| {
-                let b = &info.buffers[i];
-                let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
-                &r.gfx[(b.gfx_off as usize).min(end)..end]
-            };
-            let skin = ped_skin(a, e, &info, o, &mut item);
-            // Triangle meshes: one primitive per geometry, grouped by model.
-            let mut mesh_meta = Vec::new();
-            let prims_of = |gi: usize, material: Option<usize>, mesh_meta: &mut Vec<serde_json::Value>| -> Option<crate::gltf::TriPrim> {
-                let g = &info.geometries[gi];
-                let h = info.buffers[g.vertex_buffer].mesh_blob.as_ref()?;
-                let mut m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
-                // Ped clothing: joint index -> bone palette -> joint list.
-                if let Some(map) = skin.geometry_map.get(&gi) {
-                    let remap = |js: &mut Vec<[u16; 4]>| js.iter_mut().flatten().for_each(|j| *j = map.get(*j as usize).copied().unwrap_or(u16::MAX));
-                    m.joints.as_mut().map(remap);
-                    m.joints1.as_mut().map(remap);
-                }
-                // Bone indices with non-zero weight in either influence set.
-                let skin_used: Option<Vec<u16>> = m.joints.as_ref().map(|js| {
-                    let w0 = m.weights.as_ref().unwrap();
-                    let mut u: Vec<u16> = Vec::new();
-                    for (i, j) in js.iter().enumerate() {
-                        u.extend((0..4).filter(|&k| w0[i][k] > 0).map(|k| j[k]));
-                        if let (Some(j1), Some(w1)) = (&m.joints1, &m.weights1) {
-                            u.extend((0..4).filter(|&k| w1[i][k] > 0).map(|k| j1[i][k]));
-                        }
-                    }
-                    u.sort();
-                    u.dedup();
-                    u
-                });
-                let name = format!("geom{:02}_{:x}", gi, info.buffers[g.vertex_buffer].gfx_off);
-                let mut bb = [[f32::MAX; 3], [f32::MIN; 3]];
-                for p in &m.positions {
-                    for k in 0..3 {
-                        bb[0][k] = bb[0][k].min(p[k]);
-                        bb[1][k] = bb[1][k].max(p[k]);
-                    }
-                }
-                mesh_meta.push(serde_json::json!({
-                    "name": name, "geometry": gi, "vertex_count": m.positions.len(), "triangle_count": m.indices.len() / 3,
-                    "bbox": if m.positions.is_empty() { serde_json::Value::Null } else { serde_json::json!(bb) },
-                    "exceeds_kn5_16bit_limit": m.positions.len() > 65535,
-                    "material": material.and_then(|s| info.shaders.get(s)).map(|s| format!("shader{:02}_{}", s.index, s.name_hash)),
-                    "shader_index": material,
-                    "uv_sets": m.uvs.len(), "uv_slots": m.uvs.iter().map(|u| u.0).collect::<Vec<_>>(),
-                    "normals": m.normals.is_some(), "vertex_colors_raw": m.colors.is_some(),
-                    "triangles_flipped_to_match_normals": m.flipped, "triangles_dropped": m.dropped, "normals_rebuilt_from_faces": m.rebuilt_normals,
-                    "position_axis_order": m.axis_order, "skinned": m.joints.is_some(),
-                    "skin_influences": m.joints.as_ref().map(|j| j.iter().zip(m.weights.as_ref().unwrap()).enumerate().map(|(i, (a, w))| w.iter().filter(|&&x| x > 0).count().max(1).min(a.len()) + m.weights1.as_ref().map_or(0, |w1| w1[i].iter().filter(|&&x| x > 0).count())).max().unwrap_or(1)),
-                    "bones": skin_used.as_ref().map(|u| u.iter().filter_map(|&i| skin.joints.get(i as usize).map(|x| x.name.clone())).collect::<Vec<_>>()),
-                    // Joint indices with no bone (out of range, or a palette
-                    // bone that is in neither skeleton); their weight is moved
-                    // to the largest kept influence in the GLB.
-                    "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
-                }));
-                let tint = match (material.and_then(|s| shader_tex.get(s)).and_then(|st| st.tint_palette.as_ref()), &m.colors) {
-                    (Some(p), Some(c)) => Some(tint_colours(p, c)),
-                    _ => None,
-                };
-                if let Some(mm) = mesh_meta.last_mut() {
-                    mm["tint_applied"] = tint.is_some().into();
-                }
-                Some(crate::gltf::TriPrim {
-                    name, positions: m.positions, normals: m.normals, tangents: m.tangents, uvs: m.uvs.into_iter().map(|u| u.1).collect(),
-                    colors: m.colors, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
-                })
-            };
-            let nlod = info.models.iter().filter(|m| !m.part).map(|m| m.lod + 1).max().unwrap_or(1);
-            let mut lod_groups: Vec<Vec<crate::gltf::NodeGroup>> = (0..nlod).map(|_| Vec::new()).collect();
-            // models of embedded drawables (fragment children, sub-drawables)
-            let mut part_groups: Vec<crate::gltf::NodeGroup> = Vec::new();
-            let mut used = vec![false; info.geometries.len()];
-            for (mi, md) in info.models.iter().enumerate() {
-                let mut prims = Vec::new();
-                for (k, &gi) in md.geometries.iter().enumerate() {
-                    used[gi] = true;
-                    let sh = md.shader_indices.get(k).map(|&s| s as usize).filter(|&s| s < info.shaders.len());
-                    let before = mesh_meta.len();
-                    prims.extend(prims_of(gi, sh, &mut mesh_meta));
-                    for mm in mesh_meta[before..].iter_mut() {
-                        mm["lod"] = if md.part { serde_json::Value::Null } else { serde_json::json!(md.lod) };
-                        mm["model"] = serde_json::json!(mi);
-                        if md.part {
-                            mm["part"] = serde_json::json!(true);
-                        }
-                    }
-                }
-                if md.part {
-                    part_groups.push(crate::gltf::NodeGroup { name: format!("model{mi}"), prims });
-                } else {
-                    lod_groups[md.lod].push(crate::gltf::NodeGroup { name: format!("model{mi}"), prims });
-                }
-            }
-            let rest: Vec<usize> = (0..info.geometries.len()).filter(|&i| !used[i]).collect();
-            if requested_member.is_none() && !rest.is_empty() {
-                let prims = rest.into_iter().filter_map(|gi| prims_of(gi, None, &mut mesh_meta)).collect();
-                lod_groups[0].push(crate::gltf::NodeGroup { name: "unassigned".into(), prims });
-            }
+            let BuiltDrawable { lod_groups, part_groups, materials: mats, joints, mesh_meta, shader_tex, head } = build_drawable(a, e, &r, &info, &dir, requested_member.is_some(), o, &mut item);
             let all = || lod_groups.iter().flatten().chain(part_groups.iter()).flat_map(|g| &g.prims);
             let ntris: usize = all().map(|p| p.indices.len() / 3).sum();
             let nverts: usize = all().map(|p| p.positions.len()).sum();
@@ -851,7 +750,6 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                 "source_id": e.id, "type": e.rtype, "coordinate_system": COORDS,
                 "surface_hint": e.name.as_deref().and_then(surface_hint),
             });
-            let joints = skin.joints;
             let mut glb_file = None;
             let mut lod_files = Vec::new();
             let mut parts_file = None;
@@ -865,26 +763,6 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             let lods = lod_exports(&lod_groups);
             let primary = lods.first().map_or(0, |l| l.0);
             if ntris > 0 {
-                let mats: Vec<crate::gltf::Material> = info.shaders.iter().zip(shader_tex.iter()).map(|(s, st)| crate::gltf::Material {
-                    name: format!("shader{:02}_{}", s.index, s.name_hash),
-                    // Paint: the colour slot is the engine-default white; any sRGB
-                    // fallback (decal layer, masks) would be wrong as albedo.
-                    base_color_uri: if crate::material::is_paint(&s.name_hash) { None } else { st.base.clone() },
-                    normal_uri: st.normal.clone(),
-                    gltf: {
-                        let mut g = crate::material::gltf_fields(&classify_shader(s, st), st.base.is_some() && !crate::material::is_paint(&s.name_hash));
-                        if let (Some(f), false) = (st.base_factor, crate::material::is_paint(&s.name_hash)) {
-                            if g["pbrMetallicRoughness"].is_null() {
-                                g["pbrMetallicRoughness"] = serde_json::json!({});
-                            }
-                            if g["pbrMetallicRoughness"]["baseColorFactor"].is_null() {
-                                g["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!(f);
-                            }
-                        }
-                        g
-                    },
-                    extras: serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback}),
-                }).collect();
                 for (lod, fname) in &lods {
                     let lod = *lod;
                     let groups = &lod_groups[lod];
@@ -913,7 +791,8 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             let mut prims = Vec::new();
             for (i, b) in info.buffers.iter().enumerate() {
                 if let (Some(h), false, true) = (&b.mesh_blob, paired.contains(&i), requested_member.is_none()) {
-                    let pos = crate::drawable::decode_positions(slice(i), h);
+                    let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
+                    let pos = crate::drawable::decode_positions(&r.gfx[(b.gfx_off as usize).min(end)..end], h);
                     prims.push(crate::gltf::PointPrim { name: format!("blob{:02}_{:x}", i, b.gfx_off), positions: pos });
                 }
             }
@@ -1004,6 +883,151 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
         item.files.push(rel(&o.out, &p));
     }
     Ok(item)
+}
+
+/// A drawable's meshes, materials and skin, ready for `gltf::mesh_glb`.
+pub(crate) struct BuiltDrawable {
+    /// Node groups per LOD (index = LOD level).
+    pub lod_groups: Vec<Vec<crate::gltf::NodeGroup>>,
+    /// Models of embedded drawables (fragment children, sub-drawables).
+    pub part_groups: Vec<crate::gltf::NodeGroup>,
+    pub materials: Vec<crate::gltf::Material>,
+    pub joints: Vec<crate::gltf::Joint>,
+    /// model.json `meshes` records.
+    pub mesh_meta: Vec<serde_json::Value>,
+    shader_tex: Vec<ShaderTextures>,
+    /// Head skin shaders and the model.json record, for heads.
+    head: Option<(Vec<crate::drawable::Shader>, serde_json::Value)>,
+}
+
+/// Decode a drawable's geometry, skin and materials. Texture URIs are
+/// relative to `dir` (a folder under `o.out`); textures are written under
+/// `o.out`. `member`: `info` is one drawable-dictionary member
+/// (`drawable::select_member`), so geometries outside its models are left out.
+pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, dir: &Path, member: bool, o: &ExportOptions, item: &mut ExportedItem) -> BuiltDrawable {
+    let head = head_skin_shaders(a, e, &info.shaders, o, item);
+    let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), r, &info.embedded_textures, dir, o);
+    let slice = |i: usize| {
+        let b = &info.buffers[i];
+        let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
+        &r.gfx[(b.gfx_off as usize).min(end)..end]
+    };
+    let skin = ped_skin(a, e, info, o, item);
+    // Triangle meshes: one primitive per geometry, grouped by model.
+    let mut mesh_meta = Vec::new();
+    let prims_of = |gi: usize, material: Option<usize>, mesh_meta: &mut Vec<serde_json::Value>| -> Option<crate::gltf::TriPrim> {
+        let g = &info.geometries[gi];
+        let h = info.buffers[g.vertex_buffer].mesh_blob.as_ref()?;
+        let mut m = crate::drawable::decode_mesh(slice(g.vertex_buffer), h, slice(g.index_buffer));
+        // Ped clothing: joint index -> bone palette -> joint list.
+        if let Some(map) = skin.geometry_map.get(&gi) {
+            let remap = |js: &mut Vec<[u16; 4]>| js.iter_mut().flatten().for_each(|j| *j = map.get(*j as usize).copied().unwrap_or(u16::MAX));
+            m.joints.as_mut().map(remap);
+            m.joints1.as_mut().map(remap);
+        }
+        // Bone indices with non-zero weight in either influence set.
+        let skin_used: Option<Vec<u16>> = m.joints.as_ref().map(|js| {
+            let w0 = m.weights.as_ref().unwrap();
+            let mut u: Vec<u16> = Vec::new();
+            for (i, j) in js.iter().enumerate() {
+                u.extend((0..4).filter(|&k| w0[i][k] > 0).map(|k| j[k]));
+                if let (Some(j1), Some(w1)) = (&m.joints1, &m.weights1) {
+                    u.extend((0..4).filter(|&k| w1[i][k] > 0).map(|k| j1[i][k]));
+                }
+            }
+            u.sort();
+            u.dedup();
+            u
+        });
+        let name = format!("geom{:02}_{:x}", gi, info.buffers[g.vertex_buffer].gfx_off);
+        let mut bb = [[f32::MAX; 3], [f32::MIN; 3]];
+        for p in &m.positions {
+            for k in 0..3 {
+                bb[0][k] = bb[0][k].min(p[k]);
+                bb[1][k] = bb[1][k].max(p[k]);
+            }
+        }
+        mesh_meta.push(serde_json::json!({
+            "name": name, "geometry": gi, "vertex_count": m.positions.len(), "triangle_count": m.indices.len() / 3,
+            "bbox": if m.positions.is_empty() { serde_json::Value::Null } else { serde_json::json!(bb) },
+            "exceeds_kn5_16bit_limit": m.positions.len() > 65535,
+            "material": material.and_then(|s| info.shaders.get(s)).map(|s| format!("shader{:02}_{}", s.index, s.name_hash)),
+            "shader_index": material,
+            "uv_sets": m.uvs.len(), "uv_slots": m.uvs.iter().map(|u| u.0).collect::<Vec<_>>(),
+            "normals": m.normals.is_some(), "vertex_colors_raw": m.colors.is_some(),
+            "triangles_flipped_to_match_normals": m.flipped, "triangles_dropped": m.dropped, "normals_rebuilt_from_faces": m.rebuilt_normals,
+            "position_axis_order": m.axis_order, "skinned": m.joints.is_some(),
+            "skin_influences": m.joints.as_ref().map(|j| j.iter().zip(m.weights.as_ref().unwrap()).enumerate().map(|(i, (a, w))| w.iter().filter(|&&x| x > 0).count().max(1).min(a.len()) + m.weights1.as_ref().map_or(0, |w1| w1[i].iter().filter(|&&x| x > 0).count())).max().unwrap_or(1)),
+            "bones": skin_used.as_ref().map(|u| u.iter().filter_map(|&i| skin.joints.get(i as usize).map(|x| x.name.clone())).collect::<Vec<_>>()),
+            // Joint indices with no bone (out of range, or a palette
+            // bone that is in neither skeleton); their weight is moved
+            // to the largest kept influence in the GLB.
+            "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
+        }));
+        let tint = match (material.and_then(|s| shader_tex.get(s)).and_then(|st| st.tint_palette.as_ref()), &m.colors) {
+            (Some(p), Some(c)) => Some(tint_colours(p, c)),
+            _ => None,
+        };
+        if let Some(mm) = mesh_meta.last_mut() {
+            mm["tint_applied"] = tint.is_some().into();
+        }
+        Some(crate::gltf::TriPrim {
+            name, positions: m.positions, normals: m.normals, tangents: m.tangents, uvs: m.uvs.into_iter().map(|u| u.1).collect(),
+            colors: m.colors, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
+        })
+    };
+    let nlod = info.models.iter().filter(|m| !m.part).map(|m| m.lod + 1).max().unwrap_or(1);
+    let mut lod_groups: Vec<Vec<crate::gltf::NodeGroup>> = (0..nlod).map(|_| Vec::new()).collect();
+    // models of embedded drawables (fragment children, sub-drawables)
+    let mut part_groups: Vec<crate::gltf::NodeGroup> = Vec::new();
+    let mut used = vec![false; info.geometries.len()];
+    for (mi, md) in info.models.iter().enumerate() {
+        let mut prims = Vec::new();
+        for (k, &gi) in md.geometries.iter().enumerate() {
+            used[gi] = true;
+            let sh = md.shader_indices.get(k).map(|&s| s as usize).filter(|&s| s < info.shaders.len());
+            let before = mesh_meta.len();
+            prims.extend(prims_of(gi, sh, &mut mesh_meta));
+            for mm in mesh_meta[before..].iter_mut() {
+                mm["lod"] = if md.part { serde_json::Value::Null } else { serde_json::json!(md.lod) };
+                mm["model"] = serde_json::json!(mi);
+                if md.part {
+                    mm["part"] = serde_json::json!(true);
+                }
+            }
+        }
+        if md.part {
+            part_groups.push(crate::gltf::NodeGroup { name: format!("model{mi}"), prims });
+        } else {
+            lod_groups[md.lod].push(crate::gltf::NodeGroup { name: format!("model{mi}"), prims });
+        }
+    }
+    let rest: Vec<usize> = (0..info.geometries.len()).filter(|&i| !used[i]).collect();
+    if !member && !rest.is_empty() {
+        let prims = rest.into_iter().filter_map(|gi| prims_of(gi, None, &mut mesh_meta)).collect();
+        lod_groups[0].push(crate::gltf::NodeGroup { name: "unassigned".into(), prims });
+    }
+    let mats: Vec<crate::gltf::Material> = info.shaders.iter().zip(shader_tex.iter()).map(|(s, st)| crate::gltf::Material {
+        name: format!("shader{:02}_{}", s.index, s.name_hash),
+        // Paint: the colour slot is the engine-default white; any sRGB
+        // fallback (decal layer, masks) would be wrong as albedo.
+        base_color_uri: if crate::material::is_paint(&s.name_hash) { None } else { st.base.clone() },
+        normal_uri: st.normal.clone(),
+        gltf: {
+            let mut g = crate::material::gltf_fields(&classify_shader(s, st), st.base.is_some() && !crate::material::is_paint(&s.name_hash));
+            if let (Some(f), false) = (st.base_factor, crate::material::is_paint(&s.name_hash)) {
+                if g["pbrMetallicRoughness"].is_null() {
+                    g["pbrMetallicRoughness"] = serde_json::json!({});
+                }
+                if g["pbrMetallicRoughness"]["baseColorFactor"].is_null() {
+                    g["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!(f);
+                }
+            }
+            g
+        },
+        extras: serde_json::json!({"shader_name_hash": s.name_hash, "shader_name": crate::names::shader(&s.name_hash), "classification": classify_shader(s, st), "textures": st.entries, "texture_fallback": st.fallback}),
+    }).collect();
+    BuiltDrawable { lod_groups, part_groups, materials: mats, joints: skin.joints, mesh_meta, shader_tex, head }
 }
 
 /// Joint list of a drawable's GLB skin, and for ped clothing the joint
