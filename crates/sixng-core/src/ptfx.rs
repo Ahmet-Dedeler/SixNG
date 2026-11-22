@@ -250,6 +250,10 @@ pub struct PtfxParticle {
     /// 237 of the 242 distinct values in data.rpf are textures of
     /// `data/ttdb/vfx/ttdb_vfx.ttpf`.
     pub texture_refs: Vec<(u32, String)>,
+    /// Flipbook frame count: the `ptxu_AnimateTexture` behaviour's last frame
+    /// id (+0x4c, after its one keyframe property) plus one. The atlas grid
+    /// (columns x rows) is not stored here; see `flipbook_grid`.
+    pub frames: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -357,14 +361,94 @@ pub fn rules(r: &Resource, info: &DrawableInfo) -> Option<PtfxRules> {
                 let v = r.u64(o + 0x300 + 8 * i as usize);
                 (v != 0).then(|| (0x300 + 8 * i, format!("{v:016x}")))
             }).collect();
-            PtfxParticle { name: name(h), keyframe_texture, behaviours, texture_refs }
+            let frames = r
+                .sys_off(r.u64(o + 0x188))
+                .into_iter()
+                .flat_map(|bl| (0..nb.min(64)).filter_map(move |i| r.sys_off(r.u64(bl + 8 * i))))
+                .find(|&b| r.u32(b + 0x30) == ANIMATE_TEXTURE_KFP && r.u32(b + 0x34) == ANIMATE_TEXTURE_KFP)
+                .map(|b| r.u32(b + 0x4c))
+                .filter(|&l| l < 4096)
+                .map(|l| l + 1);
+            PtfxParticle { name: name(h), keyframe_texture, behaviours, texture_refs, frames }
         })
         .collect();
     Some(PtfxRules { effects, emitters, particles })
 }
 
+/// joaat("ptxu_animatetexture:m_animratekfp"): the one keyframe property
+/// of the flipbook behaviour.
+const ANIMATE_TEXTURE_KFP: u32 = 0x2946e76f;
+
+/// Best flipbook grid for an RGBA atlas with `n` frames: among grids that
+/// divide the image evenly with `n <= cols * rows <= 1.6 n + 1` (at most
+/// 16 x 16), the one under which consecutive frames differ least. Returns
+/// (cols, rows, score) with score = mean adjacent-frame difference over a
+/// shuffled-pair baseline: about 0.1-0.25 on smoke and fire sheets, near 1
+/// when the frames are random variants rather than an animation.
+pub fn flipbook_grid(rgba: &[u8], w: u32, h: u32, n: u32) -> Option<(u32, u32, f32)> {
+    // Colour ramps (N x 4) and other tiny textures are not atlases.
+    if n < 2 || w < 32 || h < 32 || rgba.len() < (w * h * 4) as usize {
+        return None;
+    }
+    let mut best: Option<(u32, u32, f32)> = None;
+    for c in 1..=16u32 {
+        for rr in 1..=16u32 {
+            let cells = c * rr;
+            if cells < n || cells as f32 > n as f32 * 1.6 + 1.0 || w % c != 0 || h % rr != 0 {
+                continue;
+            }
+            let (fw, fh) = (w / c, h / rr);
+            let step = (fw.min(fh) / 32).max(1);
+            let diff = |a: u32, b: u32| -> f32 {
+                let (ax, ay, bx, by) = ((a % c) * fw, (a / c) * fh, (b % c) * fw, (b / c) * fh);
+                let (mut sum, mut cnt) = (0u64, 0u64);
+                let mut y = 0;
+                while y < fh {
+                    let mut x = 0;
+                    while x < fw {
+                        let pa = (((ay + y) * w + ax + x) * 4) as usize;
+                        let pb = (((by + y) * w + bx + x) * 4) as usize;
+                        for k in 0..4 {
+                            sum += (rgba[pa + k] as i32 - rgba[pb + k] as i32).unsigned_abs() as u64;
+                        }
+                        cnt += 4;
+                        x += step;
+                    }
+                    y += step;
+                }
+                sum as f32 / cnt.max(1) as f32
+            };
+            let adj = (0..n - 1).map(|i| diff(i, i + 1)).sum::<f32>() / (n - 1) as f32;
+            let shuf = (0..n).map(|i| diff(i, (i * 7 + 3) % n)).sum::<f32>() / n as f32;
+            let score = adj / (shuf + 1e-3);
+            if best.map_or(true, |b| score < b.2) {
+                best = Some((c, rr, score));
+            }
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn flipbook_grid_finds_layout() {
+        // 4 x 2 atlas of 16 px frames whose brightness ramps frame by frame
+        let (c, r, f) = (4u32, 2u32, 32u32);
+        let (w, h) = (c * f, r * f);
+        let mut img = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = (y / f) * c + x / f;
+                let v = (i * 25 + x % f) as u8;
+                let p = ((y * w + x) * 4) as usize;
+                img[p..p + 4].copy_from_slice(&[v, v, v, 255]);
+            }
+        }
+        let g = super::flipbook_grid(&img, w, h, 8).unwrap();
+        assert_eq!((g.0, g.1), (4, 2));
+        assert!(g.2 < 0.6);
+    }
     use super::*;
 
     #[test]

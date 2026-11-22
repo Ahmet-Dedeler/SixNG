@@ -481,7 +481,9 @@ enum Cmd {
     /// classes, each particle rule's keyframe texture and its sprite
     /// textures (`particles[].sprites`: texture-store hash, store, size and
     /// format; the sprites live in data/ttdb/vfx/ttdb_vfx.ttpf). With
-    /// --sprites, also writes each sprite to <out>/ptfx/<archive>/sprites/<hash>.png.
+    /// --sprites, also writes each sprite to <out>/ptfx/<archive>/sprites/<hash>.png
+    /// and adds a flipbook grid guess (`grid_guess`) for animated particles
+    /// (`particles[].frames`).
     Ptfx {
         #[arg(default_value = "data")]
         archive: String,
@@ -1389,14 +1391,17 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 let dir = po.join("ptfx").join(a.id.trim_end_matches(".rpf").replace(['/', '\\'], "_"));
                 std::fs::create_dir_all(&dir)?;
                 let set = sixng_core::ttpf::global(&ws.game);
-                let mut wanted: std::collections::BTreeSet<u64> = Default::default();
+                // hash -> frame counts of the animated particles that use it
+                let mut wanted: std::collections::BTreeMap<u64, std::collections::BTreeSet<u32>> = Default::default();
+                let mut docs: Vec<(String, serde_json::Value)> = Vec::new();
                 for (d, kf) in &found {
-                    let off = d.id.rsplit('@').next().unwrap_or("x");
+                    let off = d.id.rsplit('@').next().unwrap_or("x").to_string();
                     let mut kf = kf.clone().unwrap_or_default();
                     // Sprite textures: texture_refs are texture-store hashes
                     // (237 of the 242 distinct values in data.rpf are in the vfx store).
                     if let Some(ps) = kf["rules"]["particles"].as_array_mut() {
                         for pt in ps {
+                            let frames = pt["frames"].as_u64().map(|n| n as u32);
                             let refs = pt["texture_refs"].as_array().cloned().unwrap_or_default();
                             let sp: Vec<serde_json::Value> = refs
                                 .iter()
@@ -1407,7 +1412,10 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                                     Some(match set.get(h) {
                                         Some((st, t)) => {
                                             if *sprites {
-                                                wanted.insert(h);
+                                                let e = wanted.entry(h).or_default();
+                                                if let Some(n) = frames {
+                                                    e.insert(n);
+                                                }
                                             }
                                             let store = st.path.strip_prefix(&ws.game).unwrap_or(&st.path).to_string_lossy().replace('\\', "/");
                                             json!({"slot": slot, "hash": hs, "store": store, "w": t.width, "h": t.height, "format": sixng_core::texture::dxgi_name(t.dxgi_format), "png": if *sprites { json!(format!("sprites/{hs}.png")) } else { serde_json::Value::Null }})
@@ -1419,24 +1427,51 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             pt["sprites"] = json!(sp);
                         }
                     }
-                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&json!({"dictionary": d, "keyframes": kf["keyframes"], "rules": kf["rules"], "rules_note": "effects[].events pair an emitter rule with a particle rule. Keyframe properties: id = joaat of the lower-cased `<class>:m_<member>KFP`, name where it resolved (all effect and emitter properties, about 70 % of behaviour ones; ptxu_Velocity:m_angleKFP is less certain), keys = [time 0..1, value vec4]; min/max pairs are separate properties or x/y of one. Scalars such as sizeScalar look like percentages (medians 70-100; unverified). Particle props are grouped by behaviour, with the behaviour class taken from its property names. particles[].keyframe_texture indexes `keyframes` (probably the particle shader's variables, not colour or size: those are the behaviour properties, colour in the two ptxu_Colour props with a `role`); particles[].sprites resolve particles[].texture_refs (slot offset, 64-bit texture-store hash) to textures in the vfx store: by format the slots hold flipbook atlases and colour sprites (BC7 / BC6H), masks (BC4), normal or lighting maps (BC5) and 4-pixel-high colour ramps (BC6H); the role of each slot is inferred from formats only."}))?)?;
+                    docs.push((off, json!({"dictionary": d, "keyframes": kf["keyframes"], "rules": kf["rules"], "rules_note": "effects[].events pair an emitter rule with a particle rule. Keyframe properties: id = joaat of the lower-cased `<class>:m_<member>KFP`, name where it resolved (all effect and emitter properties, about 70 % of behaviour ones; ptxu_Velocity:m_angleKFP is less certain), keys = [time 0..1, value vec4]; min/max pairs are separate properties or x/y of one. Scalars such as sizeScalar look like percentages (medians 70-100; unverified). Particle props are grouped by behaviour, with the behaviour class taken from its property names. particles[].keyframe_texture indexes `keyframes` (probably the particle shader's variables, not colour or size: those are the behaviour properties, colour in the two ptxu_Colour props with a `role`); particles[].sprites resolve particles[].texture_refs (slot offset, 64-bit texture-store hash) to textures in the vfx store: by format the slots hold flipbook atlases and colour sprites (BC7 / BC6H), masks (BC4), normal or lighting maps (BC5) and 4-pixel-high colour ramps (BC6H); the role of each slot is inferred from formats only. particles[].frames is the flipbook frame count (last frame id + 1, from the ptxu_AnimateTexture behaviour). With --sprites, each sprite of an animated particle gets grid_guess {cols, rows, score}: the grid (dividing the image evenly, cols x rows >= frames) under which consecutive frames differ least; score = adjacent / shuffled frame difference, about 0.1-0.25 on smoke and fire sheets, near 1 when the sheet holds random variants rather than an animation. The grid itself is not stored in the data."})));
                 }
+                let mut grids: std::collections::HashMap<(u64, u32), (u32, u32, f32)> = Default::default();
                 if !wanted.is_empty() {
                     let sd = dir.join("sprites");
                     std::fs::create_dir_all(&sd)?;
                     use rayon::prelude::*;
-                    let fails: Vec<String> = wanted
+                    let res: Vec<(u64, Result<Vec<(u32, (u32, u32, f32))>>)> = wanted
                         .par_iter()
-                        .filter_map(|&h| {
+                        .filter_map(|(&h, ns)| {
                             let (st, t) = set.get(h)?;
                             let p = sd.join(format!("{h:016x}.png"));
-                            let r = st.data_ex(t).and_then(|(data, _)| sixng_core::ttpf::decode_rgba_slice(t, &data, 0, 0)).and_then(|(rgba, w, hh)| sixng_core::texture::save_png(&p, &rgba, w, hh));
-                            r.err().map(|e| format!("{h:016x}: {e}"))
+                            let r = st.data_ex(t).and_then(|(data, _)| sixng_core::ttpf::decode_rgba_slice(t, &data, 0, 0)).and_then(|(rgba, w, hh)| {
+                                sixng_core::texture::save_png(&p, &rgba, w, hh)?;
+                                Ok(ns.iter().filter_map(|&n| sixng_core::ptfx::flipbook_grid(&rgba, w, hh, n).map(|g| (n, g))).collect())
+                            });
+                            Some((h, r))
                         })
                         .collect();
+                    let mut fails = Vec::new();
+                    for (h, r) in res {
+                        match r {
+                            Ok(v) => grids.extend(v.into_iter().map(|(n, g)| ((h, n), g))),
+                            Err(e) => fails.push(format!("{h:016x}: {e}")),
+                        }
+                    }
                     if !fails.is_empty() {
                         eprintln!("sprites not decoded: {}", fails.join("; "));
                     }
+                }
+                for (off, mut doc) in docs {
+                    if let Some(ps) = doc["rules"]["particles"].as_array_mut() {
+                        for pt in ps {
+                            let Some(n) = pt["frames"].as_u64().map(|n| n as u32) else { continue };
+                            if let Some(sp) = pt["sprites"].as_array_mut() {
+                                for s in sp {
+                                    let Some(h) = s["hash"].as_str().and_then(|x| u64::from_str_radix(x, 16).ok()) else { continue };
+                                    if let Some(&(c, r, sc)) = grids.get(&(h, n)) {
+                                        s["grid_guess"] = json!({"cols": c, "rows": r, "score": (sc * 100.0).round() / 100.0});
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&doc)?)?;
                 }
                 std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }

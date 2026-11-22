@@ -318,7 +318,17 @@ and `--sprites` also writes them to `<out>/ptfx/<archive>/sprites/<hash>.png`
 (237 PNGs, 277 MB for data.rpf, a few seconds). By format the slots hold
 flipbook atlases and colour sprites (BC7, BC6H), masks (BC4), normal or
 lighting maps (BC5) and 4-pixel-high colour ramps; which slot does what is
-inferred from formats only, and the flipbook frame layout is not read.
+inferred from formats only. The other 5 values are in no texture store.
+**Flipbooks**: `particles[].frames` is the frame count, read from the
+`ptxu_AnimateTexture` behaviour (last frame id + 1; 2,569 particles). The
+atlas grid is not stored, so `--sprites` adds `grid_guess {cols, rows,
+score}` to each sprite of an animated particle: the even grid under which
+consecutive frames differ least (score = adjacent / shuffled frame
+difference). On the big smoke and fire sheets it is clear (0.1-0.25):
+2048 x 1024 with 32 frames gives 8 x 4, 2048² with 64 frames 8 x 8. Near 1
+the sheet holds random variants, not an animation. Take the grid from the
+colour atlas; small lighting maps of the same particle can come out
+differently.
 
 **UI fonts** (`sixng fonts`): the Scaleform font libraries in data.rpf
 (`fontlib_efigs`, Chinese, Japanese and Korean) hold their fonts as SWF
