@@ -1123,9 +1123,19 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
     }
     let n_ped = ped.map_or(0, |p| p.bones.len());
     // Each model's palette is used when most of its bones resolve (lower LODs
-    // may name only shared-skeleton bones).
+    // may name only shared-skeleton bones). With the shared skeleton loaded,
+    // a palette that names any known bone is used even when some of its
+    // bones are in neither skeleton: reading the vertex joints as skeleton
+    // indices instead binds whole meshes to unrelated bones (a field jacket
+    // with 16 of 118 palette bones unknown came out bound to the legs).
     let known = |h: &u32| own_hash.contains_key(h) || ped.is_some_and(|p| p.by_hash.contains_key(h));
-    let pal: Vec<_> = cand.into_iter().filter(|(_, p)| p.iter().filter(|h| known(h)).count() * 10 >= p.len() * 9 || (ped.is_none() && p.iter().any(|h| own_hash.contains_key(h)))).collect();
+    let pal: Vec<_> = cand
+        .into_iter()
+        .filter(|(_, p)| {
+            let k = p.iter().filter(|h| known(h)).count();
+            k * 10 >= p.len() * 9 || (ped.is_some() && k > 0) || (ped.is_none() && p.iter().any(|h| own_hash.contains_key(h)))
+        })
+        .collect();
     if let Some(p) = ped {
         let mut j: Vec<Joint> = p.bones.iter().map(|b| joint(b, 0)).collect();
         if !o.body_shape.is_empty() {
