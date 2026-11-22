@@ -465,6 +465,21 @@ enum Cmd {
         #[arg(long, short)]
         out: Option<PathBuf>,
     },
+    /// Fonts of the UI movies (Scaleform font libraries in data.rpf:
+    /// DefineFont3 outlines, code table, layout). Lists them as JSON; with
+    /// -o writes <out>/fonts/<name>.ttf (TrueType, for CSS @font-face) and
+    /// <name>.typeface.json (three.js FontLoader) per font. A font found in
+    /// several movies is written once, from the copy with the most glyphs.
+    /// The fonts are the owners'; for local use.
+    Fonts {
+        #[arg(default_value = "data")]
+        archive: String,
+        /// Regex on the font name.
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// Bink videos in movies.rpf (stored uncompressed, so the stream index has none): lists every video with size, resolution, frame rate, duration and audio tracks in <out>/movies/movies.json. With --extract, writes the .bk2 files as they are (playable in any Bink 2 player); all of them take about 8.8 GB, so --only picks some.
     Movies {
         /// Archive (default movies).
@@ -1345,6 +1360,51 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }
             out.print(&json!({"ok": true, "archive": a.id, "count": found.len(), "dictionaries": found.iter().map(|x| &x.0).collect::<Vec<_>>()}));
+        }
+        Cmd::Fonts { archive, name, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
+            use rayon::prelude::*;
+            let movies: Vec<&sixng_core::scan::Entry> = ix.entries.iter().filter(|e| e.kind == Kind::Gfx).collect();
+            let all: Vec<(String, sixng_core::gfxfont::Font)> = movies
+                .par_iter()
+                .flat_map_iter(|e| {
+                    let fs = sixng_core::scan::read_entry(&a.path, e).ok().and_then(|b| sixng_core::gfxfont::fonts(&b).ok()).unwrap_or_default();
+                    fs.into_iter().map(move |f| (e.id.clone(), f))
+                })
+                .collect();
+            let mut best: std::collections::BTreeMap<String, (String, sixng_core::gfxfont::Font, usize)> = Default::default();
+            for (id, f) in all {
+                if f.glyphs.is_empty() || re.as_ref().is_some_and(|r| !r.is_match(&f.name)) {
+                    continue;
+                }
+                let key = format!("{}{}{}", f.name, if f.bold { " bold" } else { "" }, if f.italic { " italic" } else { "" });
+                let e = best.entry(key).or_insert((id.clone(), f.clone(), 0));
+                e.2 += 1;
+                if f.glyphs.len() > e.1.glyphs.len() {
+                    e.0 = id;
+                    e.1 = f;
+                }
+            }
+            let dir = po.as_ref().map(|p| p.join("fonts"));
+            if let Some(d) = &dir {
+                std::fs::create_dir_all(d)?;
+            }
+            let mut list = Vec::new();
+            for (key, (id, f, copies)) in &best {
+                let file: String = key.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+                if let Some(d) = &dir {
+                    std::fs::write(d.join(format!("{file}.ttf")), sixng_core::gfxfont::to_ttf(f))?;
+                    std::fs::write(d.join(format!("{file}.typeface.json")), serde_json::to_vec(&sixng_core::gfxfont::to_typeface(f))?)?;
+                }
+                let sample: String = f.glyphs.iter().filter_map(|g| char::from_u32(g.code as u32)).take(48).collect();
+                list.push(json!({"name": f.name, "bold": f.bold, "italic": f.italic, "file": file, "glyphs": f.glyphs.len(), "movie": id, "movies": copies, "chars": sample}));
+            }
+            if let Some(d) = &dir {
+                std::fs::write(d.join("fonts.json"), serde_json::to_vec_pretty(&list)?)?;
+            }
+            out.print(&json!({"ok": true, "archive": a.id, "movies": movies.len(), "count": list.len(), "fonts": list}));
         }
         Cmd::Movies { archive, out: po, extract, only } => {
             let a = ws.resolve(archive)?;

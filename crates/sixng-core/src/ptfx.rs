@@ -119,7 +119,7 @@ mod tests {
     }
 
     #[test]
-    fn names() {
+    fn dict_names() {
         let strings: Vec<String> = ["scr_arc_tl_candle_flame_flare", "scr_arc_tl_shadowy_figure", "keyframeTexture", "scr_arc_tl_shadow_smoke", "scr_arc_tl", "intensity"].iter().map(|s| s.to_string()).collect();
         let d = names("x", 1, &strings, 0);
         assert_eq!(d.name.as_deref(), Some("scr_arc_tl"));
