@@ -111,13 +111,78 @@ pub fn keyframes(r: &Resource, info: &DrawableInfo) -> Vec<Vec<Vec<[f32; 4]>>> {
 }
 
 
-/// One keyframe property: an id hash (property names are not recovered)
-/// and its keys over normalised time.
+/// Keyframe property names. A property id is joaat of the lower-cased
+/// `<class>:m_<member>KFP`; every name here hashes to an id found in the
+/// data (all emitter and effect properties and most behaviour ones).
+/// `ptxu_Velocity:m_angleKFP` is from a word search (one hit in ~900 k
+/// tries against 11 ids), so less certain than the others.
+const KFP_NAMES: &[&str] = &[
+    "ptxEffectRule:m_colourTintMinKFP",
+    "ptxEffectRule:m_colourTintMaxKFP",
+    "ptxEffectRule:m_zoomScalarKFP",
+    "ptxEffectRule:m_dataSphereKFP",
+    "ptxEffectRule:m_dataCapsuleKFP",
+    "ptxEmitterRule:m_spawnRateOverTimeKFP",
+    "ptxEmitterRule:m_spawnRateOverDistKFP",
+    "ptxEmitterRule:m_particleLifeKFP",
+    "ptxEmitterRule:m_playbackRateScalarKFP",
+    "ptxEmitterRule:m_speedScalarKFP",
+    "ptxEmitterRule:m_sizeScalarKFP",
+    "ptxEmitterRule:m_accnScalarKFP",
+    "ptxEmitterRule:m_dampeningScalarKFP",
+    "ptxEmitterRule:m_matrixWeightScalarKFP",
+    "ptxEmitterRule:m_inheritVelocityKFP",
+    "ptxu_Acceleration:m_xyzMinKFP",
+    "ptxu_Acceleration:m_xyzMaxKFP",
+    "ptxu_Size:m_whdMinKFP",
+    "ptxu_Size:m_whdMaxKFP",
+    "ptxu_Size:m_tblrScalarKFP",
+    "ptxu_Size:m_tblrVelScalarKFP",
+    "ptxu_Colour:m_emissiveIntensityKFP",
+    "ptxu_Rotation:m_initialAngleMinKFP",
+    "ptxu_Rotation:m_initialAngleMaxKFP",
+    "ptxu_Rotation:m_angleMinKFP",
+    "ptxu_Rotation:m_angleMaxKFP",
+    "ptxu_Dampening:m_xyzMinKFP",
+    "ptxu_Dampening:m_xyzMaxKFP",
+    "ptxu_MatrixWeight:m_mtxWeightKFP",
+    "ptxu_ZCull:m_heightKFP",
+    "ptxu_ZCull:m_fadeDistKFP",
+    "ptxu_AnimateTexture:m_animRateKFP",
+    "ptxu_Decal:m_dimensionsKFP",
+    "ptxd_Trail:m_texInfoKFP",
+    "ptxu_Light:m_rgbMinKFP",
+    "ptxu_Light:m_rgbMaxKFP",
+    "ptxu_Light:m_intensityKFP",
+    "ptxu_Light:m_rangeKFP",
+    "ptxu_Light:m_coronaRgbMinKFP",
+    "ptxu_Light:m_coronaRgbMaxKFP",
+    "ptxu_Light:m_coronaIntensityKFP",
+    "ptxu_Light:m_coronaSizeKFP",
+    "ptxu_Attractor:m_strengthKFP",
+    "ptxu_FogVolume:m_rgbTintMinKFP",
+    "ptxu_FogVolume:m_rgbTintMaxKFP",
+    "ptxu_FogVolume:m_densityRangeKFP",
+    "ptxu_FogVolume:m_rotationMinKFP",
+    "ptxu_FogVolume:m_scaleMinKFP",
+    "ptxu_FogVolume:m_scaleMaxKFP",
+    "ptxu_Velocity:m_angleKFP",
+];
+
+fn kfp_name(id: u32) -> Option<&'static str> {
+    use std::sync::OnceLock;
+    static M: OnceLock<std::collections::HashMap<u32, &'static str>> = OnceLock::new();
+    M.get_or_init(|| KFP_NAMES.iter().map(|n| (crate::meta7a::joaat(n), *n)).collect()).get(&id).copied()
+}
+
+/// One keyframe property: its id hash, name where recovered, and its keys
+/// over normalised time.
 #[derive(Debug, Clone, Serialize)]
 pub struct KfProp {
     /// Byte offset of the property inside its rule or behaviour.
     pub at: u32,
     pub id: String,
+    pub name: Option<&'static str>,
     /// (time 0..1, value vec4). Two-value properties use x/y as min/max.
     pub keys: Vec<(f32, [f32; 4])>,
 }
@@ -134,6 +199,16 @@ pub struct PtfxEffect {
     /// f32 at +0x18 (4.2 on every arcade effect; meaning not known).
     pub f18: f32,
     pub events: Vec<PtfxEvent>,
+    /// Colour tint min/max, zoom scalar, data sphere, data capsule.
+    pub props: Vec<KfProp>,
+}
+
+/// A behaviour of a particle rule: its class (from the names of its
+/// properties, when any resolved) and keyframe properties.
+#[derive(Debug, Clone, Serialize)]
+pub struct PtfxBehaviour {
+    pub class: Option<String>,
+    pub props: Vec<KfProp>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,8 +223,13 @@ pub struct PtfxParticle {
     pub name: String,
     /// Index into this dictionary's keyframe textures (`keyframes` order).
     pub keyframe_texture: Option<usize>,
-    /// Behaviours (list at +0x188): the keyframe properties found in each.
-    pub behaviours: Vec<Vec<KfProp>>,
+    /// Behaviours (list at +0x188) that hold keyframe properties.
+    pub behaviours: Vec<PtfxBehaviour>,
+    /// Non-zero 64-bit values in the slot row at +0x300..+0x360 as
+    /// (slot, hash): probably the sprite / texture references (they differ
+    /// per particle and repeat across particles), with a hash function that
+    /// is not known; no texture store holds them.
+    pub texture_refs: Vec<(u32, String)>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -187,7 +267,7 @@ fn kf_prop(r: &Resource, q: usize, at: usize) -> Option<KfProp> {
             (r.f32(e), [r.f32(e + 0x10), r.f32(e + 0x14), r.f32(e + 0x18), r.f32(e + 0x1c)])
         }).collect()
     };
-    Some(KfProp { at: at as u32, id: format!("{id:08x}"), keys })
+    Some(KfProp { at: at as u32, id: format!("{id:08x}"), name: kfp_name(id), keys })
 }
 
 /// (hash, object offset) entries of a hash/pointer table: hash array at
@@ -228,7 +308,8 @@ pub fn rules(r: &Resource, info: &DrawableInfo) -> Option<PtfxRules> {
                         .collect()
                 })
                 .unwrap_or_default();
-            PtfxEffect { name: name(h), f18: r.f32(o + 0x18), events }
+            let props = (0..5).filter_map(|i| kf_prop(r, o + 0xb8 + 0x40 * i, 0xb8 + 0x40 * i)).collect();
+            PtfxEffect { name: name(h), f18: r.f32(o + 0x18), events, props }
         })
         .collect();
     let emitters = emi
@@ -248,10 +329,15 @@ pub fn rules(r: &Resource, info: &DrawableInfo) -> Option<PtfxRules> {
                         .filter_map(|i| r.sys_off(r.u64(bl + 8 * i)))
                         .map(|b| (0..8).filter_map(|k| kf_prop(r, b + 0x40 * k, 0x40 * k)).collect::<Vec<_>>())
                         .filter(|v: &Vec<KfProp>| !v.is_empty())
+                        .map(|props| PtfxBehaviour { class: props.iter().find_map(|p| p.name).and_then(|n| n.split(':').next()).map(str::to_string), props })
                         .collect()
                 })
                 .unwrap_or_default();
-            PtfxParticle { name: name(h), keyframe_texture, behaviours }
+            let texture_refs = (0..13u32).filter_map(|i| {
+                let v = r.u64(o + 0x300 + 8 * i as usize);
+                (v != 0).then(|| (0x300 + 8 * i, format!("{v:016x}")))
+            }).collect();
+            PtfxParticle { name: name(h), keyframe_texture, behaviours, texture_refs }
         })
         .collect();
     Some(PtfxRules { effects, emitters, particles })
@@ -285,6 +371,8 @@ mod tests {
         let r = Resource { sys, gfx: vec![], gfx_base: 0 };
         let p = kf_prop(&r, 0x40, 0x40).unwrap();
         assert_eq!(p.id, "abcd1234");
+        assert_eq!(kfp_name(0x61c50318), Some("ptxEmitterRule:m_spawnRateOverTimeKFP"));
+        assert_eq!(kfp_name(0x4af0ffa1), Some("ptxEmitterRule:m_sizeScalarKFP"));
         assert_eq!(p.keys, vec![(0.0, [3.0, 4.0, 0.0, 0.0]), (1.0, [0.5, 0.0, 0.0, 0.0])]);
         // a float pair is not an id when the padding is not zero
         let mut r = r;

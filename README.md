@@ -297,13 +297,18 @@ with `-o` the keyframe curves and the rules (`rules` in `<offset>.json`):
 each effect's events, which pair an emitter rule with a particle rule
 (`scr_arc_svr_blood_melee` fires decal, mist, main, splash, droplets and
 burst); every emitter rule's ten keyframe properties and every particle
-rule's properties grouped by behaviour, as an id hash plus keys `[time 0..1,
-value vec4]` (two-value properties hold min/max in x/y); and the index of
-each particle rule's keyframe texture (null for the 7 % that have none). All
-146 dictionaries decode (2,816 effects, 11,228 events, 8,224 particle
-rules). Property names and behaviour types are hashes with no recovered
-names, so what each property drives is not known; the sprite links are not
-decoded and the sprite sheets are not embedded.
+rule's properties grouped by behaviour, with keys `[time 0..1, value vec4]`; and the index of each particle
+rule's keyframe texture (null for the 7 % that have none). Property ids are
+joaat of `<class>:m_<member>KFP`, so names resolve: every effect property
+(`ptxEffectRule:m_colourTintMinKFP` …) and emitter property
+(`m_spawnRateOverTimeKFP`, `m_particleLifeKFP`, `m_sizeScalarKFP` …) and
+about 70 % of behaviour properties (`ptxu_Size:m_whdMinKFP`,
+`ptxu_Rotation:m_angleMinKFP`, `ptxu_Light:m_rangeKFP` …), which also
+names each behaviour's class. Five `ptxu_Colour` properties and a few
+others stay hashes. All 146 dictionaries decode (2,816 effects, 11,228
+events, 8,224 particle rules). `texture_refs` lists the 64-bit values that
+probably name each particle's sprite; no texture store holds them (hash
+function unknown) and the sprite sheets are not embedded.
 
 **UI fonts** (`sixng fonts`): the Scaleform font libraries in data.rpf
 (`fontlib_efigs`, Chinese, Japanese and Korean) hold their fonts as SWF

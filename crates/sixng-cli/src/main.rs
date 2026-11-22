@@ -468,9 +468,9 @@ enum Cmd {
     /// -o, also <out>/ptfx/<archive>/index.json and per dictionary
     /// <offset>.json with the keyframe curves (16 RGBA samples x 4 rows per
     /// keyframe texture) and the rules: each effect's events (emitter rule +
-    /// particle rule), keyframe properties (id hash, keys over time) and
-    /// each particle rule's keyframe texture. Property names, behaviour
-    /// types and sprite links are not decoded.
+    /// particle rule), keyframe properties (name, keys over time), behaviour
+    /// classes and each particle rule's keyframe texture. Sprite links are
+    /// not resolved.
     Ptfx {
         #[arg(default_value = "data")]
         archive: String,
@@ -1371,7 +1371,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 for (d, kf) in &found {
                     let off = d.id.rsplit('@').next().unwrap_or("x");
                     let kf = kf.clone().unwrap_or_default();
-                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&json!({"dictionary": d, "keyframes": kf["keyframes"], "rules": kf["rules"], "rules_note": "effects[].events pair an emitter rule with a particle rule. Keyframe properties: id = hash of the property name (names not recovered), keys = [time 0..1, value vec4]; two-value properties hold min/max in x/y. Emitter props are the ten slots in stored order; particle props are grouped by behaviour (behaviour types not decoded). particles[].keyframe_texture indexes `keyframes`."}))?)?;
+                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&json!({"dictionary": d, "keyframes": kf["keyframes"], "rules": kf["rules"], "rules_note": "effects[].events pair an emitter rule with a particle rule. Keyframe properties: id = joaat of the lower-cased `<class>:m_<member>KFP`, name where it resolved (all effect and emitter properties, about 70 % of behaviour ones; ptxu_Velocity:m_angleKFP is less certain), keys = [time 0..1, value vec4]; min/max pairs are separate properties or x/y of one. Scalars such as sizeScalar are percentages (100 = 1x). Particle props are grouped by behaviour, with the behaviour class taken from its property names. particles[].keyframe_texture indexes `keyframes`; particles[].texture_refs are the 64-bit values that probably name the sprite (hash function unknown)."}))?)?;
                 }
                 std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }
