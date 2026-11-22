@@ -278,7 +278,7 @@ impl AudioView {
                 return Ok(vec![p.display().to_string()]);
             }
             let mut files = Vec::new();
-            for st in b.streams.iter().filter(|st| s.map_or(st.layout == "blocks", |x| x.id == st.id)) {
+            for st in b.streams.iter().filter(|st| s.map_or(st.layout == "blocks" || st.layout == "music", |x| x.id == st.id)) {
                 files.extend(audio::export_stream(&bytes, b, st, &dir, fmt)?);
             }
             Ok(files)
@@ -437,7 +437,7 @@ impl AudioView {
                             ui.label(format!("{} Hz", s.rate)).on_hover_text("Rate field of the stream. Opus always decodes at 48 kHz; this is likely the source rate.");
                             match s.layout.as_str() {
                                 "music" => {
-                                    ui.label(format!("music, {} ch", s.channels)).on_hover_text("Multichannel music: the block header is not decoded yet. Export the bank raw (.awc).");
+                                    ui.label(format!("music, {} ch", s.channels)).on_hover_text("Music with several sub-streams (stems): exported as one file per sub-stream. Not playable here.");
                                 }
                                 "blocks" => {
                                     ui.label(format!("Opus, {}", if s.channels == 2 { "stereo" } else { "mono" }));
@@ -457,7 +457,7 @@ impl AudioView {
                                 self.play(&b, s);
                             }
                             ui.horizontal(|ui| {
-                                let ok = s.layout == "blocks";
+                                let ok = s.layout == "blocks" || s.layout == "music";
                                 if ui.add_enabled(ok, egui::Button::new(".opus").small()).clicked() {
                                     self.export(&b, Some(s), "opus");
                                 }

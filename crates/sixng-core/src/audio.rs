@@ -15,6 +15,18 @@
 //! (bits 0-28 id, 29-31 chunk count); the chunk records (u64: type 63-56,
 //! size 55-28, offset 27-0 from the bank start), ending at the header length.
 //! Stream ids and chunk types are hashes; names are not recovered.
+//!
+//! Music streams (a stream-format chunk next to the data chunk) hold several
+//! sub-streams ("channels", each its own mono or stereo Opus stream, e.g.
+//! stems). Stream-format chunk: u32 block count, u32 block size, u32 channel
+//! count, then 16 bytes per channel (u32 id, u32 samples, u16 ?, u16 rate,
+//! u8 codec, 3 bytes ?). The data is that many blocks of the block size (the
+//! last one shorter). A block starts with 24 bytes per channel (u32 -1, u32
+//! 2 KiB-block count, u32 0, u32 samples, u32 0, u32 0), then one u32 seek
+//! table per channel (one sample position per 2 KiB block), padded to 2 KiB;
+//! then each channel's 2 KiB blocks in turn, packed as in plain streams.
+//! Sample counts (channel and block) count each channel of a stereo
+//! sub-stream, so they are twice the frame count for stereo.
 
 use crate::export::Progress;
 use anyhow::{anyhow, Context, Result};
@@ -62,11 +74,11 @@ pub struct Stream {
     pub rate: u32,
     /// Codec byte of the format chunk (Opus streams have 0).
     pub codec: u8,
-    /// Channels: from the first packet for Opus streams, from the
-    /// stream-format chunk for music streams.
+    /// Channels: from the first packet for Opus streams; for music streams
+    /// the number of sub-streams (stems) in the stream-format chunk.
     pub channels: u32,
-    /// "blocks" (Opus, 2 KiB packet blocks), "music" (512 KiB blocks with an
-    /// undecoded header, multichannel), "other" (data with a codec byte other
+    /// "blocks" (Opus, 2 KiB packet blocks), "music" (sub-streams in large
+    /// blocks, see the module notes), "other" (data with a codec byte other
     /// than 0: not decoded), or "none" (no data chunk: a channel entry of a
     /// music stream, or metadata only).
     pub layout: String,
@@ -235,6 +247,20 @@ fn read_formats(f: &mut File, bank: &mut Bank) -> Result<()> {
             _ => "none",
         }
         .into();
+        if s.layout == "music" && s.channels > 0 && s.data.1 >= 0x803 {
+            // the sample count counts both channels of a stereo sub-stream:
+            // keep frames, from the first packet's stereo bit
+            let mut h = vec![0u8; 24 * s.channels as usize];
+            f.seek(SeekFrom::Start(bank.off + s.data.0 as u64))?;
+            f.read_exact(&mut h)?;
+            let n: u64 = (0..s.channels as usize).map(|c| u32le(&h, 24 * c + 4).unwrap_or(0) as u64).sum();
+            let hdr = 24 * s.channels as u64 + 4 * n;
+            let mut t = [0u8; 3];
+            f.seek(SeekFrom::Start(bank.off + s.data.0 as u64 + hdr.div_ceil(BLOCK as u64) * BLOCK as u64))?;
+            if f.read_exact(&mut t).is_ok() && t[2] & 4 != 0 {
+                s.samples /= 2;
+            }
+        }
         if s.layout == "blocks" && s.data.1 >= 3 {
             // channels from the first packet's TOC (stereo bit)
             let mut t = [0u8; 3];
@@ -310,7 +336,7 @@ pub fn scan(path: &Path, archive: &str, pr: Progress) -> Result<AudioIndex> {
         archive: archive.into(),
         archive_size: len,
         banks,
-        note: "Audio banks (ADAT) found by scanning for the magic; offsets are in the archive. Stream ids are 29-bit hashes (names not recovered). layout: blocks = Opus packets in 2 KiB blocks (exported as Ogg Opus or WAV); music = 512 KiB blocks with an undecoded header (multichannel; exported raw); other = codec byte not 0, not decoded (exported raw); none = no data chunk. Opus sample counts are 48 kHz units over all channels.".into(),
+        note: "Audio banks (ADAT) found by scanning for the magic; offsets are in the archive. Stream ids are 29-bit hashes (names not recovered). layout: blocks = Opus packets in 2 KiB blocks (exported as Ogg Opus or WAV); music = sub-streams (stems), each its own Opus stream, exported one file per sub-stream; music lengths are per sub-stream; other = codec byte not 0, not decoded (exported raw); none = no data chunk. Opus sample counts are 48 kHz units over all channels.".into(),
     })
 }
 
@@ -356,6 +382,49 @@ pub fn packets(bank: &[u8], s: &Stream) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// One sub-stream of a music stream.
+pub struct MusicChannel {
+    pub id: u32,
+    /// Frames per channel at 48 kHz.
+    pub frames: u32,
+    pub packets: Vec<Vec<u8>>,
+}
+
+/// Split a music stream into its sub-streams. `bank` = the whole bank.
+pub fn music_channels(bank: &[u8], bank_off: u64, s: &Stream) -> Result<Vec<MusicChannel>> {
+    let hb = parse_header(bank, bank_off).ok_or_else(|| anyhow!("bank header"))?;
+    let hs = hb.streams.iter().find(|x| x.id == s.id).ok_or_else(|| anyhow!("stream {:08x} not in the bank header", s.id))?;
+    let sf = hs.chunk(CH_STREAM_FORMAT).ok_or_else(|| anyhow!("stream {:08x}: no stream-format chunk", s.id))?;
+    let dc = hs.chunk(CH_DATA).ok_or_else(|| anyhow!("stream {:08x}: no data chunk", s.id))?;
+    let f = bank.get(sf.off as usize..(sf.off + sf.size) as usize).ok_or_else(|| anyhow!("stream-format chunk outside the bank"))?;
+    let d = bank.get(dc.off as usize..(dc.off + dc.size) as usize).ok_or_else(|| anyhow!("data chunk outside the bank"))?;
+    let (nblk, bsize, nch) = (u32le(f, 0).unwrap_or(0) as usize, u32le(f, 4).unwrap_or(0) as usize, u32le(f, 8).unwrap_or(0) as usize);
+    if nch == 0 || nch > 64 || f.len() < 12 + 16 * nch || bsize < BLOCK || nblk == 0 || (nblk - 1) * bsize >= d.len() {
+        return Err(anyhow!("stream {:08x}: unexpected music layout ({nblk} blocks of {bsize:#x}, {nch} ch, data {:#x})", s.id, d.len()));
+    }
+    let mut out: Vec<MusicChannel> = (0..nch).map(|c| MusicChannel { id: u32le(f, 12 + 16 * c).unwrap(), frames: u32le(f, 12 + 16 * c + 4).unwrap(), packets: Vec::new() }).collect();
+    for bi in 0..nblk {
+        let blk = &d[bi * bsize..((bi + 1) * bsize).min(d.len())];
+        let counts: Vec<usize> = (0..nch).map(|c| u32le(blk, 24 * c + 4).unwrap_or(0) as usize).collect();
+        let hdr = (24 * nch + 4 * counts.iter().sum::<usize>()).div_ceil(BLOCK) * BLOCK;
+        if hdr + BLOCK * counts.iter().sum::<usize>() > blk.len() {
+            return Err(anyhow!("stream {:08x}: block {bi} is shorter than its header says", s.id));
+        }
+        let mut p = hdr;
+        for (c, &n) in counts.iter().enumerate() {
+            let sub = Stream { id: 0, chunks: Vec::new(), data: (p as u32, (n * BLOCK) as u32), samples: 0, rate: 0, codec: 0, channels: 0, layout: String::new() };
+            out[c].packets.extend(packets(blk, &sub));
+            p += n * BLOCK;
+        }
+    }
+    for c in out.iter_mut() {
+        if packet_channels(&c.packets) == 2 {
+            c.frames /= 2;
+        }
+    }
+    Ok(out)
 }
 
 /// Samples (at 48 kHz) in an Opus packet, from its TOC byte (RFC 6716 3.1).
@@ -515,9 +584,20 @@ pub fn stem(b: &Bank, s: &Stream) -> String {
     format!("{:x}_{:08x}", b.off, s.id)
 }
 
-/// Export one stream. `fmt`: opus | wav | both. Returns written files.
+/// Export one stream (a music stream: one file per sub-stream, named
+/// `<stem>_<sub-stream id>`). `fmt`: opus | wav | both. Returns written files.
 pub fn export_stream(bank_bytes: &[u8], b: &Bank, s: &Stream, out: &Path, fmt: &str) -> Result<Vec<String>> {
     std::fs::create_dir_all(out)?;
+    if s.layout == "music" {
+        let mut files = Vec::new();
+        for c in music_channels(bank_bytes, b.off, s)? {
+            if c.packets.is_empty() {
+                continue;
+            }
+            files.extend(write_stream(&c.packets, c.frames, &format!("{}_{:08x}", stem(b, s), c.id), out, fmt)?);
+        }
+        return Ok(files);
+    }
     if s.layout != "blocks" {
         return Err(anyhow!("stream {:08x}: layout '{}' is not exported per stream (export the bank raw)", s.id, s.layout));
     }
@@ -525,15 +605,18 @@ pub fn export_stream(bank_bytes: &[u8], b: &Bank, s: &Stream, out: &Path, fmt: &
     if pk.is_empty() {
         return Err(anyhow!("stream {:08x}: no Opus packets", s.id));
     }
+    write_stream(&pk, s.frames(), &stem(b, s), out, fmt)
+}
+
+fn write_stream(pk: &[Vec<u8>], frames: u32, st: &str, out: &Path, fmt: &str) -> Result<Vec<String>> {
     let mut files = Vec::new();
-    let st = stem(b, s);
     if fmt == "opus" || fmt == "both" {
         let p = out.join(format!("{st}.opus"));
-        std::fs::write(&p, ogg_opus(&pk, s.frames(), &st))?;
+        std::fs::write(&p, ogg_opus(pk, frames, st))?;
         files.push(p.display().to_string());
     }
     if fmt == "wav" || fmt == "both" {
-        let (ch, pcm) = decode(&pk, s.frames())?;
+        let (ch, pcm) = decode(pk, frames)?;
         let p = out.join(format!("{st}.wav"));
         let mut f = File::create(&p)?;
         f.write_all(&wav(ch, 48000, &pcm))?;
@@ -588,5 +671,49 @@ mod tests {
         assert_eq!(b.streams.len(), 1);
         assert_eq!(b.streams[0].id, 0x1234);
         assert_eq!(b.size, hl as u64 + 32 + 2048);
+    }
+    #[test]
+    fn music() {
+        // one music stream: 1 block, 2 mono sub-streams, one 2 KiB block each
+        let mut h = b"ADAT".to_vec();
+        h.extend_from_slice(&0xFF01_0001u32.to_le_bytes());
+        h.extend_from_slice(&1u32.to_le_bytes());
+        let hl = 16 + 2 + 4 + 16;
+        h.extend_from_slice(&(hl as u32).to_le_bytes());
+        h.extend_from_slice(&0u16.to_le_bytes());
+        h.extend_from_slice(&(2u32 << 29).to_le_bytes());
+        let rec = |t: u64, s: u64, o: u64| (t << 56) | (s << 28) | o;
+        let sf_len = 12 + 32;
+        let data_len = 2048 + 2 * 2048;
+        h.extend_from_slice(&rec(0x48, sf_len as u64, hl as u64).to_le_bytes());
+        h.extend_from_slice(&rec(0x55, data_len as u64, (hl + sf_len) as u64).to_le_bytes());
+        for v in [1u32, 0x4000, 2] {
+            h.extend_from_slice(&v.to_le_bytes());
+        }
+        for id in [0xAAu32, 0xBB] {
+            h.extend_from_slice(&id.to_le_bytes());
+            h.extend_from_slice(&960u32.to_le_bytes());
+            h.extend_from_slice(&[0, 0, 0x80, 0xBB, 0, 0, 0, 0]);
+        }
+        let d0 = h.len();
+        for _ in 0..2 {
+            for v in [u32::MAX, 1, 0, 960, 0, 0] {
+                h.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        h.extend_from_slice(&[0u8; 8]); // seek tables
+        h.resize(d0 + 2048, 0);
+        for tag in [1u8, 2] {
+            let s = h.len();
+            h.extend_from_slice(&[3, 0, 0xF8, tag, tag]);
+            h.resize(s + 2048, 0);
+        }
+        let b = parse_header(&h, 0).unwrap();
+        let mut st = b.streams[0].clone();
+        st.layout = "music".into();
+        let c = music_channels(&h, 0, &st).unwrap();
+        assert_eq!(c.len(), 2);
+        assert_eq!((c[0].id, c[0].frames), (0xAA, 960));
+        assert_eq!(c[1].packets, vec![vec![0xF8, 2, 2]]);
     }
 }
