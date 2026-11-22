@@ -10,7 +10,8 @@
 //!       u32 a: (a & 0xFFFFFF) << 8 = file offset of a zlib stream; bits 24-29 = flags
 //!              (codec: 0x20 zlib; 0x04 BC1, 0x0C/0x10 BC3/BC4?, 0x14 BC5, 0x18 BC6H,
 //!              0x1C BC7 = per-format BCPack, the Xbox Series hardware texture codec;
-//!              BC1 decodes with `bcpack-rs`, the others not yet; 0x00 stored),
+//!              BC1 decodes with `bcpack-rs`, BC3 with `bc3pack`, BC7 with `bc7pack`, the others not
+//!              yet; 0x00 stored),
 //!              bits 30-31 = 4 KiB pages added to the virtual offset
 //!       u32 b: virtual offset = 0x1000 + (b & 0xFFFFF) * 0x4000 + (a >> 30) * 0x1000
 //!              (the 0x1000 is the header page); b >> 20 = bytes of padding after
@@ -88,9 +89,14 @@ fn is_bcpack(fl: u8) -> bool {
     fl & 0x1C != 0
 }
 
-/// BCPack chunks that SixNG cannot decode: every codec but BC1 (0x04).
+/// BCPack BC3 codec id.
+const CODEC_BC3: u8 = 0x0C;
+/// BCPack BC7 codec id.
+const CODEC_BC7: u8 = 0x1C;
+
+/// BCPack chunks that SixNG cannot decode: every codec but BC1 (0x04), BC3 (0x0C) and BC7 (0x1C).
 fn is_undecoded(fl: u8) -> bool {
-    is_bcpack(fl) && fl & 0x3F != bcpack::ttpf::CODEC_BC1
+    is_bcpack(fl) && ![bcpack::ttpf::CODEC_BC1, CODEC_BC3, CODEC_BC7].contains(&(fl & 0x3F))
 }
 
 /// Decode a BCPack BC1 chunk to plain BC1 blocks (`blocks` x 8 bytes).
@@ -261,7 +267,14 @@ impl Ttpf {
             let mut comp = vec![0u8; (fnext - foff).saturating_sub(pad) as usize];
             f.read_exact(&mut comp)?;
             let raw = if is_bcpack(fl) {
-                match decode_bc1(&comp, ((v1 - v0) / 8) as usize) {
+                let decoded = if fl & 0x3F == CODEC_BC3 {
+                    crate::bc3pack::decode(&comp, ((v1 - v0) / 16) as usize).map(|o| o.blocks)
+                } else if fl & 0x3F == CODEC_BC7 {
+                    crate::bc7pack::decode(&comp, ((v1 - v0) / 16) as usize).map(|o| o.blocks)
+                } else {
+                    decode_bc1(&comp, ((v1 - v0) / 8) as usize)
+                };
+                match decoded {
                     Some(b) => b,
                     None => {
                         skipped += end.min(v1) - virt.max(v0);
@@ -587,11 +600,13 @@ mod tests {
     }
 
     #[test]
-    fn only_bc1_bcpack_decodes() {
+    fn only_bc1_bc3_and_bc7_bcpack_decode() {
         // flags byte = codec | (4 KiB page bits << 6)
         assert!(!is_bcpack(0x20) && !is_bcpack(0x00) && !is_bcpack(0xA0));
         assert!(is_bcpack(0x04) && !is_undecoded(0x04) && !is_undecoded(0xC4));
-        for c in [0x0C, 0x10, 0x14, 0x18, 0x1C, 0x5C] {
+        assert!(is_bcpack(0x0C) && !is_undecoded(0x0C) && !is_undecoded(0x4C));
+        assert!(!is_undecoded(0x1C) && !is_undecoded(0x5C));
+        for c in [0x10, 0x14, 0x18] {
             assert!(is_undecoded(c));
         }
     }

@@ -20,6 +20,8 @@ pub mod gfx10;
 pub mod resource;
 pub mod texture;
 pub mod ttpf;
+pub mod bc3pack;
+pub mod bc7pack;
 pub mod gaps;
 pub mod lodlinks;
 pub mod bink;
