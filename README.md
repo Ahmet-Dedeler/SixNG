@@ -304,8 +304,10 @@ joaat of `<class>:m_<member>KFP`, so names resolve: every effect property
 (`m_spawnRateOverTimeKFP`, `m_particleLifeKFP`, `m_sizeScalarKFP` …) and
 about 70 % of behaviour properties (`ptxu_Size:m_whdMinKFP`,
 `ptxu_Rotation:m_angleMinKFP`, `ptxu_Light:m_rangeKFP` …), which also
-names each behaviour's class. Five `ptxu_Colour` properties and a few
-others stay hashes. All 146 dictionaries decode (2,816 effects, 11,228
+names each behaviour's class. The colour over life is in two unnamed
+`ptxu_Colour` properties (RGBA, min/max pair; marked with `role`). The
+keyframe textures are not the behaviour curves (no row matches one); they
+look like the particle shader's variables. All 146 dictionaries decode (2,816 effects, 11,228
 events, 8,224 particle rules). `texture_refs` lists the 64-bit values that
 probably name each particle's sprite; no texture store holds them (hash
 function unknown) and the sprite sheets are not embedded.

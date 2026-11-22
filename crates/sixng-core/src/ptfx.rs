@@ -85,7 +85,12 @@ fn half(h: u16) -> f32 {
 }
 
 /// The keyframe textures as float rows: per texture, `height` rows of
-/// `width` RGBA samples (stored order; what each row drives is not known).
+/// `width` RGBA samples. Each particle rule has one (`keyframe_texture`).
+/// They are not baked copies of the behaviour curves (no row matches any
+/// time-varying behaviour property over 7,604 particles); row 0 is a
+/// constant per-particle tuple and row 2's z often 1 or a fade, so they are
+/// probably the particle shader's variables. What each row drives is not
+/// known; colour and size over life are in the behaviour properties.
 pub fn keyframes(r: &Resource, info: &DrawableInfo) -> Vec<Vec<Vec<[f32; 4]>>> {
     let mut out = Vec::new();
     for t in info.embedded_textures.iter().filter(|t| t.name == KEYFRAME_TEXTURE && t.dxgi_format == 10) {
@@ -169,6 +174,17 @@ const KFP_NAMES: &[&str] = &[
     "ptxu_Velocity:m_angleKFP",
 ];
 
+/// Roles of properties whose names did not resolve, from their values.
+fn kfp_role(id: u32) -> Option<&'static str> {
+    match id {
+        // RGBA over life, alpha fading to 0 at the end (purple splatter
+        // (0.39, 0, 0.67), blood (0.45, 0, 0)); the particle picks between
+        // the two (GTA V names them rgbaMin / rgbaMax; these ids differ)
+        0xe7851995 | 0xc1444d14 => Some("ptxu_Colour: RGBA colour over life, one bound of the min/max pair (name not recovered)"),
+        _ => None,
+    }
+}
+
 fn kfp_name(id: u32) -> Option<&'static str> {
     use std::sync::OnceLock;
     static M: OnceLock<std::collections::HashMap<u32, &'static str>> = OnceLock::new();
@@ -183,6 +199,9 @@ pub struct KfProp {
     pub at: u32,
     pub id: String,
     pub name: Option<&'static str>,
+    /// What an unnamed property holds, where its values make it clear.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<&'static str>,
     /// (time 0..1, value vec4). Two-value properties use x/y as min/max.
     pub keys: Vec<(f32, [f32; 4])>,
 }
@@ -267,7 +286,7 @@ fn kf_prop(r: &Resource, q: usize, at: usize) -> Option<KfProp> {
             (r.f32(e), [r.f32(e + 0x10), r.f32(e + 0x14), r.f32(e + 0x18), r.f32(e + 0x1c)])
         }).collect()
     };
-    Some(KfProp { at: at as u32, id: format!("{id:08x}"), name: kfp_name(id), keys })
+    Some(KfProp { at: at as u32, id: format!("{id:08x}"), name: kfp_name(id), role: kfp_role(id), keys })
 }
 
 /// (hash, object offset) entries of a hash/pointer table: hash array at
