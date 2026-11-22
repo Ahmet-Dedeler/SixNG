@@ -255,7 +255,7 @@ impl TextureView {
         }
         // filters
         ui.horizontal_wrapped(|ui| {
-            let store_name = |i: usize| set.stores[i].path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+            let store_name = |i: usize| set.stores[i].label();
             let cur = self.store_sel.map(store_name).unwrap_or_else(|| format!("all stores ({})", set.stores.len()));
             egui::ComboBox::from_id_salt("tv_store").selected_text(cur).width(220.0).show_ui(ui, |ui| {
                 if ui.selectable_label(self.store_sel.is_none(), "all stores").clicked() {
@@ -357,7 +357,7 @@ impl TextureView {
                 sixng_core::texture::dxgi_name(t.dxgi_format),
                 t.mips(),
                 t.tile_mode(),
-                st.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()
+                st.label()
             ));
         });
         ui.horizontal_wrapped(|ui| {

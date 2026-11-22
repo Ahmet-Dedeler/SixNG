@@ -202,6 +202,16 @@ impl Ttpf {
         Ok(Ttpf { path: path.to_path_buf(), chunks, virt_size, textures, by_hash })
     }
 
+    /// Short name: the file name, prefixed with the pack for stores under
+    /// `pack/<name>/` (`story000/ttdb_maps.ttpf`).
+    pub fn label(&self) -> String {
+        let file = self.path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        let parts: Vec<String> = self.path.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+        match parts.iter().rposition(|c| c.eq_ignore_ascii_case("pack")).and_then(|i| parts.get(i + 1)) {
+            Some(pk) if pk != &file => format!("{pk}/{file}"),
+            _ => file,
+        }
+    }
     pub fn get(&self, hash: u64) -> Option<&TtpfTex> {
         self.by_hash.get(&hash).map(|&i| &self.textures[i])
     }
@@ -441,10 +451,22 @@ impl TtpfTex {
     }
 }
 
-/// The stores under `<game root>/data/ttdb`, opened once per process.
+/// The stores under `<game root>/data/ttdb` and `<game root>/pack/*/data/ttdb`,
+/// opened once per process.
 pub fn global(game_root: &Path) -> &'static TtpfSet {
     static SET: std::sync::OnceLock<TtpfSet> = std::sync::OnceLock::new();
-    SET.get_or_init(|| TtpfSet::open_dir(&game_root.join("data").join("ttdb")))
+    SET.get_or_init(|| {
+        let mut set = TtpfSet::open_dir(&game_root.join("data").join("ttdb"));
+        // Content packs keep their own stores (`pack/<name>/data/ttdb`), used
+        // by the models in that pack's archive (story000 map models, ...).
+        // Only 4 hashes also occur in data/ttdb, with the same texture.
+        let mut packs: Vec<PathBuf> = std::fs::read_dir(game_root.join("pack")).into_iter().flatten().flatten().map(|e| e.path().join("data").join("ttdb")).filter(|p| p.is_dir()).collect();
+        packs.sort();
+        for p in packs {
+            set.stores.extend(TtpfSet::open_dir(&p).stores);
+        }
+        set
+    })
 }
 
 /// Mean colour of a decoded texture and whether it looks like a tangent-space

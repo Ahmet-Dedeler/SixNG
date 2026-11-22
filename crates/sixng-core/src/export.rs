@@ -380,7 +380,7 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                     st.entries.push(e);
                     continue;
                 };
-                e["store"] = store.path.file_name().map(|f| f.to_string_lossy().to_string()).into();
+                e["store"] = store.label().into();
                 e["width"] = tx.width.into();
                 e["height"] = tx.height.into();
                 e["format"] = texture::dxgi_name(tx.dxgi_format).into();

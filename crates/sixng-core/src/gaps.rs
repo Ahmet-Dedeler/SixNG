@@ -481,7 +481,7 @@ pub fn texture_gaps(archives: &[(ArchiveInfo, Vec<Entry>)], inp: &GapInputs, pro
     let set: &TtpfSet = crate::ttpf::global(&crate::export::game_root(&first.0));
     let ranges: Vec<Vec<(u64, u64)>> = set.stores.iter().map(|s| s.bcpack_ranges()).collect();
     let store_of: HashMap<usize, usize> = set.stores.iter().enumerate().map(|(i, s)| (s as *const Ttpf as usize, i)).collect();
-    let store_name = |i: usize| set.stores[i].path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+    let store_name = |i: usize| set.stores[i].label();
     let tex_cache: Mutex<HashMap<u64, Option<Tex>>> = Mutex::new(HashMap::new());
     let look = |h: u64| -> Option<Tex> {
         if let Some(t) = tex_cache.lock().unwrap().get(&h) {
