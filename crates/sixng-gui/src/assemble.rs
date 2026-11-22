@@ -9,70 +9,13 @@
 //! Both are put together here for the viewer: the default parts, one copy each
 //! (the first in the archive), in their bind pose.
 
+use sixng_core::outfit::{dedupe, is_fit};
+pub use sixng_core::outfit::{is_animal, is_ped_part, is_whole_ped, outfit_options, outfit_parts, outfit_prefix, PartOpt};
 use sixng_core::scan::{ArchiveIndex, Entry};
-use std::collections::BTreeMap;
-
-/// Animal roots: `cr` + class letter (m mammal, b bird, f fish, r reptile,
-/// a amphibian, c crustacean, i insect).
-pub fn is_animal(name: &str) -> bool {
-    let b = name.as_bytes();
-    b.len() > 4 && name.starts_with("cr") && b[2].is_ascii_lowercase() && b[3] == b'_'
-}
-
-/// Fit tag (`mr1`, `fr1`, `mk1`, `fb1` …): sex + body type + number.
-fn is_fit(t: &str) -> bool {
-    let b = t.as_bytes();
-    b.len() == 3 && (b[0] == b'm' || b[0] == b'f') && b[1].is_ascii_lowercase() && b[2].is_ascii_digit()
-}
-
-/// Character prefix of a ped part: the tokens before `<item>_<fit>`, when
-/// there are at least two (`cs_ali_head_fr1_…` → `cs_ali`). Generic items
-/// (`tshirtcrewneck_mr1_…`) and the watch set `s01_` have none.
-pub fn outfit_prefix(name: &str) -> Option<String> {
-    let t: Vec<&str> = name.split('_').collect();
-    if t[0] == "char" || t[0] == "fchar" || t[0] == "s01" || is_animal(name) {
-        return None;
-    }
-    let i = t.iter().position(|x| is_fit(x))?;
-    if i < 3 {
-        return None;
-    }
-    Some(t[..i - 1].join("_"))
-}
-
-/// Ped item that is a whole body on its own (`legacypedworld_mr1_023_fullbody…`).
-pub fn is_whole_ped(name: &str) -> bool {
-    name.starts_with("legacypedworld_") && name.contains("_fullbody")
-}
-
-/// Ped part (has a fit tag), shown under People.
-pub fn is_ped_part(name: &str) -> bool {
-    name.split('_').any(is_fit) || name.starts_with("char_") || name.starts_with("fchar_")
-}
 
 const ANIMAL_SKIP: &[&str] = &[
     "generic", "costume", "collar", "harness", "hat", "badge", "ribbon", "bandana", "cape", "lace", "flower", "knife", "vest", "rope", "tranquilizer", "loop", "shadesaviators", "accessories", "human", "stick", "corpse", "roadkill", "gut", "gonad", "bone",
 ];
-
-/// One choosable part of an animal or a character, for the viewer's Parts
-/// panel. Parts in the same `group` replace each other (one per group, or none).
-#[derive(Clone, Debug)]
-pub struct PartOpt {
-    pub off: u64,
-    pub id: String,
-    pub name: String,
-    pub group: String,
-    pub label: String,
-    pub default: bool,
-}
-
-fn dedupe<'a>(it: impl Iterator<Item = (String, &'a Entry)>) -> BTreeMap<String, &'a Entry> {
-    let mut by_name: BTreeMap<String, &Entry> = BTreeMap::new();
-    for (n, e) in it {
-        by_name.entry(n).and_modify(|x| if e.off < x.off { *x = e }).or_insert(e);
-    }
-    by_name
-}
 
 /// Every part of an animal root: `<root>_<words>_<NN>[_<set>]` (`body_00`,
 /// `body_08_collarharness`, `harness_08_collarharness`). The default look is
@@ -118,120 +61,6 @@ pub fn animal_options(ix: &ArchiveIndex, root: &str) -> Vec<PartOpt> {
 /// Default parts of an animal root: `<root>_<words>_00` without accessories.
 pub fn animal_parts<'a>(ix: &'a ArchiveIndex, root: &str) -> Vec<&'a Entry> {
     let offs: Vec<u64> = animal_options(ix, root).into_iter().filter(|o| o.default).map(|o| o.off).collect();
-    ix.entries.iter().filter(|e| offs.contains(&e.off)).collect()
-}
-
-/// Outfit slot of a ped item word (`tshirtcrewneck` → top); None = left out
-/// (hats, bags, watches, jewellery other than piercings, masks …).
-fn slot(item: &str) -> Option<&'static str> {
-    const SLOTS: &[(&str, &str)] = &[
-        ("hair", "hair"),
-        ("beard", "beard"),
-        ("brows", "brows"),
-        ("lashes", "lashes"),
-        ("eyes", "eyes"),
-        ("teeth", "teeth"),
-        ("bodyupper", "body_upper"),
-        ("bodylower", "body_lower"),
-        ("fullbody", "full"),
-        ("dress", "full"),
-        ("jumpsuit", "full"),
-        ("overalls", "full"),
-        ("jacket", "outer"),
-        ("coat", "outer"),
-        ("blazer", "outer"),
-        ("cardigan", "outer"),
-        ("tshirt", "top"),
-        ("shirt", "top"),
-        ("sweatshirt", "top"),
-        ("hoodie", "top"),
-        ("tanktop", "top"),
-        ("blouse", "top"),
-        ("bra", "top"),
-        ("pants", "bottom"),
-        ("shorts", "bottom"),
-        ("skirt", "bottom"),
-        ("undies", "bottom"),
-        ("leggings", "bottom"),
-        ("boots", "feet"),
-        ("shoes", "feet"),
-        ("sneakers", "feet"),
-        ("sandals", "feet"),
-        ("heels", "feet"),
-        ("piercing", "piercing"),
-    ];
-    if item == "head" {
-        return Some("head");
-    }
-    // longest matching word first (sweatshirt before shirt)
-    SLOTS.iter().filter(|(w, _)| item.starts_with(w)).max_by_key(|(w, _)| w.len()).map(|(_, s)| *s)
-}
-
-/// Group of an accessory item word (`hatflatcap` → hat); None = its own word.
-fn accessory_group(item: &str) -> Option<&'static str> {
-    const G: &[(&str, &str)] = &[
-        ("hat", "hat"),
-        ("cap", "hat"),
-        ("helmet", "hat"),
-        ("beanie", "hat"),
-        ("sunglasses", "glasses"),
-        ("glasses", "glasses"),
-        ("backpack", "bag"),
-        ("bag", "bag"),
-        ("watch", "watch"),
-        ("necklace", "neck"),
-        ("chain", "neck"),
-        ("earring", "ears"),
-        ("glove", "gloves"),
-        ("mask", "mask"),
-    ];
-    G.iter().filter(|(w, _)| item.starts_with(w)).max_by_key(|(w, _)| w.len()).map(|(_, g)| *g)
-}
-
-/// Every part of a character prefix, grouped by outfit slot (or by item word
-/// for hats, bags, watches …). The default look is one part per slot (the
-/// first in name order) plus the eyes that go with the head; a one-piece
-/// outfit replaces top and bottom. Accessories, `_alt_` pieces and holsters
-/// are offered but off by default; clipping-cut (`_cull`) and first-person
-/// copies are left out.
-pub fn outfit_options(ix: &ArchiveIndex, prefix: &str) -> Vec<PartOpt> {
-    let p = format!("{}_", prefix.to_ascii_lowercase());
-    let by_name = dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
-        let n = e.name.as_ref()?.to_ascii_lowercase();
-        (n.starts_with(&p) && outfit_prefix(&n).as_deref() == Some(prefix)).then_some((n, e))
-    }));
-    let mut opts = Vec::new();
-    let mut chosen: BTreeMap<String, u64> = BTreeMap::new();
-    for (n, e) in &by_name {
-        if ["_cull", "_fp", "eyecap", "tattooprojection"].iter().any(|x| n.contains(x)) {
-            continue;
-        }
-        let rest = &n[p.len()..];
-        let item = rest.split('_').next().unwrap_or("");
-        let optional = n.contains("_alt_") || n.contains("holster");
-        let group = match slot(item) {
-            Some("head") if n.contains("_eyes") => "head eyes".to_string(),
-            Some(s) => s.replace('_', " "),
-            None => accessory_group(item).unwrap_or(item).to_string(),
-        };
-        if !optional && slot(item).is_some() {
-            chosen.entry(group.clone()).or_insert(e.off);
-        }
-        opts.push(PartOpt { off: e.off, id: e.id.clone(), name: n.clone(), group, label: rest.to_string(), default: false });
-    }
-    if chosen.contains_key("full") {
-        chosen.remove("top");
-        chosen.remove("bottom");
-    }
-    for o in &mut opts {
-        o.default = chosen.get(&o.group) == Some(&o.off);
-    }
-    opts
-}
-
-/// Default parts of a character prefix (see `outfit_options`).
-pub fn outfit_parts<'a>(ix: &'a ArchiveIndex, prefix: &str) -> Vec<&'a Entry> {
-    let offs: Vec<u64> = outfit_options(ix, prefix).into_iter().filter(|o| o.default).map(|o| o.off).collect();
     ix.entries.iter().filter(|e| offs.contains(&e.off)).collect()
 }
 
@@ -329,11 +158,6 @@ mod tests {
         assert_eq!(pretty_name("u_m_m_farm_monster_man").unwrap(), "Farm monster man");
         assert_eq!(pretty_name("tshirtcrewneck_mr1_019_compression_cc_un_short_cull_00").unwrap(), "Tshirtcrewneck (male) 019");
         assert_eq!(pretty_name("crr_iguana_green_m_00_body_00").unwrap(), "Iguana (green, male) – body");
-        assert_eq!(outfit_prefix("cs_ali_head_fr1_afr_000_m_full").as_deref(), Some("cs_ali"));
-        assert_eq!(outfit_prefix("tshirtcrewneck_mr1_004_loose").as_deref(), None);
-        assert_eq!(outfit_prefix("player_story000_01_tshirtcrewneck_mr1_000").as_deref(), Some("player_story000_01"));
-        assert_eq!(slot("sweatshirtcrewneck"), Some("top"));
-        assert_eq!(slot("jacketfield"), Some("outer"));
         assert!(pretty_name("prop_bench_01a").is_none());
     }
 }

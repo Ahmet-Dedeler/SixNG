@@ -213,10 +213,43 @@ ames.json; exports and the app use it.
 # Schema index of every self-describing meta resource (0x7a) in an archive; --dump adds JSON
 .\target\release\sixng.exe meta data -o work\out
 
+# A character as ONE rigged GLB (one armature in Blender): its outfit parts on one shared skeleton,
+# optionally with an animation clip. --list shows the parts; --parts / --add pick others (regexes)
+.\target\release\sixng.exe outfit player_story000_00 --list
+.\target\release\sixng.exe outfit player_story000_00 -o work\out\lucia.glb --clip "gameplay@locomotion@female_character@kat@normal@standing@walk@stance_neutral/move"
+# Animation clips in anim.rpf: find dictionaries (first run ~20 s, cached), list a dictionary's clips
+.\target\release\sixng.exe clips --name "male_character@.*@walk"
+.\target\release\sixng.exe clips "gameplay@locomotion@male_character@raul@normal@standing@walk@stance_neutral"
+
 # Built-in categories: textures | map | vehicles | meta
 .\target\release\sixng.exe extract-category vehicles --name '^phoenix' -o work\out
 .\target\release\sixng.exe extract-category map --limit 200 -o work\out --dry-run
 ```
+
+**Characters** (`sixng outfit`, since 2026-11-22): the parts of a character
+(the GUI's default look: head, eyes, hair, top, outer, bottom, shoes …, or
+`--parts`) are skinned to the shared ped skeleton plus their own helper
+bones and written as **one GLB with one skin**: the joint lists are merged
+by name (a helper bone that two parts define differently is kept twice,
+the second as `<name>.<part>`) and each part's vertex joints are remapped
+to the merged list. `--clip <dictionary>/<clip>` adds the clip as a glTF
+animation: each bone track drives the joint whose joaat(lowercase name) is
+the track's bone id (rotation, translation, scale tracks; the mover / root
+motion and float tracks are left out), sampled at the animation's own
+frames on the clip's time line. Joint nodes are written as TRS so they can
+be animated. The JSON report gives per part the vertices, joints and
+weighted influences whose bone is in no skeleton, and for the clip how many
+bone tracks land on a joint. Checked on five characters (player_story000_00
+and _01, cs_raul, cs_iris, u_m_m_farm_monster_man) with female and male walk
+clips: Khronos validator 0 errors; Blender 5.2 imports one armature with
+every skinned mesh on it; rest-pose skinning matches the stored vertices
+within 3e-7 m; 95.6 % of the clips' bone tracks land on a joint; joints
+whose own translation is not animated keep their length to the parent
+within 4e-7 m over the clip; rotation keys sit a median 3.6° from the rest
+pose (22° for the conjugate). Not done: the mover (root motion), facial
+animation, hair (most hair parts are 3-vertex stubs), cloth simulation.
+One field jacket names 16 palette bones that are in no skeleton found yet
+(2,161 influences, weight moved to the other influences).
 
 Output options: `--tex png|dds|both|none` (DDS = original BCn with a mip chain; `none` writes no texture files, which is useful for geometry-only re-exports), `--raw` (also write the decompressed
 bytes), `--force` (redo items already done), `--no-embedded-textures`,
@@ -263,7 +296,8 @@ again**).
   teeth …, without accessories like harnesses or costumes), each with its
   own textures. Named characters (`cs_…`, `u_…`, `player_story…`) are
   listed as one entry that puts one item per outfit slot together (head,
-  hair, top, jacket, trousers, shoes …). Single ped pieces are hidden as
+  hair, top, jacket, trousers, shoes …; `sixng outfit` exports the same
+  set as one rigged GLB). Single ped pieces are hidden as
   variants. Names are made readable: "Iguana (green, male)",
   "Dog (rottweiler, female)", "Farm monster man".
 - The viewer's **Parts** panel lists every part an animal or character
@@ -759,7 +793,7 @@ Status key:
 | Light emitters (position, colour, range, cone, night flag) | **works** | `sixng lights`: 774,847 placed lights in world space, interiors included. Intensity, falloff (range), falloff exponent, cone, corona, volumetric and fade fields are named from the game's own field hashes. |
 | Collision split by surface type; walls identifiable | **works (split); partial (names)** | `sixng collision`: one GLB per bounds file, one primitive per surface id, in world coordinates. Surface ids are unnamed hashes; inferred categories (`sixng surfaces`) cover 98.3 % of area, each with a confidence (90.8 % high or medium), from plants and props standing on each surface, path-link density, slope and height. Interior collision: `sixng interiors` links 70.7 % of interior archetypes (`collision_linked`, ~91 % precision on the ordered links); its second pass links the rest by fitting the interior's entities onto candidate collision floors, for 97.8 % in all, 79.3 % at high or medium confidence. |
 | Dynamic props: mass, centre of gravity, collider primitives | **unknown** | Fragment physics data is not decoded yet. |
-| Animated props, rail and tram paths | **unknown** | `anim.rpf` and path data are not decoded. |
+| Animated props, rail and tram paths | **partial (clips); unknown (props, paths)** | `anim.rpf` clip dictionaries decode since 2026-11-22 (`sixng clips`): all 61,506 dictionaries with 0 errors, 316,150 clips (294,822 bind animations; the rest are in dictionaries whose animations are not decoded yet), 191,031 animations, 12.7 M tracks (`examples/clipcensus.rs`). They apply to characters with `sixng outfit --clip`. Which clips drive props, and rail / tram paths, are not decoded. |
 | Tunnel and bridge extents; billboard, TV and skyline meshes | **unknown** | |
 | Road/lane graph, traffic lights, pit and start positions | **works (lane graph, junctions, traffic lights, road surface); unknown (pit/start)** | `sixng paths`: node graph with lanes, speed limits and named node flags (tunnel, highway slip/exit, no-GPS, stop, yield …); junctions with turn paths and traffic-light phases linked to the placed signal props; `sixng navmesh --roads-only`: road polygons per 128 m tile. Link flags: 4 of 11 names recovered, 2 inferred (unpaved / track, two-way). Start positions not found. |
 

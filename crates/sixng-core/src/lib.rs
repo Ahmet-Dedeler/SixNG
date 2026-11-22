@@ -6,6 +6,7 @@ pub mod classify;
 pub mod navmesh;
 pub mod lights;
 pub mod paths;
+pub mod outfit;
 pub mod pedskel;
 pub mod bodyshape;
 pub mod headskin;
