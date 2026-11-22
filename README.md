@@ -293,8 +293,17 @@ bind pose.
 resources with small embedded `keyframeTexture`s (16 × 4 half-float RGBA
 curves) and no geometry (146 in data.rpf). The command lists each
 dictionary's name (`scr_arc_tl`), its effect and emitter rule names, and
-with `-o` the keyframe curves. Rule parameters and the sprite links are not
-decoded; the sprite sheets are not embedded.
+with `-o` the keyframe curves and the rules (`rules` in `<offset>.json`):
+each effect's events, which pair an emitter rule with a particle rule
+(`scr_arc_svr_blood_melee` fires decal, mist, main, splash, droplets and
+burst); every emitter rule's ten keyframe properties and every particle
+rule's properties grouped by behaviour, as an id hash plus keys `[time 0..1,
+value vec4]` (two-value properties hold min/max in x/y); and the index of
+each particle rule's keyframe texture (null for the 7 % that have none). All
+146 dictionaries decode (2,816 effects, 11,228 events, 8,224 particle
+rules). Property names and behaviour types are hashes with no recovered
+names, so what each property drives is not known; the sprite links are not
+decoded and the sprite sheets are not embedded.
 
 **UI fonts** (`sixng fonts`): the Scaleform font libraries in data.rpf
 (`fontlib_efigs`, Chinese, Japanese and Korean) hold their fonts as SWF

@@ -467,7 +467,10 @@ enum Cmd {
     /// effect/emitter rule names and keyframe-texture count, as JSON. With
     /// -o, also <out>/ptfx/<archive>/index.json and per dictionary
     /// <offset>.json with the keyframe curves (16 RGBA samples x 4 rows per
-    /// keyframe texture). Rule parameters and sprite links are not decoded.
+    /// keyframe texture) and the rules: each effect's events (emitter rule +
+    /// particle rule), keyframe properties (id hash, keys over time) and
+    /// each particle rule's keyframe texture. Property names, behaviour
+    /// types and sprite links are not decoded.
     Ptfx {
         #[arg(default_value = "data")]
         archive: String,
@@ -1357,7 +1360,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                             return None;
                         }
                     }
-                    let kf = po.as_ref().map(|_| json!(sixng_core::ptfx::keyframes(&r, &info)));
+                    let kf = po.as_ref().map(|_| json!({"keyframes": sixng_core::ptfx::keyframes(&r, &info), "rules": sixng_core::ptfx::rules(&r, &info)}));
                     Some((d, kf))
                 })
                 .collect();
@@ -1367,7 +1370,8 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                 std::fs::create_dir_all(&dir)?;
                 for (d, kf) in &found {
                     let off = d.id.rsplit('@').next().unwrap_or("x");
-                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&json!({"dictionary": d, "keyframes": kf}))?)?;
+                    let kf = kf.clone().unwrap_or_default();
+                    std::fs::write(dir.join(format!("{off}.json")), serde_json::to_vec_pretty(&json!({"dictionary": d, "keyframes": kf["keyframes"], "rules": kf["rules"], "rules_note": "effects[].events pair an emitter rule with a particle rule. Keyframe properties: id = hash of the property name (names not recovered), keys = [time 0..1, value vec4]; two-value properties hold min/max in x/y. Emitter props are the ten slots in stored order; particle props are grouped by behaviour (behaviour types not decoded). particles[].keyframe_texture indexes `keyframes`."}))?)?;
                 }
                 std::fs::write(dir.join("index.json"), serde_json::to_vec_pretty(&found.iter().map(|x| &x.0).collect::<Vec<_>>())?)?;
             }
