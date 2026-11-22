@@ -432,11 +432,28 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   per model id, all its placements as instances. Loads go on-screen first,
   then big and near before small and far; placements outside the view
   (widened a little) are not drawn but stay loaded for turning round.
-- **Texture streaming**: a model first loads with 64 px textures, read from
-  reduced copies (≤ 256 px) kept in `<work>/gui_cache_v4/lowtex` (written
-  on first use, capped at 4 GB), then reloads with sharper textures as the
-  camera comes closer (full size in the HD band, then 1/2, 1/4, 1/8).
-  Textures are shared between models.
+  The workers (¾ of the cores, 2–12) run below normal priority so the
+  frame keeps its CPU. A model's meshes share one vertex, one index and
+  one material buffer, so a 130-part building uploads in one step instead
+  of stalling the frame.
+- **Smooth streaming**: the visible set is worked out on all cores. While
+  the camera moves, models in range of where it will be in 2 s (up to
+  800 m ahead) are loaded but not drawn yet. A placement already drawn
+  keeps its place until it is 6 % past its limit (no flicker at the
+  edge), and a parent LOD/SLOD that its children would replace stays up
+  to 2.5 s longer while buildings in its 128 m cell are still loading, so
+  hand-offs do not open holes. A child already drawn stays out to 1.5×
+  its distance while its parent's model is still loading. Eviction runs
+  in 3 ms slices, not in one burst.
+- **Texture streaming**: a model first loads with 64 px base-colour
+  textures only (normal and data maps come with the sharper reload), read
+  from reduced copies kept in `<work>/gui_cache_v4/lowtex128` (≤ 128 px,
+  capped at 2 GB) and `lowtex` (≤ 256 px, capped at 4 GB), both written on
+  first use. It then reloads with sharper textures as the camera comes
+  closer (full size in the HD band, then 1/2, 1/4, 1/8). Textures are
+  shared between models and go to the GPU block-compressed (BC1, or BC3
+  with alpha: 4–8× less GPU memory) where the adapter supports it;
+  `SIXNG_MAP_NO_BC=1` uploads them uncompressed.
 - **Quality** (low / medium / high / ultra, saved in
   `<work>/gui_settings.json`) sets the detail, a triangle budget, a
   draw-call budget, the far-field error and the texture cap. Over either
@@ -494,6 +511,14 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   includes memory the graphics driver commits for GPU buffers and
   textures, so it grows with what is on the GPU (about 3 GB plus the
   estimated GPU memory downtown).
+- **GPU memory**: the dedicated and shared GPU memory of the process are
+  read once a second from the Windows performance counters. When the
+  driver starts moving the map into shared (system) memory (more than
+  384 MB), the streamer takes 85 % of what was in use at that point as the
+  GPU budget and sheds models above it, like the RAM caps. Freed models
+  give their GPU memory back: the renderer records no render bundles,
+  because the graphics library version in use never frees a bundle, nor
+  anything it draws.
 
 - **Lighting**: ambient light comes from a mostly desaturated sky, and the
   fog fades towards a half-desaturated sky, so surfaces keep their texture

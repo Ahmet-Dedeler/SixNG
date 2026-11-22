@@ -329,12 +329,12 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
     let mut images = Vec::new();
     let mut base = None;
     if tex_keys.lock().unwrap().contains(&key) {
-        images.push(glb::Image { key: key.clone(), mips: Vec::new(), srgb: true });
+        images.push(glb::Image { key: key.clone(), mips: Vec::new(), srgb: true, bc: None });
         base = Some(0);
     } else if let Ok(img) = image::open(&path) {
         let img = img.to_rgba8();
         let (iw, ih) = img.dimensions();
-        images.push(glb::Image { key: key.clone(), mips: glb::mip_chain(iw, ih, img.into_raw()), srgb: true });
+        images.push(glb::Image { key: key.clone(), mips: glb::mip_chain(iw, ih, img.into_raw()), srgb: true, bc: None });
         base = Some(0);
     }
     let base_factor = if base.is_some() { [1.0, 1.0, 1.0, 1.0] } else { SEA };
@@ -458,6 +458,7 @@ impl World {
             let tiles = self.tiles.clone();
             let keys = self.tex_keys.clone();
             std::thread::spawn(move || loop {
+                crate::mem::lower_thread_priority();
                 let key = {
                     let mut q = sh.queue.lock().unwrap();
                     loop {
@@ -507,7 +508,7 @@ impl World {
                 *self.tex_refs.entry(tex.clone()).or_insert(0) += 1;
                 self.tex_keys.lock().unwrap().insert(tex.clone());
             }
-            let bytes = gm.meshes.iter().map(|g| g.vb.size() + g.ib.size()).sum::<u64>();
+            let bytes = gm.meshes.iter().map(|g| g.bytes()).sum::<u64>();
             if let Some(old) = self.nodes.insert(k, Node { gm, used: self.frame, tex, bytes }) {
                 self.release_tex(&old.tex);
             }

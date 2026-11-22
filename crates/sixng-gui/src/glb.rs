@@ -78,6 +78,32 @@ pub struct Image {
     /// mip chain RGBA8, level 0 first
     pub mips: Vec<(u32, u32, Vec<u8>)>,
     pub srgb: bool,
+    /// Block-compressed copy of the chain (the 3D map); when set, `mips`
+    /// keeps only the level sizes.
+    pub bc: Option<crate::bc::Bc>,
+}
+
+impl Image {
+    /// Pixel bytes held (block-compressed if compressed).
+    pub fn bytes(&self) -> usize {
+        match &self.bc {
+            Some(b) => b.levels.iter().map(|l| l.len()).sum(),
+            None => self.mips.iter().map(|m| m.2.len()).sum(),
+        }
+    }
+
+    /// Replace the RGBA chain by BC1 / BC3 blocks when the size allows.
+    pub fn compress(&mut self) {
+        if self.bc.is_some() || self.mips.is_empty() {
+            return;
+        }
+        if let Some(b) = crate::bc::compress(&self.mips) {
+            self.bc = Some(b);
+            for m in &mut self.mips {
+                m.2 = Vec::new();
+            }
+        }
+    }
 }
 
 pub struct Model {
@@ -289,14 +315,42 @@ pub const SMALL_TEX: u32 = 256;
 /// and the cap above which no further copies are written.
 pub static LOWTEX_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub const LOWTEX_CAP: u64 = 4 << 30;
+/// Texture loader counters: reduced-copy hits, full decodes, full-decode µs, full-decode megapixels.
+/// [4]: µs in the whole image step (reads, reductions, mip chains, cache writes).
+pub static TEX_T: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
-/// Where the reduced copy of a texture lives (`<cache>/lowtex/<hash>.png`).
-fn small_path(out_root: &Path, p: &Path) -> PathBuf {
+/// Smaller reduced copies (<= TINY_TEX px) for the first, distant loads of
+/// the 3D map, in `<cache>/lowtex128`, with their own byte count and cap.
+pub const TINY_TEX: u32 = 128;
+pub static LOWTEX128_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub const LOWTEX128_CAP: u64 = 2 << 30;
+
+/// Where the reduced copy of a texture lives (`<cache>/<dir>/<hash>.png`).
+fn small_path_in(out_root: &Path, dir: &str, p: &Path) -> PathBuf {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in p.to_string_lossy().as_bytes() {
         h = (h ^ *b as u64).wrapping_mul(0x0100_0000_01b3);
     }
-    out_root.join("lowtex").join(format!("{h:016x}.png"))
+    out_root.join(dir).join(format!("{h:016x}.png"))
+}
+
+/// Halve an RGBA8 image until its longer side is at most `size`.
+fn reduce_to(mut img: (u32, u32, Vec<u8>), size: u32) -> (u32, u32, Vec<u8>) {
+    while img.0.max(img.1) > size.max(1) {
+        img = half(img.0, img.1, &img.2);
+    }
+    img
+}
+
+/// Write a reduced copy (best effort, via a temporary file) and count its bytes.
+fn write_small(sp: &Path, img: &(u32, u32, Vec<u8>), counter: &std::sync::atomic::AtomicU64) {
+    let _ = std::fs::create_dir_all(sp.parent().unwrap());
+    let tmp = sp.with_extension("tmp");
+    if image::save_buffer_with_format(&tmp, &img.2, img.0, img.1, image::ExtendedColorType::Rgba8, image::ImageFormat::Png).is_ok() {
+        let n = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        counter.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::rename(&tmp, sp);
+    }
 }
 
 fn load_png(path: &Path) -> Option<(u32, u32, Vec<u8>)> {
@@ -321,6 +375,9 @@ pub struct LoadOpts {
     /// Drop (discard) materials whose every decoded texture is a tiny (<= 8 px)
     /// placeholder; used by the 3D map (see `placeholder_only`).
     pub hide_placeholders: bool,
+    /// Base colour (and emissive) only: no normal or packed-data maps. The
+    /// 3D map's first, distant loads use this; sharper reloads get all maps.
+    pub base_only: bool,
 }
 
 pub fn load(path: &Path, out_root: &Path) -> Result<Model> {
@@ -345,40 +402,61 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             return None;
         }
         if opts.skip_keys.as_ref().is_some_and(|s| s.lock().unwrap().contains(&key)) {
-            images.push(Image { key: key.clone(), mips: Vec::new(), srgb });
+            images.push(Image { key: key.clone(), mips: Vec::new(), srgb, bc: None });
             img_by_key.insert(key, images.len() - 1);
             return Some(images.len() - 1);
         }
+        use std::sync::atomic::Ordering::Relaxed;
+        let t_img = std::time::Instant::now();
+        // reduced copies: <= 128 px (lowtex128) for small requests, <= 256 px
+        // (lowtex) otherwise; a 256 px copy also feeds the 128 px one
         let small = opts.small_cache && opts.max_tex > 0 && opts.max_tex <= SMALL_TEX;
-        let sp = small.then(|| small_path(out_root, &p));
-        let from_small = sp.as_ref().and_then(|sp| load_png(sp));
-        let was_small = from_small.is_some();
-        let (w, h, px) = match from_small {
-            Some(v) => v,
-            None => load_png(&p)?,
+        let tiny = small && opts.max_tex <= TINY_TEX;
+        let sp128 = tiny.then(|| small_path_in(out_root, "lowtex128", &p));
+        let sp256 = small.then(|| small_path_in(out_root, "lowtex", &p));
+        let mut img = None;
+        let mut tier = 0u32; // size cap of the copy read (0 = original file)
+        if let Some(v) = sp128.as_ref().and_then(|sp| load_png(sp)) {
+            img = Some(v);
+            tier = TINY_TEX;
+        } else if let Some(v) = sp256.as_ref().and_then(|sp| load_png(sp)) {
+            img = Some(v);
+            tier = SMALL_TEX;
+        }
+        let mut cur = match img {
+            Some(v) => {
+                TEX_T[0].fetch_add(1, Relaxed);
+                v
+            }
+            None => {
+                let t = std::time::Instant::now();
+                let v = load_png(&p)?;
+                TEX_T[1].fetch_add(1, Relaxed);
+                TEX_T[2].fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+                TEX_T[3].fetch_add((v.0 as u64 * v.1 as u64) >> 10, Relaxed);
+                v
+            }
         };
-        let mut mips = mip_chain(w, h, px);
-        let room = LOWTEX_BYTES.load(std::sync::atomic::Ordering::Relaxed) < LOWTEX_CAP;
-        if let (Some(sp), false, true) = (&sp, was_small, room) {
-            // keep a reduced copy for next time (best effort)
-            if let Some((mw, mh, m)) = mips.iter().find(|m| m.0.max(m.1) <= SMALL_TEX) {
-                if (*mw).max(*mh) < w.max(h) {
-                    let _ = std::fs::create_dir_all(sp.parent().unwrap());
-                    let tmp = sp.with_extension("tmp");
-                    if image::save_buffer_with_format(&tmp, m, *mw, *mh, image::ExtendedColorType::Rgba8, image::ImageFormat::Png).is_ok() {
-                        let n = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-                        LOWTEX_BYTES.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-                        let _ = std::fs::rename(&tmp, sp);
-                    }
-                }
+        let orig = cur.0.max(cur.1);
+        if tier == 0 && small && orig > SMALL_TEX {
+            cur = reduce_to(cur, SMALL_TEX);
+            if LOWTEX_BYTES.load(Relaxed) < LOWTEX_CAP {
+                write_small(sp256.as_ref().unwrap(), &cur, &LOWTEX_BYTES);
             }
         }
+        if tier != TINY_TEX && tiny && cur.0.max(cur.1) > TINY_TEX {
+            cur = reduce_to(cur, TINY_TEX);
+            if LOWTEX128_BYTES.load(Relaxed) < LOWTEX128_CAP {
+                write_small(sp128.as_ref().unwrap(), &cur, &LOWTEX128_BYTES);
+            }
+        }
+        // drop the levels above the size cap before building the chain
         if opts.max_tex > 0 {
-            while mips.len() > 1 && mips[0].0.max(mips[0].1) > opts.max_tex {
-                mips.remove(0);
-            }
+            cur = reduce_to(cur, opts.max_tex);
         }
-        images.push(Image { key: key.clone(), mips, srgb });
+        let mips = mip_chain(cur.0, cur.1, cur.2);
+        TEX_T[4].fetch_add(t_img.elapsed().as_micros() as u64, Relaxed);
+        images.push(Image { key: key.clone(), mips, srgb, bc: None });
         img_by_key.insert(key, images.len() - 1);
         Some(images.len() - 1)
     };
@@ -408,7 +486,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
         let with_png: Vec<&Value> = tex_list.iter().filter(|t| t["png"].is_string()).collect();
         let placeholder_only = !with_png.is_empty() && with_png.iter().all(|t| tiny_png(t).is_some());
         let base = uri_of(&m["pbrMetallicRoughness"]["baseColorTexture"]).and_then(|p| add_img(p, true, &mut images));
-        let normal = uri_of(&m["normalTexture"]).filter(|p| !is_tiny(p)).and_then(|p| add_img(p, false, &mut images));
+        let normal = uri_of(&m["normalTexture"]).filter(|p| !opts.base_only && !is_tiny(p)).and_then(|p| add_img(p, false, &mut images));
         let mut slots = Vec::new();
         let mut packed = None;
         let mut emissive = None;
@@ -416,7 +494,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             let role = slot_role(&t);
             let (status, mip) = slot_status(&t);
             let png = t["png"].as_str().map(|s| s.to_string());
-            if role == "packed_rma" && packed.is_none() && tiny_png(&t).is_none() {
+            if role == "packed_rma" && packed.is_none() && !opts.base_only && tiny_png(&t).is_none() {
                 if let Some(p) = &png {
                     packed = add_img(out_root.join(p), false, &mut images);
                 }

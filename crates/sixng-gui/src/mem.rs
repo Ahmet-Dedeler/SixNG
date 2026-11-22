@@ -101,6 +101,84 @@ impl Budget {
     }
 }
 
+/// This process's GPU memory as the OS reports it (bytes): dedicated video
+/// memory and shared (system) memory. Shared use that grows means the card
+/// is full and allocations spill into RAM, which is slow to draw from.
+/// Sampled about once a second on a background thread (the counters are
+/// slow to read); None until the first sample, or where unsupported.
+pub fn gpu_process() -> Option<(u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    gpu_sampler_start();
+    let (d, s) = (GPU_DED.load(Relaxed), GPU_SHARED.load(Relaxed));
+    (d != u64::MAX).then_some((d, s))
+}
+
+static GPU_DED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static GPU_SHARED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(windows)]
+fn gpu_sampler_start() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        std::thread::spawn(|| {
+            use std::sync::atomic::Ordering::Relaxed;
+            use windows_sys::Win32::System::Performance::*;
+            let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+            let pid = std::process::id();
+            unsafe {
+                let mut q: isize = 0;
+                if PdhOpenQueryW(std::ptr::null(), 0, &mut q) != 0 {
+                    return;
+                }
+                // one instance per adapter / memory segment group: sum them
+                let mut cs = [0isize; 2];
+                for (k, what) in ["Dedicated Usage", "Shared Usage"].iter().enumerate() {
+                    let path = wide(&format!("\\GPU Process Memory(pid_{pid}_*)\\{what}"));
+                    if PdhAddEnglishCounterW(q, path.as_ptr(), 0, &mut cs[k]) != 0 {
+                        return;
+                    }
+                }
+                let sum = |c: isize| -> Option<u64> {
+                    let (mut size, mut n) = (0u32, 0u32);
+                    let r = PdhGetFormattedCounterArrayW(c, PDH_FMT_LARGE, &mut size, &mut n, std::ptr::null_mut());
+                    if r != PDH_MORE_DATA || size == 0 {
+                        return None;
+                    }
+                    // the buffer also holds the instance names: allocate it as u64s for alignment
+                    let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+                    let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+                    if PdhGetFormattedCounterArrayW(c, PDH_FMT_LARGE, &mut size, &mut n, items) != 0 {
+                        return None;
+                    }
+                    Some((0..n as usize).map(|i| (*items.add(i)).FmtValue.Anonymous.largeValue.max(0) as u64).sum())
+                };
+                loop {
+                    if PdhCollectQueryData(q) == 0 {
+                        if let (Some(d), Some(s)) = (sum(cs[0]), sum(cs[1])) {
+                            GPU_SHARED.store(s, Relaxed);
+                            GPU_DED.store(d, Relaxed);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                }
+            }
+        });
+    });
+}
+
+#[cfg(not(windows))]
+fn gpu_sampler_start() {}
+
+/// Run the calling (worker) thread below normal priority, so loading never
+/// starves the UI thread.
+pub fn lower_thread_priority() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    }
+}
+
 pub fn gb(b: u64) -> f32 {
     b as f32 / (1u64 << 30) as f32
 }

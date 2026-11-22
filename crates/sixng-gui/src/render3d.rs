@@ -244,8 +244,11 @@ struct Target {
 }
 
 pub struct GpuMesh {
+    /// Vertex and index data: byte ranges of buffers shared by the model's meshes.
     pub vb: wgpu::Buffer,
     pub ib: wgpu::Buffer,
+    pub vb_range: std::ops::Range<u64>,
+    pub ib_range: std::ops::Range<u64>,
     pub n_idx: u32,
     pub eb: Option<wgpu::Buffer>,
     pub n_edge: u32,
@@ -262,7 +265,8 @@ pub struct GpuModel {
     pub mat_class: Vec<u32>,
     /// Decal layer order per material (None = not a decal).
     pub mat_decal: Vec<Option<u8>>,
-    mat_ub: Vec<wgpu::Buffer>,
+    /// All material uniforms in one buffer, MAT_STRIDE bytes apart.
+    mat_ub: wgpu::Buffer,
     mat_cpu: Vec<MatU>,
     _textures: Vec<wgpu::Texture>,
     pub joints_buf: wgpu::Buffer,
@@ -271,6 +275,22 @@ pub struct GpuModel {
     pub n_instances: u32,
     pub instance_cap: u32,
     pub bbox: [Vec3; 2],
+}
+
+/// Spacing of the material uniforms in a model's buffer (the uniform offset alignment).
+const MAT_STRIDE: u64 = 256;
+
+impl GpuMesh {
+    pub fn vslice(&self) -> wgpu::BufferSlice<'_> {
+        self.vb.slice(self.vb_range.clone())
+    }
+    pub fn islice(&self) -> wgpu::BufferSlice<'_> {
+        self.ib.slice(self.ib_range.clone())
+    }
+    /// GPU bytes of this mesh's vertices and indices.
+    pub fn bytes(&self) -> u64 {
+        (self.vb_range.end - self.vb_range.start) + (self.ib_range.end - self.ib_range.start)
+    }
 }
 
 pub fn class_id(c: &str) -> u32 {
@@ -312,13 +332,13 @@ pub struct Renderer3D {
     target: Option<Target>,
     /// Draw calls in the last frame.
     pub draws: u32,
-    /// Recorded opaque draws (key of the model set, bundle, draw count):
-    /// replayed while the drawn models and their instance counts stay the
-    /// same, so a still or moving camera costs no re-encoding.
-    bundle: Option<(u64, wgpu::RenderBundle, u32)>,
 }
 
+
 fn tex_rgba(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image) -> wgpu::Texture {
+    if let Some(bc) = &img.bc {
+        return tex_bc(device, queue, img, bc);
+    }
     let (w, h, _) = &img.mips[0];
     let t = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("model tex"),
@@ -336,6 +356,40 @@ fn tex_rgba(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image) -> wgp
             px,
             wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(4 * mw), rows_per_image: Some(*mh) },
             wgpu::Extent3d { width: *mw, height: *mh, depth_or_array_layers: 1 },
+        );
+    }
+    t
+}
+
+/// Upload a BC1 / BC3 chain (level 0 is a multiple of 4; smaller levels are
+/// written at their 4x4-block size).
+fn tex_bc(device: &wgpu::Device, queue: &wgpu::Queue, img: &glb::Image, bc: &crate::bc::Bc) -> wgpu::Texture {
+    let (w, h, _) = &img.mips[0];
+    let format = match (bc.alpha, img.srgb) {
+        (false, false) => wgpu::TextureFormat::Bc1RgbaUnorm,
+        (false, true) => wgpu::TextureFormat::Bc1RgbaUnormSrgb,
+        (true, false) => wgpu::TextureFormat::Bc3RgbaUnorm,
+        (true, true) => wgpu::TextureFormat::Bc3RgbaUnormSrgb,
+    };
+    let t = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("model tex bc"),
+        size: wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
+        mip_level_count: bc.levels.len() as u32,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let bb = crate::bc::block_bytes(bc.alpha) as u32;
+    for (l, data) in bc.levels.iter().enumerate() {
+        let (mw, mh) = ((w >> l).max(1), (h >> l).max(1));
+        let (bw, bh) = (mw.div_ceil(4), mh.div_ceil(4));
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &t, mip_level: l as u32, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            data,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bw * bb), rows_per_image: Some(bh) },
+            wgpu::Extent3d { width: bw * 4, height: bh * 4, depth_or_array_layers: 1 },
         );
     }
     t
@@ -424,7 +478,7 @@ impl Renderer3D {
             anisotropy_clamp: 8,
             ..Default::default()
         });
-        let wt = tex_rgba(device, &rs.queue, &glb::Image { key: "white".into(), mips: vec![(1, 1, vec![255; 4])], srgb: false });
+        let wt = tex_rgba(device, &rs.queue, &glb::Image { key: "white".into(), mips: vec![(1, 1, vec![255; 4])], srgb: false, bc: None });
         let white = wt.create_view(&Default::default());
         let ident = Mat4::IDENTITY.to_cols_array();
         let dummy_joints = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("joints"), contents: bytemuck::cast_slice(&ident), usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST });
@@ -438,7 +492,7 @@ impl Renderer3D {
             ],
         });
         std::mem::forget(wt); // the 1x1 white texture lives for the process
-        Renderer3D { pipe_opaque, pipe_blend, pipe_decal, pipe_decal_blend, decal_bias: true, pipe_wire, pipe_lines, pipe_lines_top, pipe_sky, bgl_frame, bgl_mat, frame_ub, sampler, white, dummy_joints, default_frame_bg, target: None, draws: 0, bundle: None }
+        Renderer3D { pipe_opaque, pipe_blend, pipe_decal, pipe_decal_blend, decal_bias: true, pipe_wire, pipe_lines, pipe_lines_top, pipe_sky, bgl_frame, bgl_mat, frame_ub, sampler, white, dummy_joints, default_frame_bg, target: None, draws: 0 }
     }
 
     /// Upload a CPU model (meshes, materials, textures, skeleton).
@@ -458,14 +512,14 @@ impl Renderer3D {
             let t = match cache.as_deref_mut() {
                 Some(c) => match c.get(&i.key) {
                     Some(t) => Some(t.clone()),
-                    None if !i.mips.is_empty() => {
+                    None if !i.mips.is_empty() && (i.bc.is_some() || !i.mips[0].2.is_empty()) => {
                         let t = tex_rgba(device, queue, i);
                         c.insert(i.key.clone(), t.clone());
                         Some(t)
                     }
                     None => None,
                 },
-                None => (!i.mips.is_empty()).then(|| tex_rgba(device, queue, i)),
+                None => (!i.mips.is_empty() && (i.bc.is_some() || !i.mips[0].2.is_empty())).then(|| tex_rgba(device, queue, i)),
             };
             views.push(t.as_ref().map(|t| t.create_view(&Default::default())));
             if let Some(t) = t {
@@ -474,13 +528,14 @@ impl Renderer3D {
         }
         let view = |i: Option<usize>| i.and_then(|i| views.get(i)).and_then(|v| v.as_ref()).unwrap_or(&self.white);
         let mut mat_bg = Vec::new();
-        let mut mat_ub = Vec::new();
         let mut mat_cpu = Vec::new();
         let mut mat_alpha = Vec::new();
         let mut mat_class = Vec::new();
         let mut mat_decal = Vec::new();
         let default = glb::Material { name: "default".into(), class: "opaque".into(), alpha_mode: "OPAQUE".into(), base_factor: [0.7, 0.7, 0.7, 1.0], base: None, normal: None, packed: None, emissive: None, slots: vec![], gap: "ok".into(), shader_hash: String::new(), decal: None };
         let mats: Vec<&glb::Material> = if m.materials.is_empty() { vec![&default] } else { m.materials.iter().collect() };
+        let mat_ub = device.create_buffer(&wgpu::BufferDescriptor { label: Some("mat ub"), size: MAT_STRIDE * mats.len() as u64, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+        let mut mat_bytes = vec![0u8; (MAT_STRIDE as usize) * mats.len()];
         for (k, mt) in mats.iter().enumerate() {
             let has = (mt.base.is_some() as u32) | ((mt.normal.is_some() as u32) << 1) | ((mt.packed.is_some() as u32) << 2) | ((mt.emissive.is_some() as u32) << 3);
             let alpha = match mt.alpha_mode.as_str() {
@@ -495,12 +550,13 @@ impl Renderer3D {
             };
             let base = overrides.get(k).copied().flatten().unwrap_or(mt.base_factor);
             let u = MatU { base, flags: [has, class_id(&mt.class), alpha, gap] };
-            let ub = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("mat ub"), contents: bytemuck::bytes_of(&u), usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST });
+            let o = k * MAT_STRIDE as usize;
+            mat_bytes[o..o + std::mem::size_of::<MatU>()].copy_from_slice(bytemuck::bytes_of(&u));
             let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("mat bg"),
                 layout: &self.bgl_mat,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: ub.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding { buffer: &mat_ub, offset: o as u64, size: wgpu::BufferSize::new(std::mem::size_of::<MatU>() as u64) }) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view(mt.base)) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(view(mt.normal)) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(view(mt.packed)) },
@@ -508,21 +564,41 @@ impl Renderer3D {
                 ],
             });
             mat_bg.push(bg);
-            mat_ub.push(ub);
             mat_cpu.push(u);
             mat_alpha.push(alpha);
             mat_class.push(class_id(&mt.class));
             mat_decal.push(mt.decal);
         }
-        let meshes = m
-            .meshes
-            .iter()
-            .map(|me| {
-                let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("vb"), contents: bytemuck::cast_slice(&me.verts), usage: wgpu::BufferUsages::VERTEX });
-                let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("ib"), contents: bytemuck::cast_slice(&me.indices), usage: wgpu::BufferUsages::INDEX });
-                GpuMesh { vb, ib, n_idx: me.indices.len() as u32, eb: None, n_edge: 0, material: me.material.unwrap_or(0).min(mats.len() - 1), skinned: me.skinned, centre: Vec3::from(me.centre), visible: true }
-            })
-            .collect();
+        queue.write_buffer(&mat_ub, 0, &mat_bytes);
+        // one vertex and one index buffer for all meshes (fewer GPU objects:
+        // creating them is what costs when a model has many parts)
+        let vsz = std::mem::size_of::<glb::Vertex>() as u64;
+        let nv: u64 = m.meshes.iter().map(|me| me.verts.len() as u64).sum();
+        let ni: u64 = m.meshes.iter().map(|me| me.indices.len() as u64).sum();
+        // sizes rounded up to 4 bytes, as mapped buffers need
+        let vb = device.create_buffer(&wgpu::BufferDescriptor { label: Some("vb"), size: (nv * vsz).max(vsz).next_multiple_of(4), usage: wgpu::BufferUsages::VERTEX, mapped_at_creation: true });
+        let ib = device.create_buffer(&wgpu::BufferDescriptor { label: Some("ib"), size: (ni * 4).max(4), usage: wgpu::BufferUsages::INDEX, mapped_at_creation: true });
+        let mut meshes = Vec::with_capacity(m.meshes.len());
+        {
+            let mut vmap = vb.slice(..).get_mapped_range_mut();
+            let mut imap = ib.slice(..).get_mapped_range_mut();
+            let (mut vo, mut io) = (0u64, 0u64);
+            for me in &m.meshes {
+                let vbytes: &[u8] = bytemuck::cast_slice(&me.verts);
+                let ibytes: &[u8] = bytemuck::cast_slice(&me.indices);
+                vmap[vo as usize..vo as usize + vbytes.len()].copy_from_slice(vbytes);
+                imap[io as usize..io as usize + ibytes.len()].copy_from_slice(ibytes);
+                let (vr, ir) = (vo..vo + vbytes.len() as u64, io..io + ibytes.len() as u64);
+                vo += vbytes.len() as u64;
+                io += ibytes.len() as u64;
+                // an empty range is not a valid slice: point it at the start
+                let vr = if vr.is_empty() { 0..vsz } else { vr };
+                let ir = if ir.is_empty() { 0..4 } else { ir };
+                meshes.push(GpuMesh { vb: vb.clone(), ib: ib.clone(), vb_range: vr, ib_range: ir, n_idx: me.indices.len() as u32, eb: None, n_edge: 0, material: me.material.unwrap_or(0).min(mats.len() - 1), skinned: me.skinned, centre: Vec3::from(me.centre), visible: true });
+            }
+        }
+        vb.unmap();
+        ib.unmap();
         let nj = m.joints.len().max(1);
         let joints_buf = device.create_buffer(&wgpu::BufferDescriptor { label: Some("joints"), size: (nj * 64) as u64, usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
         let ident: Vec<f32> = (0..nj).flat_map(|_| Mat4::IDENTITY.to_cols_array()).collect();
@@ -558,12 +634,14 @@ impl Renderer3D {
 
     pub fn set_instances(&self, rs: &egui_wgpu::RenderState, gm: &mut GpuModel, inst: &[Instance]) {
         if inst.len() as u32 > gm.instance_cap {
-            gm.instances = rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inst"), size: (inst.len() * std::mem::size_of::<Instance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
-            gm.instance_cap = inst.len() as u32;
+            let cap = inst.len();
+            gm.instances = rs.device.create_buffer(&wgpu::BufferDescriptor { label: Some("inst"), size: (cap * std::mem::size_of::<Instance>()) as u64, usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false });
+            gm.instance_cap = cap as u32;
         }
         rs.queue.write_buffer(&gm.instances, 0, bytemuck::cast_slice(inst));
         gm.n_instances = inst.len() as u32;
     }
+
 
     pub fn set_joints(&self, rs: &egui_wgpu::RenderState, gm: &GpuModel, mats: &[Mat4]) {
         let v: Vec<f32> = mats.iter().flat_map(|m| m.to_cols_array()).collect();
@@ -572,17 +650,17 @@ impl Renderer3D {
 
     /// Change a material's base factor (e.g. after a paint override).
     pub fn set_material_base(&self, rs: &egui_wgpu::RenderState, gm: &mut GpuModel, k: usize, base: [f32; 4]) {
-        if let (Some(u), Some(b)) = (gm.mat_cpu.get_mut(k), gm.mat_ub.get(k)) {
+        if let Some(u) = gm.mat_cpu.get_mut(k) {
             u.base = base;
-            rs.queue.write_buffer(b, 0, bytemuck::bytes_of(u));
+            rs.queue.write_buffer(&gm.mat_ub, k as u64 * MAT_STRIDE, bytemuck::bytes_of(u));
         }
     }
 
     /// Use the secondary paint colour on a car-paint material.
     pub fn set_material_secondary(&self, rs: &egui_wgpu::RenderState, gm: &mut GpuModel, k: usize, on: bool) {
-        if let (Some(u), Some(b)) = (gm.mat_cpu.get_mut(k), gm.mat_ub.get(k)) {
+        if let Some(u) = gm.mat_cpu.get_mut(k) {
             u.flags[0] = if on { u.flags[0] | 16 } else { u.flags[0] & !16 };
-            rs.queue.write_buffer(b, 0, bytemuck::bytes_of(u));
+            rs.queue.write_buffer(&gm.mat_ub, k as u64 * MAT_STRIDE, bytemuck::bytes_of(u));
         }
     }
 
@@ -644,6 +722,57 @@ impl Renderer3D {
 
     /// Render models (each with its own instances) and lines into the
     /// offscreen target; returns the egui texture to show.
+    /// Opaque and cutout draws of `models` into a render pass or bundle.
+    fn record_opaque<'a, E: wgpu::util::RenderEncoder<'a>>(pipe: &'a wgpu::RenderPipeline, default_frame_bg: &'a wgpu::BindGroup, decal_bias: bool, be: &mut E, models: &[&'a GpuModel], mode: u32) -> u32 {
+        let mut n = 0u32;
+        be.set_pipeline(pipe);
+        // static models share the default frame bind group (their joints
+        // buffer is never read), so it is bound once
+        let mut shared_bound = false;
+        for gm in models {
+            if gm.n_instances == 0 {
+                continue;
+            }
+            if gm.meshes.iter().any(|m| m.skinned) {
+                be.set_bind_group(0, Some(&gm.frame_bg), &[]);
+                shared_bound = false;
+            } else if !shared_bound {
+                be.set_bind_group(0, Some(default_frame_bg), &[]);
+                shared_bound = true;
+            }
+            be.set_vertex_buffer(1, gm.instances.slice(..));
+            // a model's meshes share one vertex and one index buffer: bind
+            // them once and address each mesh by first index / base vertex,
+            // and bind a material only when it changes (fewer commands to
+            // validate: that is most of the CPU cost of a frame)
+            let mut bound: Option<&wgpu::Buffer> = None;
+            let mut mat = usize::MAX;
+            for me in gm.meshes.iter().filter(|m| m.visible && m.n_idx > 0) {
+                let blend = gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8);
+                if blend && mode == 0 {
+                    continue;
+                }
+                if decal_bias && gm.mat_decal[me.material].is_some() {
+                    continue;
+                }
+                if mat != me.material {
+                    be.set_bind_group(1, Some(&gm.mat_bg[me.material]), &[]);
+                    mat = me.material;
+                }
+                if bound != Some(&me.vb) {
+                    be.set_vertex_buffer(0, me.vb.slice(..));
+                    be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    bound = Some(&me.vb);
+                }
+                let first = (me.ib_range.start / 4) as u32;
+                let base = (me.vb_range.start / std::mem::size_of::<glb::Vertex>() as u64) as i32;
+                be.draw_indexed(first..first + me.n_idx, base, 0..gm.n_instances);
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, look: &Look, models: &[&GpuModel], lines: &[LineV], lines_on_top: &[LineV]) -> egui::TextureId {
         let size = [size[0].max(16), size[1].max(16)];
         self.ensure_target(rs, size);
@@ -654,61 +783,6 @@ impl Renderer3D {
         queue.write_buffer(&self.frame_ub, 0, bytemuck::bytes_of(&fu));
         let lb = (!lines.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("lines"), contents: bytemuck::cast_slice(lines), usage: wgpu::BufferUsages::VERTEX }));
         let lt = (!lines_on_top.is_empty()).then(|| device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("lines top"), contents: bytemuck::cast_slice(lines_on_top), usage: wgpu::BufferUsages::VERTEX }));
-        // opaque draws: record once per model set, replay every frame
-        let key = {
-            use std::hash::{Hash, Hasher};
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            (look.mode, self.decal_bias).hash(&mut h);
-            for gm in models {
-                (*gm as *const GpuModel as usize, gm.n_instances, gm.instance_cap, gm.instances.size(), gm.meshes.len()).hash(&mut h);
-                for me in &gm.meshes {
-                    me.visible.hash(&mut h);
-                }
-            }
-            h.finish()
-        };
-        if self.bundle.as_ref().map(|b| b.0) != Some(key) {
-            let mut be = device.create_render_bundle_encoder(&wgpu::RenderBundleEncoderDescriptor {
-                label: Some("opaque bundle"),
-                color_formats: &[Some(COLOR_FMT)],
-                depth_stencil: Some(wgpu::RenderBundleDepthStencil { format: DEPTH_FMT, depth_read_only: false, stencil_read_only: true }),
-                sample_count: MSAA,
-                multiview: None,
-            });
-            let mut n = 0u32;
-            be.set_pipeline(&self.pipe_opaque);
-            // static models share the default frame bind group (their joints
-            // buffer is never read), so it is bound once
-            let mut shared_bound = false;
-            for gm in models {
-                if gm.n_instances == 0 {
-                    continue;
-                }
-                if gm.meshes.iter().any(|m| m.skinned) {
-                    be.set_bind_group(0, &gm.frame_bg, &[]);
-                    shared_bound = false;
-                } else if !shared_bound {
-                    be.set_bind_group(0, &self.default_frame_bg, &[]);
-                    shared_bound = true;
-                }
-                be.set_vertex_buffer(1, gm.instances.slice(..));
-                for me in gm.meshes.iter().filter(|m| m.visible) {
-                    let blend = gm.mat_alpha[me.material] == 2 || matches!(gm.mat_class[me.material], 5 | 6 | 8);
-                    if blend && look.mode == 0 {
-                        continue;
-                    }
-                    if self.decal_bias && gm.mat_decal[me.material].is_some() {
-                        continue;
-                    }
-                    be.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    be.set_vertex_buffer(0, me.vb.slice(..));
-                    be.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
-                    be.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
-                    n += 1;
-                }
-            }
-            self.bundle = Some((key, be.finish(&wgpu::RenderBundleDescriptor { label: Some("opaque bundle") }), n));
-        }
         let t = self.target.as_ref().unwrap();
         let mut draws = 0u32;
         let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("viewer") });
@@ -731,10 +805,9 @@ impl Renderer3D {
                 pass.draw(0..3, 0..1);
             }
             // opaque + mask
-            if let Some((_, b, n)) = &self.bundle {
-                pass.execute_bundles(std::iter::once(b));
-                draws += n;
-            }
+            // no render bundles: wgpu 24 never frees a bundle, and with it
+            // everything it draws (evicted models stayed in GPU memory)
+            draws += Self::record_opaque(&self.pipe_opaque, &self.default_frame_bg, self.decal_bias, &mut pass, models, look.mode);
             // decals: after all opaque surfaces, by layer order; opaque-mode
             // decals (terrain blend layers) write depth, blended ones do not
             if self.decal_bias {
@@ -760,8 +833,8 @@ impl Renderer3D {
                     pass.set_bind_group(0, &gm.frame_bg, &[]);
                     pass.set_vertex_buffer(1, gm.instances.slice(..));
                     pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vb.slice(..));
-                    pass.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_vertex_buffer(0, me.vslice());
+                    pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
                     draws += 1;
                 }
@@ -786,8 +859,8 @@ impl Renderer3D {
                     pass.set_bind_group(0, &gm.frame_bg, &[]);
                     pass.set_vertex_buffer(1, gm.instances.slice(..));
                     pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                    pass.set_vertex_buffer(0, me.vb.slice(..));
-                    pass.set_index_buffer(me.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    pass.set_vertex_buffer(0, me.vslice());
+                    pass.set_index_buffer(me.islice(), wgpu::IndexFormat::Uint32);
                     pass.draw_indexed(0..me.n_idx, 0, 0..gm.n_instances);
                     draws += 1;
                 }
@@ -800,7 +873,7 @@ impl Renderer3D {
                     for me in gm.meshes.iter().filter(|m| m.visible) {
                         if let Some(eb) = &me.eb {
                             pass.set_bind_group(1, &gm.mat_bg[me.material], &[]);
-                            pass.set_vertex_buffer(0, me.vb.slice(..));
+                            pass.set_vertex_buffer(0, me.vslice());
                             pass.set_index_buffer(eb.slice(..), wgpu::IndexFormat::Uint32);
                             pass.draw_indexed(0..me.n_edge, 0, 0..gm.n_instances);
                         }

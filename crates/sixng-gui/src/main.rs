@@ -14,6 +14,7 @@ mod glb;
 mod assemble;
 mod map2d;
 mod map3d;
+mod bc;
 mod world3d;
 mod mem;
 
@@ -166,9 +167,29 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default().with_inner_size(size).with_title("SixNG Extractor").with_icon(app_icon()),
         renderer: eframe::Renderer::Wgpu,
         vsync: !cli.has("no-vsync"),
+        wgpu_options: wgpu_options(),
         ..Default::default()
     };
     eframe::run_native("SixNG Extractor", opts, Box::new(move |_cc| Ok(Box::new(App::new(cli)))))
+}
+
+/// Default wgpu setup plus BC texture compression where the adapter has it
+/// (the 3D map stores its textures block-compressed).
+fn wgpu_options() -> eframe::egui_wgpu::WgpuConfiguration {
+    use eframe::egui_wgpu::{wgpu, WgpuConfiguration, WgpuSetup};
+    let mut o = WgpuConfiguration::default();
+    if let WgpuSetup::CreateNew(c) = &mut o.wgpu_setup {
+        let base = c.device_descriptor.clone();
+        c.device_descriptor = std::sync::Arc::new(move |adapter| {
+            let mut d = base(adapter);
+            d.required_features |= adapter.features() & wgpu::Features::TEXTURE_COMPRESSION_BC;
+            // smaller device-memory blocks: the 3D map frees and allocates
+            // many buffers and textures of mixed sizes while it streams
+            d.memory_hints = wgpu::MemoryHints::MemoryUsage;
+            d
+        });
+    }
+    o
 }
 
 /// Window / taskbar icon (the exe icon itself is embedded by build.rs).
@@ -1151,10 +1172,12 @@ impl App {
                 m3.show_stats = false;
             }
             if let Some(v) = c.get("fly") {
-                // "x,y,height,seconds"
-                let v: Vec<f32> = v.split(',').filter_map(|x| x.parse().ok()).collect();
-                if v.len() == 4 {
-                    m3.auto.fly = Some(([v[0], v[1], v[2]], v[3]));
+                // "x,y,height,seconds[;x,y,height,seconds...]"
+                for leg in v.split(';') {
+                    let v: Vec<f32> = leg.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                    if v.len() == 4 {
+                        m3.auto.fly.push(([v[0], v[1], v[2]], v[3]));
+                    }
                 }
             }
             if let Some(p) = c.get("screenshot") {
