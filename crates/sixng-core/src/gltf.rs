@@ -53,6 +53,84 @@ pub struct Joint {
     pub pose: Option<[f32; 16]>,
 }
 
+/// Joint property an animation channel drives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimPath {
+    Translation,
+    Rotation,
+    Scale,
+}
+
+/// Keyframes of one joint property, in RAGE space (Z-up) and relative to
+/// the parent joint: translation / scale (x, y, z, unused), rotation
+/// quaternion (x, y, z, w). Times in seconds, ascending.
+pub struct AnimChannel {
+    pub joint: usize,
+    pub path: AnimPath,
+    pub times: Vec<f32>,
+    pub values: Vec<[f32; 4]>,
+}
+
+/// A glTF animation over the skeleton joints.
+pub struct Animation {
+    pub name: String,
+    pub channels: Vec<AnimChannel>,
+}
+
+/// Extra choices for `mesh_glb_with`.
+#[derive(Default)]
+pub struct GlbOptions<'a> {
+    /// Animations of the skeleton joints. Joint nodes are written as TRS
+    /// when there are any (glTF animates TRS nodes only).
+    pub animations: &'a [Animation],
+    /// Write joint nodes as translation / rotation / scale instead of a matrix.
+    pub trs_joints: bool,
+    /// Put skinned mesh nodes at the scene root (glTF ignores their parent
+    /// transforms anyway) instead of under one node per group.
+    pub skinned_meshes_at_root: bool,
+}
+
+/// Split an affine column-major 4x4 into translation, rotation quaternion
+/// (x, y, z, w) and scale. Assumes no shear.
+pub fn decompose(m: &[f32; 16]) -> ([f32; 3], [f32; 4], [f32; 3]) {
+    let col = |c: usize| [m[c * 4] as f64, m[c * 4 + 1] as f64, m[c * 4 + 2] as f64];
+    let len = |v: [f64; 3]| (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    let (c0, c1, c2) = (col(0), col(1), col(2));
+    let mut sc = [len(c0), len(c1), len(c2)];
+    let det = c0[0] * (c1[1] * c2[2] - c2[1] * c1[2]) - c1[0] * (c0[1] * c2[2] - c2[1] * c0[2]) + c2[0] * (c0[1] * c1[2] - c1[1] * c0[2]);
+    if det < 0.0 {
+        sc[0] = -sc[0];
+    }
+    let r = |row: usize, c: usize| [c0, c1, c2][c][row] / if sc[c].abs() < 1e-12 { 1.0 } else { sc[c] };
+    let tr = r(0, 0) + r(1, 1) + r(2, 2);
+    let q = if tr > 0.0 {
+        let s = (tr + 1.0).sqrt() * 2.0;
+        [(r(2, 1) - r(1, 2)) / s, (r(0, 2) - r(2, 0)) / s, (r(1, 0) - r(0, 1)) / s, 0.25 * s]
+    } else if r(0, 0) > r(1, 1) && r(0, 0) > r(2, 2) {
+        let s = (1.0 + r(0, 0) - r(1, 1) - r(2, 2)).sqrt() * 2.0;
+        [0.25 * s, (r(0, 1) + r(1, 0)) / s, (r(0, 2) + r(2, 0)) / s, (r(2, 1) - r(1, 2)) / s]
+    } else if r(1, 1) > r(2, 2) {
+        let s = (1.0 + r(1, 1) - r(0, 0) - r(2, 2)).sqrt() * 2.0;
+        [(r(0, 1) + r(1, 0)) / s, 0.25 * s, (r(1, 2) + r(2, 1)) / s, (r(0, 2) - r(2, 0)) / s]
+    } else {
+        let s = (1.0 + r(2, 2) - r(0, 0) - r(1, 1)).sqrt() * 2.0;
+        [(r(0, 2) + r(2, 0)) / s, (r(1, 2) + r(2, 1)) / s, 0.25 * s, (r(1, 0) - r(0, 1)) / s]
+    };
+    let n = (q.iter().map(|x| x * x).sum::<f64>()).sqrt().max(1e-12);
+    let q = [q[0] / n, q[1] / n, q[2] / n, q[3] / n];
+    ([m[12], m[13], m[14]], q.map(|x| x as f32), sc.map(|x| x as f32))
+}
+
+/// A RAGE (Z-up) channel value in glTF (Y-up) space.
+fn yup_value(path: AnimPath, v: [f32; 4]) -> [f32; 4] {
+    match path {
+        AnimPath::Translation => [v[0], v[2], -v[1], 0.0],
+        // C is a proper rotation, so the quaternion's vector part turns with it
+        AnimPath::Rotation => [v[0], v[2], -v[1], v[3]],
+        AnimPath::Scale => [v[0], v[2], v[1], 0.0],
+    }
+}
+
 /// RAGE (Z-up) -> glTF (Y-up) for a column-major 4x4: C * M * C^T with
 /// C = (x, y, z) -> (x, z, -y).
 fn yup_mat(m: &[f32; 16]) -> [f32; 16] {
@@ -75,7 +153,8 @@ fn yup_mat(m: &[f32; 16]) -> [f32; 16] {
     o
 }
 
-fn mat_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
+/// Product of two column-major 4x4 matrices (a · b).
+pub fn mat_mul(a: &[f32; 16], b: &[f32; 16]) -> [f32; 16] {
     let mut o = [0f32; 16];
     for r in 0..4 {
         for c in 0..4 {
@@ -203,7 +282,13 @@ pub(crate) fn pack(doc: &Value, mut bin: Vec<u8>) -> Vec<u8> {
 /// Build a triangle-mesh GLB: a root node, one child node per group, and
 /// one node + mesh per primitive under it. Materials are double-sided.
 pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skeleton: &[Joint], extras: Value) -> Vec<u8> {
+    mesh_glb_with(name, groups, materials, skeleton, extras, &GlbOptions::default())
+}
+
+/// `mesh_glb` with animations and node layout options.
+pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], skeleton: &[Joint], extras: Value, opt: &GlbOptions) -> Vec<u8> {
     let mut b = Builder::default();
+    let trs = opt.trs_joints || !opt.animations.is_empty();
     let mut nodes: Vec<Value> = Vec::new();
     // Joint nodes first (indices 0..n), local matrices from model binds.
     let binds: Vec<[f32; 16]> = skeleton.iter().map(|j| yup_mat(&j.bind)).collect();
@@ -214,7 +299,15 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
             None => poses[i],
         };
         let children: Vec<usize> = skeleton.iter().enumerate().filter(|(_, c)| c.parent == Some(i)).map(|(k, _)| k).collect();
-        let mut nd = json!({"name": j.name, "matrix": local});
+        let mut nd = json!({"name": j.name});
+        if trs {
+            let (t, r, sc) = decompose(&local);
+            nd["translation"] = json!(t);
+            nd["rotation"] = json!(r);
+            nd["scale"] = json!(sc);
+        } else {
+            nd["matrix"] = json!(local);
+        }
         if !children.is_empty() {
             nd["children"] = json!(children);
         }
@@ -227,10 +320,17 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
         let ibm: Vec<u8> = binds.iter().flat_map(|m| crate::drawable::affine_inverse(m)).flat_map(|f| f.to_le_bytes()).collect();
         let bv = b.view(&ibm, None);
         b.accessors.push(json!({"bufferView": bv, "componentType": 5126, "count": skeleton.len(), "type": "MAT4"}));
-        Some(json!({"name": "skeleton", "joints": (0..skeleton.len()).collect::<Vec<_>>(), "inverseBindMatrices": b.accessors.len() - 1, "skeleton": joint_roots.first().copied().unwrap_or(0)}))
+        let mut sk = json!({"name": "skeleton", "joints": (0..skeleton.len()).collect::<Vec<_>>(), "inverseBindMatrices": b.accessors.len() - 1});
+        // `skeleton` must be a common root of all joints; with several joint
+        // roots there is none among the joints, so it is left out.
+        if joint_roots.len() == 1 {
+            sk["skeleton"] = json!(joint_roots[0]);
+        }
+        Some(sk)
     };
     let mut meshes = Vec::new();
     let mut group_nodes = Vec::new();
+    let mut scene_meshes = Vec::new();
     let mut images = Vec::new();
     let mut textures = Vec::new();
     let mats: Vec<Value> = materials
@@ -321,6 +421,12 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
                         let top = (0..4 * sets).max_by_key(|&k| ww[k]).unwrap_or(0);
                         ww[top] = (ww[top] as u32 + 255u32.saturating_sub(sum)).min(255) as u8;
                     }
+                    // unused slots point at joint 0 (glTF: zero weight, joint 0)
+                    for k in 0..4 * sets {
+                        if ww[k] == 0 {
+                            jj[k] = 0;
+                        }
+                    }
                     for s in 0..sets {
                         for k in 4 * s..4 * s + 4 {
                             if wide { jb[s].extend_from_slice(&jj[k].to_le_bytes()) } else { jb[s].push(jj[k] as u8) }
@@ -347,19 +453,65 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
                 nd["skin"] = json!(0);
             }
             nodes.push(nd);
-            children.push(nodes.len() - 1);
+            if skinned && opt.skinned_meshes_at_root {
+                scene_meshes.push(nodes.len() - 1);
+            } else {
+                children.push(nodes.len() - 1);
+            }
         }
-        nodes.push(json!({"name": g.name, "children": children}));
-        group_nodes.push(nodes.len() - 1);
+        if !children.is_empty() || !opt.skinned_meshes_at_root {
+            nodes.push(json!({"name": g.name, "children": children}));
+            group_nodes.push(nodes.len() - 1);
+        }
     }
     let mut root_children = joint_roots.clone();
     root_children.extend(group_nodes);
     nodes.push(json!({"name": name, "children": root_children}));
     let root = nodes.len() - 1;
+    let mut scene_nodes = vec![root];
+    scene_nodes.extend(scene_meshes);
+    // Animations: one sampler per channel, time accessors shared.
+    let mut anims = Vec::new();
+    let mut time_acc: std::collections::HashMap<Vec<u32>, usize> = Default::default();
+    for an in opt.animations {
+        let mut samplers = Vec::new();
+        let mut channels = Vec::new();
+        for ch in an.channels.iter().filter(|c| c.joint < skeleton.len() && !c.times.is_empty() && c.times.len() == c.values.len()) {
+            let key: Vec<u32> = ch.times.iter().map(|t| t.to_bits()).collect();
+            let input = *time_acc.entry(key).or_insert_with(|| {
+                let bytes: Vec<u8> = ch.times.iter().flat_map(|t| t.to_le_bytes()).collect();
+                let bv = b.view(&bytes, None);
+                let (mn, mx) = (ch.times[0], *ch.times.last().unwrap());
+                b.accessors.push(json!({"bufferView": bv, "componentType": 5126, "count": ch.times.len(), "type": "SCALAR", "min": [mn], "max": [mx]}));
+                b.accessors.len() - 1
+            });
+            let n = if ch.path == AnimPath::Rotation { 4 } else { 3 };
+            let bytes: Vec<u8> = ch.values.iter().flat_map(|v| {
+                let mut y = yup_value(ch.path, *v);
+                if ch.path == AnimPath::Rotation {
+                    let l = (y.iter().map(|x| x * x).sum::<f32>()).sqrt().max(1e-12);
+                    y = y.map(|x| x / l);
+                }
+                y[..n].iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>()
+            }).collect();
+            let bv = b.view(&bytes, None);
+            b.accessors.push(json!({"bufferView": bv, "componentType": 5126, "count": ch.values.len(), "type": if n == 4 { "VEC4" } else { "VEC3" }}));
+            samplers.push(json!({"input": input, "output": b.accessors.len() - 1, "interpolation": "LINEAR"}));
+            let path = match ch.path {
+                AnimPath::Translation => "translation",
+                AnimPath::Rotation => "rotation",
+                AnimPath::Scale => "scale",
+            };
+            channels.push(json!({"sampler": samplers.len() - 1, "target": {"node": ch.joint, "path": path}}));
+        }
+        if !channels.is_empty() {
+            anims.push(json!({"name": an.name, "samplers": samplers, "channels": channels}));
+        }
+    }
     let mut doc = json!({
         "asset": {"version": "2.0", "generator": "sixng-extractor"},
         "scene": 0,
-        "scenes": [{"name": name, "nodes": [root], "extras": extras}],
+        "scenes": [{"name": name, "nodes": scene_nodes, "extras": extras}],
         "nodes": nodes,
         "meshes": meshes,
         "materials": mats,
@@ -369,6 +521,9 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
     });
     if let Some(sk) = skin {
         doc["skins"] = json!([sk]);
+    }
+    if !anims.is_empty() {
+        doc["animations"] = json!(anims);
     }
     if !images.is_empty() {
         doc["images"] = json!(images);

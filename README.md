@@ -213,10 +213,43 @@ ames.json; exports and the app use it.
 # Schema index of every self-describing meta resource (0x7a) in an archive; --dump adds JSON
 .\target\release\sixng.exe meta data -o work\out
 
+# A character as ONE rigged GLB (one armature in Blender): its outfit parts on one shared skeleton,
+# optionally with an animation clip. --list shows the parts; --parts / --add pick others (regexes)
+.\target\release\sixng.exe outfit player_story000_00 --list
+.\target\release\sixng.exe outfit player_story000_00 -o work\out\lucia.glb --clip "gameplay@locomotion@female_character@kat@normal@standing@walk@stance_neutral/move"
+# Animation clips in anim.rpf: find dictionaries (first run ~20 s, cached), list a dictionary's clips
+.\target\release\sixng.exe clips --name "male_character@.*@walk"
+.\target\release\sixng.exe clips "gameplay@locomotion@male_character@raul@normal@standing@walk@stance_neutral"
+
 # Built-in categories: textures | map | vehicles | meta
 .\target\release\sixng.exe extract-category vehicles --name '^phoenix' -o work\out
 .\target\release\sixng.exe extract-category map --limit 200 -o work\out --dry-run
 ```
+
+**Characters** (`sixng outfit`, since 2026-11-22): the parts of a character
+(the GUI's default look: head, eyes, hair, top, outer, bottom, shoes …, or
+`--parts`) are skinned to the shared ped skeleton plus their own helper
+bones and written as **one GLB with one skin**: the joint lists are merged
+by name (a helper bone that two parts define differently is kept twice,
+the second as `<name>.<part>`) and each part's vertex joints are remapped
+to the merged list. `--clip <dictionary>/<clip>` adds the clip as a glTF
+animation: each bone track drives the joint whose joaat(lowercase name) is
+the track's bone id (rotation, translation, scale tracks; the mover / root
+motion and float tracks are left out), sampled at the animation's own
+frames on the clip's time line. Joint nodes are written as TRS so they can
+be animated. The JSON report gives per part the vertices, joints and
+weighted influences whose bone is in no skeleton, and for the clip how many
+bone tracks land on a joint. Checked on five characters (player_story000_00
+and _01, cs_raul, cs_iris, u_m_m_farm_monster_man) with female and male walk
+clips: Khronos validator 0 errors; Blender 5.2 imports one armature with
+every skinned mesh on it; rest-pose skinning matches the stored vertices
+within 3e-7 m; 95.6 % of the clips' bone tracks land on a joint; joints
+whose own translation is not animated keep their length to the parent
+within 4e-7 m over the clip; rotation keys sit a median 3.6° from the rest
+pose (22° for the conjugate). Not done: the mover (root motion), facial
+animation, hair (most hair parts are 3-vertex stubs), cloth simulation.
+One field jacket names 16 palette bones that are in no skeleton found yet
+(2,161 influences, weight moved to the other influences).
 
 Output options: `--tex png|dds|both|none` (DDS = original BCn with a mip chain; `none` writes no texture files, which is useful for geometry-only re-exports), `--raw` (also write the decompressed
 bytes), `--force` (redo items already done), `--no-embedded-textures`,
@@ -263,7 +296,8 @@ again**).
   teeth …, without accessories like harnesses or costumes), each with its
   own textures. Named characters (`cs_…`, `u_…`, `player_story…`) are
   listed as one entry that puts one item per outfit slot together (head,
-  hair, top, jacket, trousers, shoes …). Single ped pieces are hidden as
+  hair, top, jacket, trousers, shoes …; `sixng outfit` exports the same
+  set as one rigged GLB). Single ped pieces are hidden as
   variants. Names are made readable: "Iguana (green, male)",
   "Dog (rottweiler, female)", "Farm monster man".
 - The viewer's **Parts** panel lists every part an animal or character
@@ -759,7 +793,7 @@ Status key:
 | Light emitters (position, colour, range, cone, night flag) | **works** | `sixng lights`: 774,847 placed lights in world space, interiors included. Intensity, falloff (range), falloff exponent, cone, corona, volumetric and fade fields are named from the game's own field hashes. |
 | Collision split by surface type; walls identifiable | **works (split); partial (names)** | `sixng collision`: one GLB per bounds file, one primitive per surface id, in world coordinates. Surface ids are unnamed hashes; inferred categories (`sixng surfaces`) cover 98.3 % of area, each with a confidence (90.8 % high or medium), from plants and props standing on each surface, path-link density, slope and height. Interior collision: `sixng interiors` links 70.7 % of interior archetypes (`collision_linked`, ~91 % precision on the ordered links); its second pass links the rest by fitting the interior's entities onto candidate collision floors, for 97.8 % in all, 79.3 % at high or medium confidence. |
 | Dynamic props: mass, centre of gravity, collider primitives | **unknown** | Fragment physics data is not decoded yet. |
-| Animated props, rail and tram paths | **unknown** | `anim.rpf` and path data are not decoded. |
+| Animated props, rail and tram paths | **partial (clips); unknown (props, paths)** | `anim.rpf` clip dictionaries decode since 2026-11-22 (`sixng clips`): all 61,506 dictionaries with 0 errors, 316,150 clips (294,822 bind animations; the rest are in dictionaries whose animations are not decoded yet), 191,031 animations, 12.7 M tracks (`examples/clipcensus.rs`). They apply to characters with `sixng outfit --clip`. Which clips drive props, and rail / tram paths, are not decoded. |
 | Tunnel and bridge extents; billboard, TV and skyline meshes | **unknown** | |
 | Road/lane graph, traffic lights, pit and start positions | **works (lane graph, junctions, traffic lights, road surface); unknown (pit/start)** | `sixng paths`: node graph with lanes, speed limits and named node flags (tunnel, highway slip/exit, no-GPS, stop, yield …); junctions with turn paths and traffic-light phases linked to the placed signal props; `sixng navmesh --roads-only`: road polygons per 128 m tile. Link flags: 4 of 11 names recovered, 2 inferred (unpaved / track, two-way). Start positions not found. |
 
@@ -769,7 +803,7 @@ Status key:
 |----------|--------|-------|
 | Node hierarchy with pivots | **now** | Skeleton joints with model-space pivots, in `model.json` and as glTF joints. |
 | Bonnet and boot as their own parent nodes | **partial** | `bonnet` and `boot` are joints with correct hinge pivots, and their vertices are skinned to them (slot 8). They are not split into separate mesh nodes: a converter can split by joint (most parts use one bone per vertex). Separate `_dmg_mod_bonnet_*` / `_boot_*` fragments also exist. |
-| Skinning (bones and weights) | **now** | glTF skin: one joint per vertex for car bodies (slot 8, format 0x00), and up to 4 joints and weights for wheels and tyres (slot 8 format 0x25 + slot 6). Since 2026-11-21 ped clothing gets **8 influences** (JOINTS_1 / WEIGHTS_1 from slots 9 and 7; before, the second four were dropped) and is **bound to the right bones**: its joint indices go through each model's bone palette (sorted bone-name hashes) to the shared ped skeleton (596 bones, read from `ambient_femalebody` / `ambient_malebody` in `packs.rpf`, so `packs` must be indexed) plus the file's own `GM_U01_*` helper bones. Earlier ped clothing exports used the file's own bone order and are wrongly skinned; re-export them. The `GM_U01_*` joints sit at parent-relative positions (their parent bone is not known), which does not change the rest pose. Some T-shirts name 8–9 palette bones that are in neither skeleton (warning with their hashes); their weight goes to the other influences. **Body shape** (since 2026-11-21): `extract --body-shape "gcweightbelly=0.5,gcmusclechest=1"` (or the Body shape field in the GUI) poses the shared ped skeleton with the game's own body-shape rig (`LOD0_Body_Shapes_Female` / `_Male` from the rig dictionary in `anim.rpf`, so `anim` must be indexed with this version too). Controls: `gcweight<region>` -1 (thin) to 1 (heavy) and `gcmuscle<region>` 0 to 1 for back, belly, butt, calf, chest, forearm, hip, muffin, neck, shoulder, thigh, upperarm, plus `gcbutt` and `gcbreasts`; `allweight=v` / `allmuscle=v` set a whole group. The shape is in the joint node transforms (the inverse bind matrices stay neutral), so Blender and other glTF viewers show it; the GUI model viewer draws the bind pose and does not. Checked on a female sports top (thin, heavy and belly look right, left/right symmetric). On male T-shirts with palette bones in neither skeleton the belly can come out as a spike. Heads use a different skin format (slots 8 / 9 format 0x8c) and are not skinned yet. The bind pose is model space. |
+| Skinning (bones and weights) | **now** | glTF skin: one joint per vertex for car bodies (slot 8, format 0x00), and up to 4 joints and weights for wheels and tyres (slot 8 format 0x25 + slot 6). Since 2026-11-21 ped clothing gets **8 influences** (JOINTS_1 / WEIGHTS_1 from slots 9 and 7; before, the second four were dropped) and is **bound to the right bones**: its joint indices go through each model's bone palette (sorted bone-name hashes) to the shared ped skeleton (596 bones, read from `ambient_femalebody` / `ambient_malebody` in `packs.rpf`, so `packs` must be indexed) plus the file's own `GM_U01_*` helper bones. Earlier ped clothing exports used the file's own bone order and are wrongly skinned; re-export them. Since 2026-11-22 the `GM_U01_*` helper joints hang under the shared bone their bone record names (u32 joaat at record +0x2C, e.g. `SKEL_Spine3`, `RB_L_Thigh01`, `SKEL_L_Clavicle`), with their parent-relative bind moved to model space, so they follow the body when it is posed or animated (sports top: helper joints 0.36 m → 0.07 m median from the vertices they drive), and the GLB skin passes the Khronos validator (before: `SKIN_SKELETON_INVALID`, joints with zero weight not 0). Some T-shirts name 8–9 palette bones that are in neither skeleton (warning with their hashes); their weight goes to the other influences. **Body shape** (since 2026-11-21): `extract --body-shape "gcweightbelly=0.5,gcmusclechest=1"` (or the Body shape field in the GUI) poses the shared ped skeleton with the game's own body-shape rig (`LOD0_Body_Shapes_Female` / `_Male` from the rig dictionary in `anim.rpf`, so `anim` must be indexed with this version too). Controls: `gcweight<region>` -1 (thin) to 1 (heavy) and `gcmuscle<region>` 0 to 1 for back, belly, butt, calf, chest, forearm, hip, muffin, neck, shoulder, thigh, upperarm, plus `gcbutt` and `gcbreasts`; `allweight=v` / `allmuscle=v` set a whole group. The shape is in the joint node transforms (the inverse bind matrices stay neutral), so Blender and other glTF viewers show it; the GUI model viewer draws the bind pose and does not. Checked on a female sports top (thin, heavy and belly look right, left/right symmetric). On male T-shirts with palette bones in neither skeleton the belly can come out as a spike. **Heads, jackets and other 0x8c-skinned parts** are skinned since 2026-11-22 (before, they came out with no skin): slots 8 / 9 format 0x8c hold 4 × u32 per vertex with the joint index in the low 12 bits (stream 8 keeps other data in the rest; 8 influences with slots 6 / 7), through the part's bone palette; low-detail copies whose palette names only shared bones are bound the same way. A part can hold **several bone arrays** (torso, upper-arm and forearm helper sets: a biker jacket has 69 + 32 + 24 + 16 + 9 bones) and its palettes name bones of all of them; all are now joints, which binds the arm helpers that used to count as "in neither skeleton" (biker jacket: 98 helper joints used, median 3 cm from the vertices they drive; 0 unresolved influences). The bind pose is model space. |
 | Damage or deformation variants | **partial** | Damage parts are separate fragments (`<car>_dmg_mod_<part>_NNN`, with `_hi`/`_mid`) and are exported. How the game swaps them in is not decoded. (`phoenix_mid` models 3–5 are LOD1, not damage.) |
 | Light meshes by function, or light IDs | **unknown** | |
 | Car paint (`smCarPaint`: colour, flakes, clear coat; liveries) | **partial (colours decoded 2026-11-21)** | `sixng vehicles` gives each model's spawn configurations with a body colour and its paint palettes. Colours are stored as ARGB u32 and are all dark, so they are probably linear. `srgb_if_linear` gives the sRGB reading (phoenix: steel blue, sage green, navy …; not checked in game). Secondary/pearl colours and liveries are not identified. Material side: paint materials have `classification.class = \"car_paint\"` and a `paint` block in `model.json` (mask slot hashes, a neutral default colour); in the GLB they get a grey `baseColorFactor`, metallic 0.6 and roughness 0.25. Take the colour from `vehicles.json`. The model viewer applies a car's first spawn configuration (colour, rim, tyre) when it opens, lists the other configurations, and shows the palettes as swatches with their shares. Palette colours rarely match the configuration colours (168 of 4,024), so they are a separate random-paint pool. |

@@ -500,6 +500,59 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         lookup: Vec<String>,
     },
+    /// Export a character as ONE rigged GLB: its outfit parts (head, hair,
+    /// top, bottom, shoes …; the default look, or --parts) skinned to one
+    /// shared skeleton, optionally with an animation clip as a glTF
+    /// animation. Imports into Blender as a single armature. Needs packs
+    /// (and for --clip, anim) indexed.
+    Outfit {
+        /// Character prefix, e.g. player_story000_00 or cs_ali.
+        character: String,
+        /// Output .glb file. Textures go to a textures/ folder next to it.
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+        /// Archive holding the parts.
+        #[arg(long, default_value = "packs")]
+        archive: String,
+        /// Parts to use instead of the default look: regexes, each picks the
+        /// first part (in name order) whose name matches.
+        #[arg(long, value_delimiter = ',')]
+        parts: Vec<String>,
+        /// Parts to add to the default look (regexes, as for --parts).
+        #[arg(long, value_delimiter = ',')]
+        add: Vec<String>,
+        /// List the character's parts (group, name, default) and stop.
+        #[arg(long)]
+        list: bool,
+        /// Animation clip: <dictionary>/<clip>, the dictionary by name or
+        /// entry id (anim.rpf@…), e.g.
+        /// gameplay@locomotion@female_character@kat@normal@standing@walk@stance_neutral/move.
+        /// `sixng clips` lists dictionaries and clips.
+        #[arg(long)]
+        clip: Option<String>,
+        /// Texture output: png, dds, or both.
+        #[arg(long, default_value = "png")]
+        tex: String,
+        /// Body shape, as for extract (e.g. "gcweightbelly=0.5").
+        #[arg(long)]
+        body_shape: Option<String>,
+        /// Face variant for the head, as for extract.
+        #[arg(long, default_value_t = 0)]
+        head_skin: usize,
+    },
+    /// Animation clips in anim.rpf: list the clip dictionaries (filter with
+    /// --name), or the clips of one dictionary (by name or entry id). The
+    /// first listing reads every resource of the anim.rpf index once (about
+    /// a minute) and caches the names in <work>/index/anim.clipdicts.json.
+    Clips {
+        /// Clip dictionary name or entry id (anim.rpf@…).
+        dict: Option<String>,
+        /// Regex on dictionary names (listing) or clip names (one dictionary).
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
     /// Inspect a ttpf texture store: list its textures, or decode some to PNG.
     Ttpf {
         /// Store id or substring (e.g. vehicles/ttdb_vehicles.ttpf).
@@ -702,6 +755,77 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     .map(|h| json!({"hash": format!("{h:08x}"), "names": sixng_core::names::all(h).into_iter().map(|(n, s)| json!({"name": n, "source": s})).collect::<Vec<_>>()}))
                     .collect();
                 out.print(&json!({"ok": true, "results": v}));
+            }
+        }
+        Cmd::Outfit { character, out: glb, archive, parts, add, list, clip, tex, body_shape, head_skin } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let prefix = character.to_ascii_lowercase();
+            let opts = sixng_core::outfit::outfit_options(&ix, &prefix);
+            if opts.is_empty() {
+                bail!("no parts named {prefix}_<item>_<fit>_… in {} (`sixng search '^{prefix}_'` to check the name)", a.id);
+            }
+            if *list {
+                let v: Vec<_> = opts.iter().map(|o| json!({"group": o.group, "name": o.name, "id": o.id, "default": o.default})).collect();
+                out.print(&json!({"ok": true, "character": prefix, "count": v.len(), "parts": v}));
+                return Ok(());
+            }
+            let pick = |pats: &[String]| -> Result<Vec<u64>> {
+                let mut v = Vec::new();
+                for p in pats {
+                    let re = regex::RegexBuilder::new(p).case_insensitive(true).build()?;
+                    let o = opts.iter().find(|o| re.is_match(&o.name)).ok_or_else(|| anyhow!("no part of {prefix} matches {p:?} (see --list)"))?;
+                    v.push(o.off);
+                }
+                Ok(v)
+            };
+            let mut offs: Vec<u64> = if parts.is_empty() { opts.iter().filter(|o| o.default).map(|o| o.off).collect() } else { pick(parts)? };
+            for o in pick(add)? {
+                if !offs.contains(&o) {
+                    offs.push(o);
+                }
+            }
+            let sel: Vec<&sixng_core::scan::Entry> = offs.iter().filter_map(|o| ix.entries.iter().find(|e| e.off == *o)).collect();
+            let glb = glb.clone().unwrap_or_else(|| PathBuf::from(format!("{prefix}.glb")));
+            let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: body_shape.clone(), head_skin: *head_skin };
+            let clip_data = match clip {
+                Some(c) => {
+                    let (dq, cq) = c.rsplit_once('/').ok_or_else(|| anyhow!("--clip wants <dictionary>/<clip>"))?;
+                    let (_, d) = sixng_core::anim::load_dictionary(&game, &ws.work, dq)?;
+                    let names: Vec<&str> = d.clips.iter().map(|c| c.short_name()).collect();
+                    let cl = d.clip(cq).ok_or_else(|| anyhow!("no clip {cq:?} in {}; it has: {}", d.name, names.join(", ")))?.clone();
+                    Some((d, cl))
+                }
+                None => None,
+            };
+            let t = Instant::now();
+            let mut r = sixng_core::outfit::export_outfit(&a, &sel, &prefix, &glb, &oa.opts(), clip_data.as_ref().map(|(d, c)| (d, c)))?;
+            r["seconds"] = t.elapsed().as_secs_f64().into();
+            out.print(&json!({"ok": true, "result": r}));
+        }
+        Cmd::Clips { dict, name, limit } => {
+            let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
+            match dict {
+                None => {
+                    let all = sixng_core::anim::dictionaries(&game, &ws.work)?;
+                    let hits: Vec<_> = all.iter().filter(|d| re.as_ref().is_none_or(|r| r.is_match(&d.name))).collect();
+                    out.print(&json!({"ok": true, "dictionaries": all.len(), "count": hits.len(), "matches": hits.iter().take(*limit).map(|d| json!({"name": d.name, "id": d.id})).collect::<Vec<_>>()}));
+                }
+                Some(q) => {
+                    let (de, d) = sixng_core::anim::load_dictionary(&game, &ws.work, q)?;
+                    let clips: Vec<_> = d
+                        .clips
+                        .iter()
+                        .filter(|c| re.as_ref().is_none_or(|r| r.is_match(&c.name)))
+                        .take(*limit)
+                        .map(|c| {
+                            let tr = sixng_core::anim::all_tracks(&d, c);
+                            json!({"name": c.short_name(), "hash": format!("{:08x}", c.hash), "type": c.kind, "duration": c.duration, "bindings": c.bindings.len(),
+                                "tracks": tr.len(), "bones": tr.iter().filter(|t| t.0 != 0).map(|t| t.0).collect::<std::collections::BTreeSet<_>>().len()})
+                        })
+                        .collect();
+                    out.print(&json!({"ok": true, "dictionary": de.name, "id": de.id, "clip_count": d.clips.len(), "animations": d.animations.len(), "clips": clips}));
+                }
             }
         }
         Cmd::Ttpf { store, hash, first, mip, all_slices, all, out: tout } => {

@@ -54,6 +54,12 @@ pub fn get(game_root: &Path, female: bool) -> Option<&'static PedSkeleton> {
     cell.get_or_init(|| load(game_root, female)).as_ref()
 }
 
+/// Ped part name: has a fit tag (`mr1`, `fr1`, `mk1` …: sex + body type +
+/// number) as one of its `_` tokens.
+pub fn is_ped_name(name: &str) -> bool {
+    name.split('_').any(crate::outfit::is_fit)
+}
+
 /// Female rig unless the name has the male rig token (`_mr1`).
 pub fn is_female_name(name: &str) -> bool {
     !name.contains("_mr1")
