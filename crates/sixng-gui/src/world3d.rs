@@ -279,7 +279,7 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
             let y = Y1 - (r as f32 + 0.5) * cs;
             let u = u0 + (i as f32 + 0.5) / n as f32 * us;
             let v = v0 + (j as f32 + 0.5) / n as f32 * us;
-            verts.push(glb::Vertex { pos: gl([x, y, z]), nrm: gl([nr.x, nr.y, nr.z]), tan: [1.0, 0.0, 0.0, 1.0], uv0: [u, v], uv1: [0.0, 0.0], col: [255, 255, 255, 255], joints: [0; 4], weights: [0; 4] });
+            verts.push(glb::Vertex { pos: gl([x, y, z]), nrm: gl([nr.x, nr.y, nr.z]), tan: [1.0, 0.0, 0.0, 1.0], uv0: [u, v], uv1: [0.0, 0.0], col: [255, 255, 255, 255], joints: [0; 4], weights: [0; 4], tint: [255; 4] });
         }
     }
     let w = n + 1;
@@ -682,7 +682,7 @@ fn ocean_model() -> glb::Model {
     let (cx, cy) = (X0 + W as f32 * CELL * 0.5, Y1 - H as f32 * CELL * 0.5);
     let e = 120_000.0;
     let z = WATER_Z - SINK - 0.5;
-    let v = |x: f32, y: f32| glb::Vertex { pos: gl([x, y, z]), nrm: [0.0, 1.0, 0.0], tan: [1.0, 0.0, 0.0, 1.0], uv0: [0.0, 0.0], uv1: [0.0, 0.0], col: [255; 4], joints: [0; 4], weights: [0; 4] };
+    let v = |x: f32, y: f32| glb::Vertex { pos: gl([x, y, z]), nrm: [0.0, 1.0, 0.0], tan: [1.0, 0.0, 0.0, 1.0], uv0: [0.0, 0.0], uv1: [0.0, 0.0], col: [255; 4], joints: [0; 4], weights: [0; 4], tint: [255; 4] };
     let verts = vec![v(cx - e, cy - e), v(cx + e, cy - e), v(cx - e, cy + e), v(cx + e, cy + e)];
     let mesh = glb::Mesh { name: "sea".into(), verts, indices: vec![0, 2, 1, 1, 2, 3], material: Some(0), skinned: false, has_tangents: false, uv_sets: 1, centre: gl([cx, cy, z]) };
     let mat = glb::Material { name: "sea".into(), class: "map_tile".into(), alpha_mode: "OPAQUE".into(), base_factor: SEA, base: None, normal: None, packed: None, emissive: None, slots: vec![], gap: "ok".into(), shader_hash: String::new(), decal: None };

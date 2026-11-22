@@ -850,6 +850,7 @@ impl ModelView {
         });
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.look.wire, "wireframe");
+            ui.checkbox(&mut self.look.tint, "tint").on_hover_text("Multiply the model's tint palette colour into the base colour (the game's per-model colour variation; GLB COLOR_0)");
             ui.checkbox(&mut self.show_normals, "normals");
             ui.checkbox(&mut self.decal_bias, "decal bias").on_hover_text("Draw decal-bucket materials (markings, grime, signage, terrain blend layers) after opaque surfaces with a depth bias, by layer order");
         });
@@ -1175,9 +1176,11 @@ fn load_query_sel(ws: &Workspace, cache: &Path, q: &str, sel: Option<Vec<u64>>, 
 fn export_load(a: &sixng_core::game::ArchiveInfo, e: &sixng_core::scan::Entry, cache: &Path, lod: usize) -> anyhow::Result<(glb::Model, Vec<PathBuf>, serde_json::Value)> {
     // Heads are exported again each time (small), so the chosen face variant applies.
     let head = sixng_core::headskin::is_head(e.name.as_deref().unwrap_or(""));
-    let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: head, skip_embedded_textures: false, body_shape: Vec::new(), head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed) };
-    let item = export::export_entry(a, e, &opts)?;
     let dir = cache.join("models").join(sixng_core::game::index_stem(&a.id)).join(format!("{}_{:x}", export_sanitize(e.name.as_deref().unwrap_or("unnamed")), e.off));
+    // Cached exports from before tint palettes were applied: export again.
+    let stale_tint = std::fs::read_to_string(dir.join("model.json")).is_ok_and(|j| j.contains("\"tintpalettetex\"") && !j.contains("\"tint_applied\""));
+    let opts = ExportOptions { out: cache.to_path_buf(), png: true, dds: false, raw: false, force: head || stale_tint, skip_embedded_textures: false, body_shape: Vec::new(), head_skin: HEAD_SKIN.load(std::sync::atomic::Ordering::Relaxed) };
+    let item = export::export_entry(a, e, &opts)?;
     let lods = lods_in(&dir);
     if lods.is_empty() {
         return Err(anyhow::anyhow!("{} exported no model.glb (status {}, files {:?}{})", e.id, item.status, item.files, item.error.map(|x| format!(", {x}")).unwrap_or_default()));

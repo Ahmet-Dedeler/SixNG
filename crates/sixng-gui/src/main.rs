@@ -38,7 +38,7 @@ mod pages;
 /// Command-line automation (verification screenshots):
 /// `sixng-gui --model <id|regex|glb> [--lod N] [--mode N] [--slot N] [--rma N] [--wire] [--skeleton]
 ///  [--tod H] [--paint r,g,b] [--finish N] [--pearl A] [--spin R] [--door R] [--yaw R] [--pitch R] [--zoom F]
-///  [--size WxH] --screenshot out.png --exit`
+///  [--no-tint] [--size WxH] --screenshot out.png --exit`
 #[derive(Default, Clone)]
 struct Cli {
     args: std::collections::HashMap<String, String>,
@@ -1247,6 +1247,7 @@ impl App {
             }
         }
         m.look.wire = c.has("wire");
+        m.look.tint = !c.has("no-tint");
         m.show_skeleton = c.has("skeleton");
         m.show_normals = c.has("normals");
         m.decal_bias = !c.has("no-decal-bias");

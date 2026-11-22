@@ -14,6 +14,7 @@ struct Frame {
     paint2: vec4<f32>,    // pearl colour (linear), w pearl amount
     misc: vec4<f32>,      // x wetness, y emissive boost, z time, w ambient
     misc2: vec4<f32>,     // x fog density, yzw secondary paint colour
+    misc3: vec4<f32>,     // x tint palette on (1) / off (0)
 };
 
 struct Mat {
@@ -45,6 +46,7 @@ struct VIn {
     @location(10) m2: vec4<f32>,
     @location(11) m3: vec4<f32>,
     @location(12) extra: vec4<f32>, // x skinned, y highlight, z tint code, w unused
+    @location(13) tint: vec4<f32>,  // model tint palette colour (linear; white = none)
 };
 
 struct VOut {
@@ -56,6 +58,7 @@ struct VOut {
     @location(4) uv1: vec2<f32>,
     @location(5) col: vec4<f32>,
     @location(6) extra: vec4<f32>,
+    @location(7) tint: vec4<f32>,
 };
 
 fn skin_matrix(v: VIn) -> mat4x4<f32> {
@@ -92,6 +95,7 @@ fn mesh_vertex(v: VIn) -> VOut {
     o.uv1 = v.uv1;
     o.col = v.col;
     o.extra = v.extra;
+    o.tint = v.tint;
     return o;
 }
 
@@ -160,6 +164,8 @@ fn fs_mesh(i: VOut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
         rough = clamp(rough, 0.04, 1.0);
     }
     var albedo = base.rgb;
+    // the model's tint palette entry multiplies the base colour
+    if (F.misc3.x > 0.5) { albedo = albedo * i.tint.rgb; }
     var alpha = base.a;
     var emissive = vec3(0.0);
     var pearl = vec3(0.0);

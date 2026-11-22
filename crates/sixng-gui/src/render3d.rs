@@ -28,6 +28,8 @@ pub struct FrameU {
     pub paint2: [f32; 4],
     pub misc: [f32; 4],
     pub misc2: [f32; 4],
+    /// x: tint palette on (1) / off (0)
+    pub misc3: [f32; 4],
 }
 
 #[repr(C)]
@@ -79,6 +81,8 @@ pub struct Look {
     pub emissive: f32,
     pub fog: f32,
     pub wire: bool,
+    /// Multiply the model's tint palette colour (GLB COLOR_0) into the base colour.
+    pub tint: bool,
     pub clear: [f32; 3],
 }
 
@@ -107,6 +111,7 @@ impl Default for Look {
             emissive: 2.0,
             fog: 0.0,
             wire: false,
+            tint: true,
             clear: [0.6, 0.65, 0.7],
         }
     }
@@ -367,7 +372,7 @@ impl Renderer3D {
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("mesh"), bind_group_layouts: &[&bgl_frame, &bgl_mat], push_constant_ranges: &[] });
         let layout_frame = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("frame only"), bind_group_layouts: &[&bgl_frame], push_constant_ranges: &[] });
-        let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Uint16x4, 7 => Unorm8x4];
+        let vattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x4, 3 => Float32x2, 4 => Float32x2, 5 => Unorm8x4, 6 => Uint16x4, 7 => Unorm8x4, 13 => Unorm8x4];
         let iattrs = wgpu::vertex_attr_array![8 => Float32x4, 9 => Float32x4, 10 => Float32x4, 11 => Float32x4, 12 => Float32x4];
         let vbufs = [
             wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<glb::Vertex>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &vattrs },
@@ -633,6 +638,7 @@ impl Renderer3D {
             paint2: [look.pearl[0], look.pearl[1], look.pearl[2], look.pearl_amount],
             misc: [look.wet, look.emissive, time, look.ambient],
             misc2: [look.fog, look.paint2nd[0], look.paint2nd[1], look.paint2nd[2]],
+            misc3: [look.tint as u32 as f32, 0.0, 0.0, 0.0],
         }
     }
 

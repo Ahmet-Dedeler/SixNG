@@ -18,6 +18,8 @@ pub struct Vertex {
     pub col: [u8; 4],
     pub joints: [u16; 4],
     pub weights: [u8; 4],
+    /// Tint palette colour (GLB COLOR_0, linear); white = no tint.
+    pub tint: [u8; 4],
 }
 
 pub struct Mesh {
@@ -515,6 +517,7 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
             for i in 0..n {
                 v[i].pos = [pos[3 * i], pos[3 * i + 1], pos[3 * i + 2]];
                 v[i].col = [255; 4];
+                v[i].tint = [255; 4];
                 v[i].weights = [255, 0, 0, 0];
                 for k in 0..3 {
                     lo[k] = lo[k].min(v[i].pos[k]);
@@ -555,6 +558,12 @@ pub fn load_with(path: &Path, out_root: &Path, opts: &LoadOpts) -> Result<Model>
                 let c = d.u8x4(a as usize)?;
                 for i in 0..n.min(c.len()) {
                     v[i].col = c[i];
+                }
+            }
+            if let Some(a) = at["COLOR_0"].as_u64() {
+                let c = d.u8x4(a as usize)?;
+                for i in 0..n.min(c.len()) {
+                    v[i].tint = c[i];
                 }
             }
             if let (true, Some(a), Some(w)) = (skinned, at["JOINTS_0"].as_u64(), at["WEIGHTS_0"].as_u64()) {
