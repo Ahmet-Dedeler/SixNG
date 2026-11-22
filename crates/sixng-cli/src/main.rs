@@ -420,7 +420,7 @@ enum Cmd {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
-    /// Export audio: Ogg Opus (lossless remux), WAV (decoded) or the raw bank (.awc). Needs `sixng audio` first.
+    /// Export audio: Ogg Opus (lossless remux), WAV (decoded) or the raw bank (.awc). PCM streams always export as WAV and XMA2 streams as .xma (RIFF XMA2, lossless remux). Needs `sixng audio` first.
     AudioExport {
         /// Archive (default audio).
         #[arg(long, default_value = "audio")]
@@ -431,7 +431,7 @@ enum Cmd {
         /// Stream id in hex (default: every stream of the bank).
         #[arg(long)]
         stream: Option<String>,
-        /// opus | wav | both | awc (raw bank).
+        /// opus | wav | both | awc (raw bank). Applies to Opus streams; PCM gives .wav and XMA2 .xma whatever the choice (except awc).
         #[arg(long, default_value = "opus")]
         format: String,
         /// Output folder.
