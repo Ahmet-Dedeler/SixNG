@@ -258,9 +258,19 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
         "note": "Derived from texture-size grouping and vertex/UV statistics, not from shader code. Blend: lerp(base, layer2, COLOR0.a), then the overlay by its alpha. Normal maps: DirectX green.",
     });
     if name_hash == "89c8fe07" {
+        // Unpainted vertices are A = 255 here (every granite rock, plain
+        // barriers), and A is painted down on container corner posts, edges
+        // and corrugations (more on the weathered `_b` variant): the overlay
+        // layer weight is 1 - A, the reverse of the wall shaders.
+        out["layers"][0]["weight"] = json!("COLOR0.a");
+        out["layers"][1]["weight"] = json!("1 - COLOR0.a");
+        out["vertex_color_channels"]["a"] = json!("layer-1 weight as 1 - a: 255 (unpainted) = base layer only");
+        out["vertex_color_channels"]["r"] = json!("unverified on props: 0/1 part masks on containers, varies on concrete barriers (lower on upward faces)");
+        out["confidence"]["weight_channel"] = json!("medium (direction from where the painting sits, not from shader code)");
+        out["note"] = json!("Derived from recovered slot names, UV tests and where the vertex alpha is painted, not from shader code. Blend: lerp(base, layer2, 1 - COLOR0.a), sharpened by the layers' materialb alpha (height-like), then the dirt overlay by its alpha (overlay UV set unknown). Normal maps: DirectX green.");
         out["prop_2lyr"] = json!({
             "slot_names": {"p0": "lyr0diffusetex", "p6": "lyr0normaltex", "p7": "lyr0materialbtex", "p9": "lyr0materialatex", "p4": "lyr1diffusetex", "p10": "lyr1normaltex", "p5": "lyr1materialbtex", "p2": "lyr1materialatex", "p8": "dirtdiffusetex", "p1": "tintpalettetex (embedded)", "p11": "unnamed (greyscale mask, containers only)"},
-            "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). materialb alpha looks like a height map in both layers (a height blend would sharpen the COLOR0.a weight). Raw COLOR0 on a container is all 1 and on a large rock R is 0/1, G 1, B about 0 and A varies, so A as the layer weight is plausible but unverified here.",
+            "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). materialb alpha looks like a height map in both layers (a height blend would sharpen the COLOR0.a weight). Raw COLOR0 on a container is all 1 and on a large rock R is 0/1, G 1, B about 0 and A varies, so A = 255 means base only and the overlay weight is 1 - A (see layers[].weight).",
         });
     }
     Some(out)
@@ -544,6 +554,8 @@ mod paint_tests {
         assert_eq!(l["layers"][1]["normal"]["png"], "t10.png");
         assert_eq!(l["overlay"]["colour_alpha"]["png"], "t8.png");
         assert!(l["prop_2lyr"].is_object());
+        assert_eq!(l["layers"][1]["weight"], "1 - COLOR0.a");
+        assert_eq!(layers("b217b263", &entries).unwrap()["layers"][1]["weight"], "COLOR0.a");
     }
 
     #[test]
