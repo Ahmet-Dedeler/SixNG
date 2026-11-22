@@ -245,6 +245,20 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Strand hair grooms (hair, beards, brows, fur: unnamed packs.rpf resources) as GLB line strips in model space: <out>/grooms/<archive>/<offset>.glb and index.jsonl (strands, points, bones, LOD group). Not linked to peds yet.
+    Grooms {
+        /// Archive (default packs).
+        #[arg(default_value = "packs")]
+        archive: String,
+        #[command(flatten)]
+        filter: FilterArgs,
+        /// Also write the scalp triangles between strand roots.
+        #[arg(long)]
+        roots: bool,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
     /// Road/path-node graph (nodes with speed limits, links with lane counts): <out>/paths/<archive>/graph.json.
     Paths {
         /// Archive (default levels).
@@ -761,6 +775,19 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let (n, roads) = export::export_navmesh(&a, &sel, po, *roads_only, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "tiles": n, "tiles_with_roads": roads,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("navmesh").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
+        }
+        Cmd::Grooms { archive, filter, roots, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let mut f = filter.to_filter()?;
+            if f.kinds.is_empty() {
+                f.kinds = vec![Kind::RageObj];
+            }
+            let sel: Vec<_> = f.select(&ix)?.into_iter().filter(|e| e.name.is_none()).collect();
+            let t = Instant::now();
+            let (n, scanned, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, po, *roots, pr)?;
+            out.print(&json!({"ok": true, "archive": a.id, "scanned": scanned, "grooms": n, "errors": errors,
+                "seconds": t.elapsed().as_secs_f64(), "index": po.join("grooms").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
         Cmd::Paths { archive, filter, out: po } => {
             let a = ws.resolve(archive)?;
