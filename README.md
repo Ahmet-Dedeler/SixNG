@@ -223,11 +223,25 @@ ames.json; exports and the app use it.
 .\target\release\sixng.exe outfit player_story000_00 --list
 .\target\release\sixng.exe outfit player_story000_00 -o work\out\lucia.glb --clip "gameplay@locomotion@female_character@kat@normal@standing@walk@stance_neutral/move"
 # Game text: all text tables to JSON, or one label's string in every language
-.	argetelease\sixng.exe text data -o work\out
-.	argetelease\sixng.exe text pack__shared_minigame000__shared_minigame000 --label AG_SUR_GEAR_FIRST1_01 --plain
+.\target\release\sixng.exe text data -o work\out
+.\target\release\sixng.exe text pack__shared_minigame000__shared_minigame000 --label AG_SUR_GEAR_FIRST1_01 --plain
 # Animation clips in anim.rpf: find dictionaries (first run ~20 s, cached), list a dictionary's clips
 .\target\release\sixng.exe clips --name "male_character@.*@walk"
 .\target\release\sixng.exe clips "gameplay@locomotion@male_character@raul@normal@standing@walk@stance_neutral"
+# Every character and animal `outfit` can build (name, kind, archive)
+.\target\release\sixng.exe characters --kind animal --name deer
+# An animal (root fragment + its parts on the animal's own skeleton), with two clips as two animations
+.\target\release\sixng.exe outfit crb_deer_whitetailed_m_00 -o work\out\deer.glb --clip "gameplay@creatures@land@mammal@deer@normal@run@fast/move,gameplay@creatures@land@mammal@deer@idle/idle"
+# Clip-only GLB (skeleton + animations, no meshes or textures) for the model above
+.\target\release\sixng.exe outfit crb_deer_whitetailed_m_00 -o work\out\deer_walk.glb --anim-only --clip "gameplay@creatures@land@mammal@deer@normal@walk@slow/move"
+# An ad-hoc character: any name plus --parts (regexes over every drawable in the archive)
+.\target\release\sixng.exe outfit hiker_m -o work\out\hiker.glb --parts '^head_mr1_cau_000_m_full','^hand_mr1_000_tshirt','^feet_mr1_000_shortsmid','^tshirtcrewneck_mr1_000.*_full$','^shortscargo_mr1_000','^bootshiking_mr1','^backpackhiking'
+# Particle effect dictionaries: names, rule names, keyframe curves
+.\target\release\sixng.exe ptfx data --name scr_arc -o work\out
+# UI fonts (Scaleform font libraries) as TrueType + three.js typeface JSON
+.\target\release\sixng.exe fonts data -o work\out
+# A vehicle with its body colour (sRGB hex; e.g. srgb_if_linear from vehicles.json)
+.\target\release\sixng.exe extract levels --name '^stanierg2$' -o work\out --paint 8a1a12
 
 # Built-in categories: textures | map | vehicles | meta
 .\target\release\sixng.exe extract-category vehicles --name '^phoenix' -o work\out
@@ -258,6 +272,44 @@ pose (22° for the conjugate). Not done: the mover (root motion), facial
 animation, hair (most hair parts are 3-vertex stubs), cloth simulation.
 One field jacket names 16 palette bones that are in no skeleton found yet
 (2,161 influences, weight moved to the other influences).
+
+**Animals and ad-hoc characters** (since 2026-11-22): an animal's root
+fragment (`crb_eagle_bald_m_00`, `crb_deer_whitetailed_m_00`) holds its
+skeleton, and its parts are the drawables named `<root>_<part>_NN`. `outfit`
+skins them to that skeleton. Parts bound to one bone (eyes, tongue, rigid
+props) are attached to that bone. The 3-vertex `fur` placeholders are left
+out by default; `--add fur` brings them back. A name that is not a known
+character plus `--parts` makes an ad-hoc character from any drawables, for
+example the generic hikers. `--clip` takes several clips (comma-separated or
+repeated), one glTF animation each. `--anim-only` writes only the skeleton
+and the animations. `sixng characters` lists every character and animal
+`outfit` can build (327 characters and 263 animals). The animal clips were
+checked by rendering (eagle flap, deer walk/run/idle: 91–97 % of tracks land
+on a joint). Animals have a 180° yaw on `SKEL_ROOT` in the bind pose that
+the clips do not carry, so an animated animal faces the other way from its
+bind pose.
+
+**Particle effects** (`sixng ptfx`): the effect dictionaries are unnamed
+resources with small embedded `keyframeTexture`s (16 × 4 half-float RGBA
+curves) and no geometry (146 in data.rpf). The command lists each
+dictionary's name (`scr_arc_tl`), its effect and emitter rule names, and
+with `-o` the keyframe curves. Rule parameters and the sprite links are not
+decoded; the sprite sheets are not embedded.
+
+**UI fonts** (`sixng fonts`): the Scaleform font libraries in data.rpf
+(`fontlib_efigs`, Chinese, Japanese and Korean) hold their fonts as SWF
+DefineFont3 outlines. 29 fonts are written as TrueType (`.ttf`, for CSS
+`@font-face`) and as three.js typeface JSON. Several are subsets of a full
+font (digits only, a few icons). The fonts belong to their owners; use them
+locally with your own install.
+
+**Emissive and paint**: materials of the emissive shaders (`standard_emissive`,
+`standard_emissive_layer` …, by recovered shader name or known family) get
+their colour texture as `emissiveTexture` in the GLB, so lamps, neon and
+screens light up in viewers and engines. `--paint RRGGBB` (or `AARRGGBB`)
+sets the colour of car-paint materials (linear `baseColorFactor`, and
+`paint.colour` in `model.json`). Map wreck props (`prop_am_wreck_*`) have no
+car-paint material: their colour is in their textures.
 
 Output options: `--tex png|dds|both|none` (DDS = original BCn with a mip chain; `none` writes no texture files, which is useful for geometry-only re-exports), `--raw` (also write the decompressed
 bytes), `--force` (redo items already done), `--no-embedded-textures`,
