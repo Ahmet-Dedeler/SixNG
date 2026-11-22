@@ -292,6 +292,23 @@ struct ShaderTextures {
     fallback: Option<serde_json::Value>,
     /// Alpha range of the base-colour texture.
     base_alpha: Option<[u8; 2]>,
+    /// The model's tint palette (sRGB RGBA8), indexed by vertex colour blue.
+    tint_palette: Option<Vec<[u8; 4]>>,
+}
+
+/// Shader slot of the per-model tint palette.
+const TINT_PALETTE: &str = "2c8d7182";
+
+/// Per-vertex tint from a palette: entry `colour.b` of row 0 (the default
+/// tint), as linear RGBA8 for glTF COLOR_0. Indices past the palette are
+/// white (no tint).
+fn tint_colours(palette: &[[u8; 4]], colours: &[[u8; 4]]) -> Vec<[u8; 4]> {
+    let lin = |v: u8| {
+        let c = v as f32 / 255.0;
+        let l = if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) };
+        (l * 255.0 + 0.5) as u8
+    };
+    colours.iter().map(|c| palette.get(c[2] as usize).map_or([255; 4], |p| [lin(p[0]), lin(p[1]), lin(p[2]), 255])).collect()
 }
 
 /// Classification of a shader, corrected by its base-colour texture: an
@@ -340,16 +357,22 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resou
                             if let Some(sr) = crate::material::slot_role(&t.param_hash) {
                                 e["slot_role"] = sr.into();
                             }
-                            if o.png {
-                                let p = model_dir.join("textures").join(format!("{}.png", t.hash64));
-                                let done = p.exists() || texture::embedded_rgba(r, et).and_then(|rgba| {
-                                    fs::create_dir_all(model_dir.join("textures"))?;
-                                    texture::save_png(&p, &rgba, et.width, et.height)
-                                }).map_err(|err| e["status"] = format!("embedded in the model, not decoded: {err}").into()).is_ok();
-                                if done {
-                                    e["png"] = rel(&o.out, &p).into();
+                            match texture::embedded_rgba(r, et) {
+                                Ok(rgba) => {
+                                    if t.param_hash == TINT_PALETTE && et.height == 1 {
+                                        st.tint_palette = Some(rgba.chunks(4).map(|p| [p[0], p[1], p[2], p[3]]).collect());
+                                        e["applied"] = "GLB COLOR_0 = palette entry at vertex colour blue (row 0), multiplied into the base colour".into();
+                                    }
                                     e["status"] = "ok (embedded in the model)".into();
+                                    if o.png {
+                                        let p = model_dir.join("textures").join(format!("{}.png", t.hash64));
+                                        let w = p.exists() || fs::create_dir_all(model_dir.join("textures")).map_err(anyhow::Error::from).and_then(|_| texture::save_png(&p, &rgba, et.width, et.height)).is_ok();
+                                        if w {
+                                            e["png"] = rel(&o.out, &p).into();
+                                        }
+                                    }
                                 }
+                                Err(err) => e["status"] = format!("embedded in the model, not decoded: {err}").into(),
                             }
                         }
                         None => e["status"] = "not in any ttpf store".into(),
@@ -629,9 +652,16 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     // to the largest kept influence in the GLB.
                     "unresolved_joints": skin_used.as_ref().map(|u| u.iter().filter(|&&i| i as usize >= skin.joints.len()).count()),
                 }));
+                let tint = match (material.and_then(|s| shader_tex.get(s)).and_then(|st| st.tint_palette.as_ref()), &m.colors) {
+                    (Some(p), Some(c)) => Some(tint_colours(p, c)),
+                    _ => None,
+                };
+                if let Some(mm) = mesh_meta.last_mut() {
+                    mm["tint_applied"] = tint.is_some().into();
+                }
                 Some(crate::gltf::TriPrim {
                     name, positions: m.positions, normals: m.normals, tangents: m.tangents, uvs: m.uvs.into_iter().map(|u| u.1).collect(),
-                    colors: m.colors, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
+                    colors: m.colors, tint, indices: m.indices, material, joints: m.joints, weights: m.weights, joints1: m.joints1, weights1: m.weights1,
                 })
             };
             let nlod = info.models.iter().filter(|m| !m.part).map(|m| m.lod + 1).max().unwrap_or(1);

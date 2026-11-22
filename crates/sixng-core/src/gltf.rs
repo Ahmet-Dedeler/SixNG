@@ -26,6 +26,9 @@ pub struct TriPrim {
     /// Raw RGBA8 stream, written as the custom attribute `_COLOR0`
     /// (meaning unverified, so not COLOR_0).
     pub colors: Option<Vec<[u8; 4]>>,
+    /// Per-vertex colour (linear RGBA8) written as COLOR_0, which glTF
+    /// multiplies into the base colour: the model's tint palette entry.
+    pub tint: Option<Vec<[u8; 4]>>,
     pub indices: Vec<u32>,
     pub material: Option<usize>,
     /// Per-vertex skin joints (skeleton bone indices) and u8 weights
@@ -273,6 +276,9 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
             }
             if let Some(c) = &p.colors {
                 attrs["_COLOR0"] = json!(b.rgba8(c));
+            }
+            if let Some(t) = &p.tint {
+                attrs["COLOR_0"] = json!(b.rgba8(t));
             }
             let skinned = skin.is_some() && p.joints.is_some();
             if let (true, Some(js)) = (skinned, &p.joints) {
