@@ -2,6 +2,8 @@
 //! graphics pages, decompressed one entry at a time) for byte needles:
 //! ASCII strings and the little-endian joaat of each string (lower case).
 //! Usage: needles <archive path> <index json> <needle> [needle ...]
+//! A needle `0x1234abcd` is searched as that raw little-endian u32 only;
+//! 16 hex digits (`0x0123456789abcdef`) as a raw little-endian u64.
 //! Prints one JSON line per entry with hits.
 use rayon::prelude::*;
 use sixng_core::{resource::Resource, scan};
@@ -31,6 +33,14 @@ fn main() -> anyhow::Result<()> {
     let ix = scan::load_index(std::path::Path::new(&a[2]))?;
     let mut needles: Vec<(String, Vec<u8>)> = Vec::new();
     for s in &a[3..] {
+        if let Some(h) = s.strip_prefix("0x").filter(|h| h.len() == 16).and_then(|h| u64::from_str_radix(h, 16).ok()) {
+            needles.push((format!("u64:{h:016x}"), h.to_le_bytes().to_vec()));
+            continue;
+        }
+        if let Some(h) = s.strip_prefix("0x").and_then(|h| u32::from_str_radix(h, 16).ok()) {
+            needles.push((format!("u32:{h:08x}"), h.to_le_bytes().to_vec()));
+            continue;
+        }
         needles.push((format!("str:{s}"), s.as_bytes().to_vec()));
         needles.push((format!("joaat:{s}={:08x}", joaat(s)), joaat(s).to_le_bytes().to_vec()));
     }
