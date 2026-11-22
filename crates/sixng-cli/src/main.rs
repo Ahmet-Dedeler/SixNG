@@ -278,6 +278,24 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Text tables (localised UI text, subtitles, item names, phone and ambient speech; one table per language): <out>/text/<archive>/<offset>.json (label hash -> string) + index.jsonl. Labels are joaat(lowercase label); a subtitle's label is its voice-line name plus a 2-digit variation (AG_SUR_GEAR_FIRST1_01). With --label, prints those labels' strings from every table instead
+    Text {
+        /// Archive (default data; the minigame text is in pack/shared_minigame000).
+        #[arg(default_value = "data")]
+        archive: String,
+        /// Only these resource offsets (hex, comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Look up these labels (names or 0x-hashes, comma-separated) and print their strings.
+        #[arg(long, value_delimiter = ',')]
+        label: Vec<String>,
+        /// Strip the inline markup (~sl:…~, ~b~, ~n~ …) from printed strings.
+        #[arg(long)]
+        plain: bool,
+        /// Output directory (needed unless --label is given).
+        #[arg(long, short)]
+        out: Option<PathBuf>,
+    },
     /// Head identity deltas (per-head vertex offsets from the class's base head): matches each to its head drawable, recovers the vertex order and with --build writes the heads that have no drawable as GLBs (<out>/models/<archive>/head_<class>_delta_<offset>/model.glb). Index: <out>/head_deltas/<archive>/index.jsonl.
     HeadDeltas {
         /// Archive (default packs).
@@ -963,6 +981,38 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let (n, errors) = sixng_core::cloth::export_cloth(&a, &ix.entries, &only, po, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "cloth": n, "errors": errors,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("cloth").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
+        }
+        Cmd::Text { archive, only, label, plain, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let t = Instant::now();
+            let only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
+            let (tables, errors) = sixng_core::text::read_all(&a, &ix.entries, &only, pr)?;
+            if !label.is_empty() {
+                let keys: Vec<(String, u32)> = label
+                    .iter()
+                    .map(|l| {
+                        let h = l.strip_prefix("0x").and_then(|x| u32::from_str_radix(x, 16).ok()).unwrap_or_else(|| sixng_core::meta7a::joaat(l));
+                        (l.clone(), h)
+                    })
+                    .collect();
+                let found: Vec<serde_json::Value> = keys
+                    .iter()
+                    .map(|(l, h)| {
+                        let hits: Vec<serde_json::Value> = tables
+                            .iter()
+                            .filter_map(|t| t.strings.get(h).map(|s| json!({"table": t.id, "text": if *plain { sixng_core::text::plain(s) } else { s.clone() }})))
+                            .collect();
+                        json!({"label": l, "hash": format!("{h:08x}"), "found": hits})
+                    })
+                    .collect();
+                out.print(&json!({"ok": true, "archive": a.id, "tables": tables.len(), "labels": found}));
+            } else {
+                let Some(po) = po else { bail!("--out is needed unless --label is given") };
+                let (n, strings) = sixng_core::text::export(&a, &tables, po)?;
+                out.print(&json!({"ok": true, "archive": a.id, "tables": n, "strings": strings, "errors": errors,
+                    "seconds": t.elapsed().as_secs_f64(), "index": po.join("text").join(sixng_core::game::index_stem(&a.id)).join("index.jsonl")}));
+            }
         }
         Cmd::HeadDeltas { archive, build, only, out: po } => {
             let a = ws.resolve(archive)?;
