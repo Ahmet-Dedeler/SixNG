@@ -452,6 +452,19 @@ enum Cmd {
         #[arg(long, value_delimiter = ',')]
         lookup: Vec<String>,
     },
+    /// Animation clips in anim.rpf: list the clip dictionaries (filter with
+    /// --name), or the clips of one dictionary (by name or entry id). The
+    /// first listing reads every resource of the anim.rpf index once (about
+    /// a minute) and caches the names in <work>/index/anim.clipdicts.json.
+    Clips {
+        /// Clip dictionary name or entry id (anim.rpf@…).
+        dict: Option<String>,
+        /// Regex on dictionary names (listing) or clip names (one dictionary).
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+    },
     /// Inspect a ttpf texture store: list its textures, or decode some to PNG.
     Ttpf {
         /// Store id or substring (e.g. vehicles/ttdb_vehicles.ttpf).
@@ -654,6 +667,31 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
                     .map(|h| json!({"hash": format!("{h:08x}"), "names": sixng_core::names::all(h).into_iter().map(|(n, s)| json!({"name": n, "source": s})).collect::<Vec<_>>()}))
                     .collect();
                 out.print(&json!({"ok": true, "results": v}));
+            }
+        }
+        Cmd::Clips { dict, name, limit } => {
+            let re = name.as_deref().map(|n| regex::RegexBuilder::new(n).case_insensitive(true).build()).transpose()?;
+            match dict {
+                None => {
+                    let all = sixng_core::anim::dictionaries(&game, &ws.work)?;
+                    let hits: Vec<_> = all.iter().filter(|d| re.as_ref().is_none_or(|r| r.is_match(&d.name))).collect();
+                    out.print(&json!({"ok": true, "dictionaries": all.len(), "count": hits.len(), "matches": hits.iter().take(*limit).map(|d| json!({"name": d.name, "id": d.id})).collect::<Vec<_>>()}));
+                }
+                Some(q) => {
+                    let (de, d) = sixng_core::anim::load_dictionary(&game, &ws.work, q)?;
+                    let clips: Vec<_> = d
+                        .clips
+                        .iter()
+                        .filter(|c| re.as_ref().is_none_or(|r| r.is_match(&c.name)))
+                        .take(*limit)
+                        .map(|c| {
+                            let tr = sixng_core::anim::all_tracks(&d, c);
+                            json!({"name": c.short_name(), "hash": format!("{:08x}", c.hash), "type": c.kind, "duration": c.duration, "bindings": c.bindings.len(),
+                                "tracks": tr.len(), "bones": tr.iter().filter(|t| t.0 != 0).map(|t| t.0).collect::<std::collections::BTreeSet<_>>().len()})
+                        })
+                        .collect();
+                    out.print(&json!({"ok": true, "dictionary": de.name, "id": de.id, "clip_count": d.clips.len(), "animations": d.animations.len(), "clips": clips}));
+                }
             }
         }
         Cmd::Ttpf { store, hash, first, mip, all_slices, all, out: tout } => {
