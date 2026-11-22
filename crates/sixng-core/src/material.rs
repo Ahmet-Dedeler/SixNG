@@ -270,6 +270,8 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
         out["note"] = json!("Derived from recovered slot names, UV tests and where the vertex alpha is painted, not from shader code. Blend: lerp(base, layer2, 1 - COLOR0.a), sharpened by the layers' materialb alpha (height-like), then the dirt overlay by its alpha (overlay UV set unknown). Normal maps: DirectX green.");
         out["prop_2lyr"] = json!({
             "slot_names": {"p0": "lyr0diffusetex", "p6": "lyr0normaltex", "p7": "lyr0materialbtex", "p9": "lyr0materialatex", "p4": "lyr1diffusetex", "p10": "lyr1normaltex", "p5": "lyr1materialbtex", "p2": "lyr1materialatex", "p8": "dirtdiffusetex", "p1": "tintpalettetex (embedded)", "p11": "unnamed (greyscale mask, containers only)"},
+            "tint": "the tintpalettetex colour is applied per vertex as COLOR_0 (tint_applied in meshes[]; props with a palette such as containers and barriers, not the rocks); multiply it into the base layer (white paint), not the rust or moss overlay, whose textures are already coloured",
+            "dirt_uv": "unknown: TEXCOORD_2 is parked at (1, 0) on every rock and many props (and the dirt alpha there is not 0, so it is not a no-dirt sentinel); TEXCOORD_0 and TEXCOORD_1 are both full mappings and equal on most rocks and barriers. TEXCOORD_1 is the best guess",
             "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). materialb alpha looks like a height map in both layers (a height blend would sharpen the COLOR0.a weight). Raw COLOR0 on a container is all 1 and on a large rock R is 0/1, G 1, B about 0 and A varies, so A = 255 means base only and the overlay weight is 1 - A (see layers[].weight).",
         });
     }
@@ -408,7 +410,7 @@ pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
         ("c35e27af", "equal across seams 100 % for the same texture (44 % otherwise); values 1.0-1.7: a per-texture factor (tiling or intensity, not decided)"),
         ("627ce8ae", "99 % / 71 %; values 1 or 2"),
         ("781f7100", "98 % / 10 %; values 0.35-0.75"),
-        ("9a4a3781", "92 % / 14 %; values 0-0.175 (parallax or height depth?)"),
+        ("9a4a3781", "92 % / 14 %; values 0-0.175 on some sections, mostly 0.5 or 1.0 on others (parallax or height depth?)"),
         ("f354f896", "85 % / 13 %; values about 1-16"),
         ("9ede7c13", "83 % / 23 %; values about 1-14"),
         ("b25b6656", "100 % / 86 %; mostly 1.0"),
