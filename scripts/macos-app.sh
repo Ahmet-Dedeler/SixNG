@@ -23,7 +23,7 @@ if [ $universal = 1 ]; then
       "$target/aarch64-apple-darwin/release/$b" "$target/x86_64-apple-darwin/release/$b"
   done
 else
-  cargo build --release
+  MACOSX_DEPLOYMENT_TARGET=11.0 cargo build --release
   cp "$target/release/sixng-gui" "$target/release/sixng" "$app/Contents/MacOS/"
 fi
 
