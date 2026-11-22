@@ -4,11 +4,13 @@
 //!
 //! Header: block table at 0x38 ({u32 struct hash, u32 size, u64 ptr} per
 //! block, count u16 at 0x4C). A text table has three blocks:
-//! - struct 0xa8478889: one 16-byte string ref per string, the string's
-//!   byte offset into the blob in bits 20.. of the u64 at +8;
+//! - struct 0xa8478889: one 16-byte string ref per string; the u64 at +8
+//!   is (byte offset << 20) | block number, the block number counted from 1
+//!   in the block table;
 //! - 0x101: a hash map of 16-byte slots (groups of control bytes and
 //!   slots); a used slot is {u32 label hash, u32 0, u64 (index << 24) | 1};
-//! - 0x10: the UTF-8 string blob, NUL-terminated strings.
+//! - 0x10: the UTF-8 string blob, NUL-terminated strings, in pages of at
+//!   most 1 MiB: big tables have two or three 0x10 blocks.
 //!
 //! The label hash is joaat(lowercase label). For dialogue subtitles the
 //! label is the voice-line name plus a 2-digit variation
@@ -35,22 +37,26 @@ fn u64_(b: &[u8], o: usize) -> u64 {
     rd::<8>(b, o).map(u64::from_le_bytes).unwrap_or(0)
 }
 
-/// Blocks of a 0x7a meta resource (struct hash, offset, size); system-page
-/// pointers only.
-fn blocks(b: &[u8]) -> Vec<(u32, usize, usize)> {
+/// Blocks of a 0x7a meta resource in block-table order (struct hash,
+/// offset, size); `None` for blocks outside the system page.
+fn block_table(b: &[u8]) -> Vec<Option<(u32, usize, usize)>> {
     let t = u64_(b, 0x38);
     if b.get(0x10..0x15) != Some(b"0DRPz") || t >> 28 != 5 {
         return Vec::new();
     }
     let t = (t & 0x0FFF_FFFF) as usize;
     (0..u16_(b, 0x4C) as usize)
-        .filter_map(|i| {
+        .map(|i| {
             let o = t + 16 * i;
             let p = u64_(b, o + 8);
             let (at, size) = ((p & 0x0FFF_FFFF) as usize, u32_(b, o + 4) as usize);
             (p >> 28 == 5 && at + size <= b.len()).then_some((u32_(b, o), at, size))
         })
         .collect()
+}
+
+fn blocks(b: &[u8]) -> Vec<(u32, usize, usize)> {
+    block_table(b).into_iter().flatten().collect()
 }
 
 /// Cheap test: the resource has the three text-table blocks.
@@ -62,9 +68,9 @@ pub fn is_text_table(b: &[u8]) -> bool {
 /// Decode a text table (the whole decompressed resource): label hash ->
 /// string, sorted by hash.
 pub fn parse(b: &[u8]) -> Result<BTreeMap<u32, String>> {
-    let bl = blocks(b);
-    let find = |h: u32| bl.iter().find(|x| x.0 == h).copied();
-    let (Some(refs), Some(map), Some(blob)) = (find(STRING_REFS), find(HASH_MAP), find(BLOB)) else {
+    let table = block_table(b);
+    let find = |h: u32| table.iter().flatten().find(|x| x.0 == h).copied();
+    let (Some(refs), Some(map), Some(_)) = (find(STRING_REFS), find(HASH_MAP), find(BLOB)) else {
         bail!("not a text table");
     };
     let n = refs.2 / 16;
@@ -81,11 +87,14 @@ pub fn parse(b: &[u8]) -> Result<BTreeMap<u32, String>> {
     if labels.is_empty() && n > 0 {
         bail!("hash map has no entries");
     }
-    let bytes = &b[blob.1..blob.1 + blob.2];
     let mut out = BTreeMap::new();
     for (h, i) in labels {
-        let at = (u64_(b, refs.1 + 16 * i + 8) >> 20) as usize;
-        let Some(s) = bytes.get(at..) else { bail!("string offset past the blob") };
+        let r = u64_(b, refs.1 + 16 * i + 8);
+        let (at, blk) = ((r >> 20) as usize, (r & 0xF_FFFF) as usize);
+        let Some(Some((BLOB, start, size))) = blk.checked_sub(1).and_then(|k| table.get(k)).copied() else {
+            bail!("string ref {i} names block {blk}, not a string blob");
+        };
+        let Some(s) = b[start..start + size].get(at..) else { bail!("string offset past the blob") };
         let end = s.iter().position(|&c| c == 0).unwrap_or(s.len());
         out.insert(h, String::from_utf8_lossy(&s[..end]).into_owned());
     }
@@ -189,5 +198,37 @@ mod tests {
         assert_eq!(plain("~sl:0:3.15~I said you'll need gears.~sl:0.01~Find them."), "I said you'll need gears. Find them.");
         assert_eq!(plain("~b~AUTO SHOTGUN~b~"), "AUTO SHOTGUN");
         assert_eq!(plain("a ~n~b"), "a b");
+    }
+
+    /// A string ref names its blob page: big tables split the blob over
+    /// several 0x10 blocks.
+    #[test]
+    fn strings_in_the_second_blob_page() {
+        let mut b = vec![0u8; 0x200];
+        b[0x10..0x15].copy_from_slice(b"0DRPz");
+        let t = 0x60usize;
+        b[0x38..0x40].copy_from_slice(&(0x5000_0000u64 | t as u64).to_le_bytes());
+        b[0x4C..0x4E].copy_from_slice(&4u16.to_le_bytes());
+        // block table: refs, hash map, blob page 1, blob page 2
+        let blocks = [(STRING_REFS, 0x100u64, 32u32), (HASH_MAP, 0x120, 32), (BLOB, 0x140, 8), (BLOB, 0x160, 8)];
+        for (i, (h, at, size)) in blocks.iter().enumerate() {
+            let o = t + 16 * i;
+            b[o..o + 4].copy_from_slice(&h.to_le_bytes());
+            b[o + 4..o + 8].copy_from_slice(&size.to_le_bytes());
+            b[o + 8..o + 16].copy_from_slice(&(0x5000_0000 | at).to_le_bytes());
+        }
+        // ref 0: offset 2 in block 3 (page 1); ref 1: offset 0 in block 4 (page 2)
+        b[0x108..0x110].copy_from_slice(&((2u64 << 20) | 3).to_le_bytes());
+        b[0x118..0x120].copy_from_slice(&4u64.to_le_bytes());
+        for (k, (h, i)) in [(0xaaaa_aaaau32, 0u64), (0xbbbb_bbbb, 1)].iter().enumerate() {
+            let o = 0x120 + 16 * k;
+            b[o..o + 4].copy_from_slice(&h.to_le_bytes());
+            b[o + 8..o + 16].copy_from_slice(&((i << 24) | 1).to_le_bytes());
+        }
+        b[0x140..0x146].copy_from_slice(b"x\0One\0");
+        b[0x160..0x164].copy_from_slice(b"Two\0");
+        let m = parse(&b).unwrap();
+        assert_eq!(m[&0xaaaa_aaaa], "One");
+        assert_eq!(m[&0xbbbb_bbbb], "Two");
     }
 }
