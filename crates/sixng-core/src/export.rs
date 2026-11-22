@@ -912,7 +912,7 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
         &r.gfx[(b.gfx_off as usize).min(end)..end]
     };
-    let skin = ped_skin(a, e, info, o, item);
+    let skin = ped_skin(a, e, r, info, o, item);
     // Triangle meshes: one primitive per geometry, grouped by model.
     let mut mesh_meta = Vec::new();
     let prims_of = |gi: usize, material: Option<usize>, mesh_meta: &mut Vec<serde_json::Value>| -> Option<crate::gltf::TriPrim> {
@@ -1081,13 +1081,32 @@ fn head_skin_shaders(a: &ArchiveInfo, e: &Entry, shaders: &[crate::drawable::Sha
 /// then the shared ped skeleton followed by the drawable's own bones. The own
 /// `GM_U01_*` helper bones hang under the shared bone their record names
 /// (`Bone::parent_hash`), with their parent-relative bind moved to model space.
-fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o: &ExportOptions, item: &mut ExportedItem) -> SkinSetup {
+fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::DrawableInfo, o: &ExportOptions, item: &mut ExportedItem) -> SkinSetup {
     use crate::gltf::Joint;
     let joint = |b: &crate::drawable::Bone, off: usize| Joint { name: b.name.clone(), parent: b.parent.map(|p| p as usize + off), bind: b.bind_matrix.unwrap(), pose: None };
-    let own_ok = info.skeleton.iter().all(|b| b.bind_matrix.is_some());
-    let own: Vec<Joint> = if own_ok { info.skeleton.iter().map(|b| joint(b, 0)).collect() } else { Vec::new() };
+    let ped_name = crate::pedskel::is_ped_name(e.name.as_deref().unwrap_or(""));
+    // Ped parts can hold several bone arrays (torso, upper-arm and forearm
+    // helper sets); their palettes name bones of all of them.
+    let all_bones: Vec<crate::drawable::Bone>;
+    let skeleton: &[crate::drawable::Bone] = if ped_name {
+        let mut v = Vec::new();
+        for mut arr in crate::drawable::find_skeletons(r) {
+            let off = v.len() as u16;
+            arr.iter_mut().for_each(|b| b.parent = b.parent.map(|p| p + off));
+            v.extend(arr);
+        }
+        all_bones = v;
+        &all_bones
+    } else {
+        &info.skeleton
+    };
+    let own_ok = skeleton.iter().all(|b| b.bind_matrix.is_some());
+    let own: Vec<Joint> = if own_ok { skeleton.iter().map(|b| joint(b, 0)).collect() } else { Vec::new() };
     let mut out = SkinSetup { joints: own, geometry_map: Default::default() };
-    let own_hash: std::collections::HashMap<u32, usize> = info.skeleton.iter().enumerate().map(|(i, b)| (crate::meta7a::joaat(&b.name), i)).collect();
+    let mut own_hash: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (i, b) in skeleton.iter().enumerate() {
+        own_hash.entry(crate::meta7a::joaat(&b.name)).or_insert(i);
+    }
     let cand: Vec<(&crate::drawable::Model, &Vec<u32>)> = info.models.iter().filter_map(|m| m.bone_palette.as_ref().map(|p| (m, p))).collect();
     if !own_ok || cand.is_empty() {
         return out;
@@ -1097,7 +1116,6 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o:
     // (the ascending check alone is not proof), or a ped part's palette
     // names shared ped skeleton bones only (heads, low-detail copies).
     let names_own = cand.iter().any(|(_, p)| p.iter().any(|h| own_hash.contains_key(h)));
-    let ped_name = crate::pedskel::is_ped_name(e.name.as_deref().unwrap_or(""));
     let ped = if names_own || ped_name { crate::pedskel::get(&game_root(a), female) } else { None };
     let in_ped = |p: &Vec<u32>| ped.is_some_and(|s| !p.is_empty() && p.iter().filter(|h| s.by_hash.contains_key(h)).count() * 10 >= p.len() * 9);
     if !names_own && !cand.iter().any(|(_, p)| in_ped(p)) {
@@ -1120,20 +1138,20 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o:
             }
         }
         let ped_joints = j.len();
-        j.extend(info.skeleton.iter().map(|b| joint(b, n_ped)));
+        j.extend(skeleton.iter().map(|b| joint(b, n_ped)));
         // Helper bones (`GM_U01_*`) are roots of the drawable's skeleton that
         // name their parent in the shared skeleton (`Bone::parent_hash`);
         // their binds are relative to it. Hang them under that bone and put
         // their bind (and body-shape pose) in model space, so they follow
         // the body when it moves.
         let mut unattached = 0;
-        for (k, b) in info.skeleton.iter().enumerate() {
+        for (k, b) in skeleton.iter().enumerate() {
             // the drawable root this bone hangs from, and its shared parent
-            let mut r = k;
-            while let Some(q) = info.skeleton[r].parent.map(|q| q as usize).filter(|&q| q < info.skeleton.len() && q != r) {
-                r = q;
+            let mut root = k;
+            while let Some(q) = skeleton[root].parent.map(|q| q as usize).filter(|&q| q < skeleton.len() && q != root) {
+                root = q;
             }
-            let Some(&pi) = info.skeleton[r].parent_hash.and_then(|h| p.by_hash.get(&h)) else {
+            let Some(&pi) = skeleton[root].parent_hash.and_then(|h| p.by_hash.get(&h)) else {
                 unattached += 1;
                 continue;
             };

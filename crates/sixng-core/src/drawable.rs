@@ -211,6 +211,17 @@ pub fn affine_inverse(m: &[f32; 16]) -> [f32; 16] {
 /// Find the bone array: consecutive 0x50-byte records whose index field
 /// counts 0, 1, 2... and whose name pointer resolves to a name.
 pub fn find_skeleton(r: &Resource) -> Vec<Bone> {
+    scan_skeletons(r, true).into_iter().next().unwrap_or_default()
+}
+
+/// Every bone array of a resource, in system page order. Ped clothing can
+/// hold several (helper sets for the torso, upper arms, forearms …), and its
+/// bone palettes name bones of all of them; `find_skeleton` returns the first.
+pub fn find_skeletons(r: &Resource) -> Vec<Vec<Bone>> {
+    scan_skeletons(r, false)
+}
+
+fn scan_skeletons(r: &Resource, first_only: bool) -> Vec<Vec<Bone>> {
     let ok_name = |s: &str| !s.is_empty() && s.len() < 96 && s.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_');
     // q = record start; name ptr at +0x30, u16 fields at +0x40.
     let rec = |q: usize, k: u16| -> Option<Bone> {
@@ -235,6 +246,7 @@ pub fn find_skeleton(r: &Resource) -> Vec<Bone> {
             parent_hash: Some(r.u32(q + 0x2c)).filter(|&h| h != 0 && r.u16(q + 0x46) == 0xffff),
         })
     };
+    let mut out = Vec::new();
     let mut p = 0usize;
     while p + 0x50 <= r.sys.len() {
         if let Some(b0) = rec(p, 0) {
@@ -245,13 +257,18 @@ pub fn find_skeleton(r: &Resource) -> Vec<Bone> {
                 }
                 if v.len() >= 2 {
                     attach_binds(r, p, &mut v);
-                    return v;
+                    p += v.len() * 0x50;
+                    out.push(v);
+                    if first_only {
+                        break;
+                    }
+                    continue;
                 }
             }
         }
         p += 16;
     }
-    Vec::new()
+    out
 }
 
 /// Read the inverse bind matrices through the skeleton header and store
@@ -552,9 +569,11 @@ pub struct Mesh {
     /// Skin joints per vertex (skeleton bone indices). Stream 8: format
     /// 0x25 = 4 x u8 blend indices; format 0x00 is sized per vertex:
     /// 1 byte = one u8 bone, 2 = one u16 bone (rigid), 4 = 4 x u8,
-    /// 8 = 4 x u16 blend indices. Format 0x8C (ped heads) = 4 x u32 per
-    /// vertex, the joint index in the low u16 of each (the high halves of
-    /// stream 8 hold other per-vertex data; those of stream 9 are 0).
+    /// 8 = 4 x u16 blend indices. Format 0x8C (ped heads and clothing) = 4 x
+    /// u32 per vertex, the joint index in the low 12 bits of each; in stream
+    /// 8 bits 12-15 and the high u16 hold other per-vertex data (on a
+    /// jacket, 0 of 82,042 weighted low-12-bit indices fall outside the bone
+    /// palette; the full low u16 misses on 26 %).
     pub joints: Option<Vec<[u16; 4]>>,
     /// Skin weights per vertex (u8, sum 255). Stream 6 (format 0x26) when
     /// stream 8 has 4 indices; otherwise (255, 0, 0, 0).
@@ -720,11 +739,11 @@ pub fn decode_mesh(blob: &[u8], h: &MeshBlobHeader, ib: &[u8]) -> Mesh {
         if v == 0 { 0 } else { (next.min(blob.len()) - o) / v }
     };
     let u16le = |c: &[u8]| u16::from_le_bytes([c[0], c[1]]);
-    let quad_u32 = |b: &[u8]| -> Vec<[u16; 4]> { b.chunks_exact(16).map(|c| [u16le(&c[0..]), u16le(&c[4..]), u16le(&c[8..]), u16le(&c[12..])]).collect() };
+    let quad_u32 = |b: &[u8]| -> Vec<[u16; 4]> { b.chunks_exact(16).map(|c| [0, 4, 8, 12].map(|k| u16le(&c[k..]) & 0x0fff)).collect() };
     let jw = width(8);
     let joints: Option<Vec<[u16; 4]>> = match stream(8) {
         Some((o, 0x25)) => blob.get(o..o + 4 * v).map(|b| b.chunks_exact(4).map(|c| [c[0] as u16, c[1] as u16, c[2] as u16, c[3] as u16]).collect()),
-        // 4 x u32 (ped heads): joint index in the low u16 of each
+        // 4 x u32 (peds): joint index in the low 12 bits of each
         Some((o, 0x8c)) => blob.get(o..o + 16 * v).map(quad_u32),
         // one u16 bone per vertex (rigid, skeletons over 255 bones)
         Some((o, 0x00)) if (2..4).contains(&jw) => blob.get(o..o + 2 * v).map(|b| b.chunks_exact(2).map(|c| [u16le(c), 0, 0, 0]).collect()),
