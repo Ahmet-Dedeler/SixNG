@@ -409,7 +409,7 @@ fn four_layer_detail_uv(fit: &Value) -> Value {
 pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
     // per-layer vec4s (component k = layer k) with the seam agreement found
     const PER_LAYER: &[(&str, &str)] = &[
-        ("c35e27af", "equal across seams 100 % for the same texture (44 % otherwise); values 1.0-1.7: a per-texture factor (tiling or intensity, not decided)"),
+        ("c35e27af", "equal across seams 100 % for the same texture (44 % otherwise); values 0.65-2.0, 1.0 on 108 of 137 layers: a per-texture factor (tiling or intensity, not decided: no correlation with texture brightness or feature size, |r| <= 0.12, and the baked low-detail maps show no detail repeat to measure). As a tiling factor, values where 64 x value is not whole (1.2, 1.3, 1.325, 1.4, 1.6, 0.65) would leave a seam at every 512 m section border, since TEXCOORD_0 restarts there"),
         ("627ce8ae", "99 % / 71 %; values 1 or 2"),
         ("781f7100", "98 % / 10 %; values 0.35-0.75"),
         ("9a4a3781", "92 % / 14 %; values 0-0.175 on some sections, mostly 0.5 or 1.0 on others (parallax or height depth?)"),
