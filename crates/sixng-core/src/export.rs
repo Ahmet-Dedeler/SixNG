@@ -269,6 +269,10 @@ pub struct ExportOptions {
     /// linked to the head, or into the automatic candidates; wraps around.
     #[serde(default)]
     pub head_skin: usize,
+    /// Body colour for car-paint materials (linear RGB 0..1), e.g. a wreck's
+    /// colour from `sixng vehicles`. None = neutral grey stand-in.
+    #[serde(default)]
+    pub paint: Option<[f32; 3]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,6 +851,10 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
                     }
                     if m["classification"]["class"] == "car_paint" {
                         m["paint"] = crate::material::paint_block();
+                        if let Some(c) = o.paint {
+                            m["paint"]["colour"] = serde_json::json!(c);
+                            m["paint"]["colour_source"] = serde_json::json!("--paint (linear RGB, also the glTF baseColorFactor)");
+                        }
                     }
                     m
                 }).collect::<Vec<_>>(),
@@ -1020,6 +1028,16 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
         normal_uri: st.normal.clone(),
         gltf: {
             let mut g = crate::material::gltf_fields(&classify_shader(s, st), st.base.is_some() && !crate::material::is_paint(&s.name_hash));
+            // Lamps, neon, screens: the emissive shaders (`standard_emissive`,
+            // `standard_emissive_layer` …, by recovered name) sit in any
+            // render bucket; their colour map is what lights up.
+            if g["emissiveFactor"].is_null() && crate::names::shader(&s.name_hash).is_some_and(|n| n.contains("emissive")) {
+                g["emissiveFactor"] = serde_json::json!([1.0, 1.0, 1.0]);
+                g["emissiveTexture"] = serde_json::json!("base");
+            }
+            if let (Some(p), true) = (o.paint, crate::material::is_paint(&s.name_hash)) {
+                g["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!([p[0], p[1], p[2], 1.0]);
+            }
             if let (Some(f), false) = (st.base_factor, crate::material::is_paint(&s.name_hash)) {
                 if g["pbrMetallicRoughness"].is_null() {
                     g["pbrMetallicRoughness"] = serde_json::json!({});
@@ -2596,7 +2614,7 @@ mod dictionary_tests {
         let a = ArchiveInfo { id: "levels.rpf".into(), path: work.join("levels.rpf"), size: archive.len() as u64, container: "rpf9".into() };
         fs::write(&a.path, archive).unwrap();
         let o = ExportOptions { out: work.join("out"), png: false, dds: false, raw: false,
-            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0 };
+            force: false, skip_embedded_textures: true, body_shape: vec![], head_skin: 0, paint: None };
         let dir = o.out.join("models/levels").join(export_base_name(&e));
         fs::create_dir_all(&dir).unwrap();
         let marker = dir.join("model.json");

@@ -735,6 +735,7 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
             skip_embedded_textures: false,
             body_shape,
             head_skin: self.head_skin,
+            paint: None,
         };
         self.start_task(
             &format!("Extracting {} entries", idxs.len()),

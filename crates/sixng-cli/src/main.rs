@@ -121,6 +121,11 @@ struct OutArgs {
     /// ethnicity; model.json `head_skin.count` says how many there are.
     #[arg(long, default_value_t = 0)]
     head_skin: usize,
+    /// Body colour of car-paint materials as sRGB hex (RRGGBB, or AARRGGBB
+    /// as `sixng vehicles` lists it; alpha ignored). Without it paint is a
+    /// neutral grey.
+    #[arg(long)]
+    paint: Option<String>,
 }
 
 impl OutArgs {
@@ -141,6 +146,13 @@ impl OutArgs {
                 }
             },
             head_skin: self.head_skin,
+            paint: self.paint.as_deref().map(|p| match sixng_core::material::parse_paint(p) {
+                Some(c) => c,
+                None => {
+                    eprintln!("--paint wants RRGGBB or AARRGGBB hex, got {p:?}");
+                    std::process::exit(2);
+                }
+            }),
         }
     }
 }
@@ -876,7 +888,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let sel: Vec<&sixng_core::scan::Entry> = offs.iter().filter_map(|o| ix.entries.iter().find(|e| e.off == *o)).collect();
             let glb = glb.clone().unwrap_or_else(|| PathBuf::from(format!("{prefix}.glb")));
-            let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: body_shape.clone(), head_skin: *head_skin };
+            let oa = OutArgs { out: glb.parent().map(|p| p.to_path_buf()).unwrap_or_default(), tex: tex.clone(), raw: false, force: true, no_embedded_textures: false, dry_run: false, body_shape: body_shape.clone(), head_skin: *head_skin, paint: None };
             if *anim_only && clip.is_empty() {
                 bail!("--anim-only needs at least one --clip");
             }

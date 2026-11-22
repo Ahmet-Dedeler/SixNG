@@ -361,6 +361,15 @@ pub fn mesh_glb_with(name: &str, groups: &[NodeGroup], materials: &[Material], s
                     }
                 }
             }
+            // "emissiveTexture": "base" = light with the base-colour texture
+            if mat["emissiveTexture"] == "base" {
+                match mat["pbrMetallicRoughness"]["baseColorTexture"].get("index").cloned() {
+                    Some(i) => mat["emissiveTexture"] = json!({"index": i}),
+                    None => {
+                        mat.as_object_mut().unwrap().remove("emissiveTexture");
+                    }
+                }
+            }
             mat
         })
         .collect();

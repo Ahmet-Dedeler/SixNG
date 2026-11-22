@@ -4017,6 +4017,7 @@ pub(crate) fn load_model(
             skip_embedded_textures: false,
             body_shape: Vec::new(),
             head_skin: 0,
+            paint: None,
         };
         let _ = sixng_core::export::export_entry(&a, e, &eo)?;
         add(1, t1);

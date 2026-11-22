@@ -173,10 +173,29 @@ pub fn gltf_fields(c: &Value, has_base: bool) -> Value {
                 m["pbrMetallicRoughness"]["baseColorFactor"] = json!([0.08, 0.09, 0.1, 0.35]);
             }
         }
+        // Lamps, signs, screens: the colour map lights itself. "base" is
+        // resolved by the glTF writer to the base-colour texture (and
+        // dropped when there is none).
+        "emissive" => {
+            m["emissiveFactor"] = json!([1.0, 1.0, 1.0]);
+            m["emissiveTexture"] = json!("base");
+        }
         "water" => m["pbrMetallicRoughness"] = json!({"metallicFactor": 0.0, "roughnessFactor": 0.05, "baseColorFactor": [0.1, 0.2, 0.25, 0.6]}),
         _ => {}
     }
     m
+}
+
+/// `--paint` colour: sRGB hex RRGGBB or AARRGGBB (`#` optional; alpha
+/// ignored) as linear RGB.
+pub fn parse_paint(s: &str) -> Option<[f32; 3]> {
+    let h = s.trim().trim_start_matches('#').trim_start_matches("0x");
+    let v = u32::from_str_radix(h, 16).ok().filter(|_| h.len() == 6 || h.len() == 8)?;
+    let lin = |c: u32| {
+        let x = c as f32 / 255.0;
+        if x <= 0.04045 { x / 12.92 } else { ((x + 0.055) / 1.055).powf(2.4) }
+    };
+    Some([lin((v >> 16) & 0xff), lin((v >> 8) & 0xff), lin(v & 0xff)])
 }
 
 pub fn is_paint(name_hash: &str) -> bool {
@@ -231,4 +250,26 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
         "confidence": {"grouping": "high", "weight_channel": "medium", "uv_layer2": "medium", "uv_base": "low", "data_channels": "unknown"},
         "note": "Derived from texture-size grouping and vertex/UV statistics, not from shader code. Blend: lerp(base, layer2, COLOR0.a), then the overlay by its alpha. Normal maps: DirectX green.",
     }))
+}
+
+#[cfg(test)]
+mod paint_tests {
+    use super::*;
+
+    #[test]
+    fn paint_hex() {
+        assert_eq!(parse_paint("ffffff"), Some([1.0, 1.0, 1.0]));
+        assert_eq!(parse_paint("#ff000000").map(|c| c[0]), Some(0.0));
+        let c = parse_paint("0x00808080").unwrap();
+        assert!((c[0] - 0.2158).abs() < 1e-3);
+        assert_eq!(parse_paint("fff"), None);
+        assert_eq!(parse_paint("zzzzzz"), None);
+    }
+
+    #[test]
+    fn emissive_fields() {
+        let m = gltf_fields(&json!({"class": "emissive", "alpha_mode": "OPAQUE"}), true);
+        assert_eq!(m["emissiveTexture"], "base");
+        assert_eq!(m["emissiveFactor"], json!([1.0, 1.0, 1.0]));
+    }
 }
