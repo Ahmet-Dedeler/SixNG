@@ -23,7 +23,7 @@
 //!   budget.
 use crate::glb;
 use crate::mapbake::{CELL, COARSE, H, W, X0, Y1};
-use crate::render3d::{Camera, GpuModel, Renderer3D};
+use crate::render3d::{Camera, GpuModel, Instance, Renderer3D};
 use eframe::egui_wgpu::{self, wgpu};
 use glam::{Mat4, Vec3, Vec4};
 use std::collections::{HashMap, HashSet};
@@ -39,6 +39,8 @@ const DATA_LEVEL: u8 = 6;
 const N: usize = 64;
 /// Heights sit this far under the surface so placed models win the depth test.
 const SINK: f32 = 1.5;
+/// Ground nodes (coverage pass only) sit this far above the ground estimate.
+const GROUND_LIFT: f32 = 2.0;
 const WATER_Z: f32 = -2.0;
 /// The map tiles' water colour (40, 80, 140 sRGB), linear.
 const SEA: [f32; 4] = [0.021, 0.080, 0.262, 1.0];
@@ -267,7 +269,8 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
             let (c, r) = (c0 + i as i64, r0 + j as i64);
             let raw = lvl.get(c, r);
             inside.push(raw.is_finite() || raw.is_nan());
-            let z = if raw.is_finite() { raw - SINK } else { WATER_Z - SINK };
+            // ground nodes are lifted by GROUND_LIFT when drawn; water stays under the sea plane
+            let z = if raw.is_finite() { raw - SINK } else { WATER_Z - SINK - if k.ground { GROUND_LIFT } else { 0.0 } };
             let hz = |dc: i64, dr: i64| {
                 let v = lvl.get_clamped(c + dc, r + dr);
                 if v.is_finite() { v } else { WATER_Z }
@@ -340,6 +343,10 @@ fn node_model(py: &Pyramids, k: Key, tiles: &PathBuf, tex_keys: &Mutex<HashSet<S
     let base_factor = if base.is_some() { [1.0, 1.0, 1.0, 1.0] } else { SEA };
     let rect = k.rect();
     let centre = gl([(rect[0] + rect[2]) * 0.5, (rect[1] + rect[3]) * 0.5, 0.0]);
+    // counter-clockwise seen from above: the coverage pass culls back faces
+    for t in idx.chunks_exact_mut(3) {
+        t.swap(1, 2);
+    }
     let tris = idx.len() / 3;
     let nv = verts.len();
     let mesh = glb::Mesh { name: format!("world {}/{}/{}", k.l, k.x, k.y), verts, indices: idx, material: Some(0), skinned: false, has_tangents: false, uv_sets: 1, centre };
@@ -505,6 +512,13 @@ impl World {
             let tex = m.images.first().map(|i| i.key.clone()).unwrap_or_default();
             let mut gm = ren.upload_shared(rs, &m, &[], Some(&mut self.tex_cache));
             gm.stencil = 0; // far field: coverage fallbacks may draw over it
+            if k.ground {
+                // Near the camera the ground only fills what the streamed
+                // models leave open: it draws in the coverage pass (pixels no
+                // real surface covers), lifted a little above its estimate
+                // so it also covers ground-level coarse slabs there.
+                ren.set_instances(rs, &mut gm, &[Instance::new(glam::Mat4::from_translation(Vec3::Y * (SINK + GROUND_LIFT)), false).fallback()]);
+            }
             if !tex.is_empty() && self.tex_cache.contains_key(&tex) {
                 *self.tex_refs.entry(tex.clone()).or_insert(0) += 1;
                 self.tex_keys.lock().unwrap().insert(tex.clone());

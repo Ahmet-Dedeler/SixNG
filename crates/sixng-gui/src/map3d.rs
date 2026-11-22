@@ -953,8 +953,12 @@ impl Map3D {
             let wc = gl(centre(e));
             let seen = draw && in_view(wc, rad.min(2000.0));
             acc.keep.insert(e.model);
+            // texture size goes by this distance; SLODs carry whole-area
+            // atlases with few texels per metre, so theirs is to the nearest
+            // edge (inside it: full size), not to the centre
+            let tex_d = if l >= 2 { (dd - rad).max(0.0) } else { dd };
             let nd = acc.near.entry(e.model).or_insert(f32::MAX);
-            *nd = nd.min(dd);
+            *nd = nd.min(tex_d);
             // load order: nearest surface first (size only breaks near-ties,
             // so a big building far off does not beat a prop next to the
             // camera), on screen before off screen, what lies ahead between

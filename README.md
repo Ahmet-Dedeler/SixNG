@@ -521,7 +521,14 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   show as blocks instead of a void; nearer, where buildings or their LODs
   are drawn, a tile switches to ground heights (a morphological opening
   that removes buildings) once at least 90 % of the building and LOD
-  models on it have loaded, so coarse blocks do not swallow the LODs. Built in the background from the map data already in
+  models on it have loaded, so coarse blocks do not swallow the LODs.
+  Ground tiles draw in the coverage pass (only on pixels no real surface
+  covers, so they never cover a street or sidewalk that sits a little
+  lower) and 2 m above the ground estimate, so where the map data has no
+  ground model near the camera, the 2D map's colours show instead of a
+  pale coarse SLOD slab. Coarse SLOD placements near the camera also load
+  their texture atlas at full size (they cover a whole area with few
+  texels per metre). Built in the background from the map data already in
   memory (about 0.3 s); no extra bake. A sea plane fills the rest.
 - Overlays: roads (by speed) and exterior lights (by hour) as lines; a
   draggable **Minimap** window (click to move there) and a **Stream**
