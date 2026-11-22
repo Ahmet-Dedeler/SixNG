@@ -211,6 +211,10 @@ pub fn is_paint(name_hash: &str) -> bool {
 ///   (b217b263 / 1251cae5 / cd8ceb5e / 77d8ab27: {p0 colour, p6 normal,
 ///   p7 data, p9 two-channel} and {p4 colour, p10 normal, p5 data, p2
 ///   two-channel}; 4f0b809b: {p2, p10, p3, p0} and {p7, p4, p5, p9}).
+///   `prop_2lyr_batch` 89c8fe07 (rocks, containers) has the first layout,
+///   and its recovered slot names confirm it (`lyr0diffusetex`,
+///   `lyr0normaltex`, `lyr0materialbtex`, `lyr0materialatex`, `lyr1…`,
+///   `dirtdiffusetex` for the overlay).
 ///   Confidence: high for the grouping.
 /// * COLOR0.a is the only vertex channel painted over the full 0..255 range
 ///   (R is mostly a constant 255, G stays within 0..45, B has a few
@@ -230,19 +234,19 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
             None => json!({"param": p, "png": null, "status": "no texture bound"}),
         }
     };
-    if matches!(name_hash, "61e09df7" | "b21f1ba5" | "360e396b") {
+    if matches!(name_hash, "61e09df7" | "b21f1ba5" | "360e396b" | "27e5c49d") {
         return Some(four_layer(name_hash, &tex));
     }
     // (colour, normal, data, two-channel) for base and layer 2, overlay, extra data
     let (base, l2, overlay, extra): ([usize; 4], [usize; 4], usize, usize) = match name_hash {
-        "b217b263" | "1251cae5" | "cd8ceb5e" | "77d8ab27" => ([0, 6, 7, 9], [4, 10, 5, 2], 8, 11),
+        "b217b263" | "1251cae5" | "cd8ceb5e" | "77d8ab27" | "89c8fe07" => ([0, 6, 7, 9], [4, 10, 5, 2], 8, 11),
         "4f0b809b" => ([2, 10, 3, 0], [7, 4, 5, 9], 6, 11),
         _ => return None,
     };
     let layer = |name: &str, s: [usize; 4], uv: &str, weight: &str| {
         json!({"name": name, "colour": tex(s[0]), "normal": tex(s[1]), "data": tex(s[2]), "two_channel": tex(s[3]), "uv_set": uv, "weight": weight})
     };
-    Some(json!({
+    let mut out = json!({
         "layers": [
             layer("base", base, "TEXCOORD_0", "1 - COLOR0.a"),
             layer("layer2", l2, "TEXCOORD_1", "COLOR0.a"),
@@ -252,7 +256,14 @@ pub fn layers(name_hash: &str, entries: &[Value]) -> Option<Value> {
         "vertex_color_channels": {"r": "unverified: a baked shading term, mostly 255 (dark blobs on ground tiles where trees stand, 23 on average on trees, 252 on interior shaders; does not follow sky visibility from its own or neighbouring placed geometry in ray tests, nor nearby batch trees, grass AO or road distance)", "g": "unverified: equal to r on 63 % of ordinary vertices; low on ground shaders and varies widely within one collision surface, so not a surface-type mask (looks painted per vertex)", "b": "tint palette index (entry within the palette row)", "a": "layer 2 weight"},
         "confidence": {"grouping": "high", "weight_channel": "medium", "uv_layer2": "medium", "uv_base": "low", "data_channels": "unknown"},
         "note": "Derived from texture-size grouping and vertex/UV statistics, not from shader code. Blend: lerp(base, layer2, COLOR0.a), then the overlay by its alpha. Normal maps: DirectX green.",
-    }))
+    });
+    if name_hash == "89c8fe07" {
+        out["prop_2lyr"] = json!({
+            "slot_names": {"p0": "lyr0diffusetex", "p6": "lyr0normaltex", "p7": "lyr0materialbtex", "p9": "lyr0materialatex", "p4": "lyr1diffusetex", "p10": "lyr1normaltex", "p5": "lyr1materialbtex", "p2": "lyr1materialatex", "p8": "dirtdiffusetex", "p1": "tintpalettetex (embedded)", "p11": "unnamed (greyscale mask, containers only)"},
+            "note": "prop_2lyr_batch (rocks, containers, concrete barriers): same slot layout as the multilayer walls. Layer 0 is the unwrapped base (rock chunk atlas, painted metal) on TEXCOORD_0 (checked: rock UV0 triangles fall inside the atlas chunks, UV1 ones do not); layer 1 is a tiling overlay (moss, rust). materialb alpha looks like a height map in both layers (a height blend would sharpen the COLOR0.a weight). Raw COLOR0 on a container is all 1 and on a large rock R is 0/1, G 1, B about 0 and A varies, so A as the layer weight is plausible but unverified here.",
+        });
+    }
+    Some(out)
 }
 
 /// `layers` plus, for the 4-layer ground family, the shader's constants
@@ -309,8 +320,8 @@ pub fn four_layer_params(consts: &[crate::drawable::ShaderConst]) -> Value {
 }
 
 /// The 17-slot 4-layer ground shaders (`standard_uber_4lyr_dpm_dm_hbb`
-/// 61e09df7, `…_pxm_hbb_fixuv1` b21f1ba5, `…_spx_dm_hbb` 360e396b), same
-/// slot layout in all three. Slot names are recovered parameter names
+/// 61e09df7, `…_pxm_hbb_fixuv1` b21f1ba5, `…_spx_dm_hbb` 360e396b,
+/// `…_pxm_hbb_uv3` 27e5c49d), same slot layout in all four. Slot names are recovered parameter names
 /// (`diffusetexture_layer0` …); the unnamed data maps were paired with
 /// their layer by co-occurrence (each data-map hash goes with exactly one
 /// layer's diffuse over 200 materials). Weights: the section-wide
@@ -327,13 +338,17 @@ fn four_layer(name_hash: &str, tex: &dyn Fn(usize) -> Value) -> Value {
         .enumerate()
         .map(|(i, s)| json!({"name": format!("layer{i}"), "colour": tex(s[0]), "normal": tex(s[1]), "data": tex(s[2]), "uv_set": "TEXCOORD_0", "uv_scale": 64.0, "weight": weight[i]}))
         .collect();
-    let alt_uv = if name_hash == "b21f1ba5" { Value::Null } else { json!("TEXCOORD_1") };
+    let alt_uv = match name_hash {
+        "b21f1ba5" => Value::Null,
+        "27e5c49d" => json!("TEXCOORD_2"),
+        _ => json!("TEXCOORD_1"),
+    };
     json!({
         "family": "four_layer",
         "layers": layers,
         "weights": {"texture": tex(2), "uv_set": "TEXCOORD_0", "channels": {"r": "layer0", "g": "layer1", "b": "layer2", "remainder": "layer3"}, "note": "R+G+B <= 1 (BC7 rounding up to 258/255: clamp); the remainder weights layer 3"},
         "macro": {"uv_set": "TEXCOORD_0", "tint": tex(16), "tint_normal": tex(8), "grass_mask": tex(3), "note": "section-wide maps (one 512 m section per texture): colour variation, large-scale normal, grass placement mask"},
-        "detail_uv": {"default": "TEXCOORD_0 * 64 (world-planar, one repeat per 8 m)", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. Per-layer tiling factors sit in the shader's constant block and are not decoded; scale per layer by eye"},
+        "detail_uv": {"default": "TEXCOORD_0 * 64 (world-planar, one repeat per 8 m)", "alt_uv_set": alt_uv, "note": "TEXCOORD_1 (61e09df7, 360e396b) is world-planar / 8 m on flat ground and unwrapped elsewhere (probably slopes); constant on b21f1ba5 ('fixuv1'), so that variant tiles from position. 27e5c49d ('uv3'): TEXCOORD_1 is not a usable UV (spans >1000), TEXCOORD_2 is an unwrap (not world-planar), so the alternative set is TEXCOORD_2 (low confidence). Per-layer tiling factors sit in the shader's constant block and are not decoded; scale per layer by eye"},
         "vertex_color_channels": {"rgb": "unverified: varies 50..230, mean ~155, not weights (does not sum to a constant); baked shading or tint", "a": "always 0"},
         "texcoord_2": "a copy of TEXCOORD_0 on most 61e09df7 primitives, constant elsewhere",
         "height_blend": "the shader names end in hbb (height-based blend): each layer's data map B channel looks like a height map; sharpen the weights by height for the game's look",
@@ -368,6 +383,19 @@ mod paint_tests {
         assert_eq!(l["weights"]["texture"]["png"], "t2.png");
         assert_eq!(l["macro"]["tint"]["png"], "t16.png");
         assert!(layers("b21f1ba5", &entries).unwrap()["detail_uv"]["alt_uv_set"].is_null());
+        assert_eq!(layers("27e5c49d", &entries).unwrap()["detail_uv"]["alt_uv_set"], "TEXCOORD_2");
+    }
+
+    #[test]
+    fn prop_two_layer_slots() {
+        let entries: Vec<Value> = [0usize, 4, 6, 8, 10].iter().map(|&p| json!({"param": p, "png": format!("t{p}.png"), "status": "ok"})).collect();
+        let l = layers("89c8fe07", &entries).unwrap();
+        assert_eq!(l["layers"][0]["colour"]["png"], "t0.png");
+        assert_eq!(l["layers"][0]["normal"]["png"], "t6.png");
+        assert_eq!(l["layers"][1]["colour"]["png"], "t4.png");
+        assert_eq!(l["layers"][1]["normal"]["png"], "t10.png");
+        assert_eq!(l["overlay"]["colour_alpha"]["png"], "t8.png");
+        assert!(l["prop_2lyr"].is_object());
     }
 
     #[test]
