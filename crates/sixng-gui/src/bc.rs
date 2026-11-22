@@ -56,6 +56,70 @@ fn compress_level(w: u32, h: u32, px: &[u8], alpha: bool) -> Vec<u8> {
     out
 }
 
+/// BC3 for every level, whatever the alpha (texture arrays need one format).
+pub fn compress_bc3(mips: &[(u32, u32, Vec<u8>)]) -> Vec<Vec<u8>> {
+    mips.iter().map(|(w, h, px)| compress_level(*w, *h, px, true)).collect()
+}
+
+/// Decode level 0 of a block-compressed image back to RGBA8.
+pub fn decode(bc: &Bc, w: u32, h: u32) -> Vec<u8> {
+    let (w, h) = (w as usize, h as usize);
+    let (bw, bh) = (w.div_ceil(4), h.div_ceil(4));
+    let bb = block_bytes(bc.alpha);
+    let src = match bc.levels.first() {
+        Some(l) if l.len() >= bw * bh * bb => l,
+        _ => return vec![255; w * h * 4],
+    };
+    let mut out = vec![0u8; w * h * 4];
+    for by in 0..bh {
+        for bx in 0..bw {
+            let b = &src[(by * bw + bx) * bb..(by * bw + bx + 1) * bb];
+            let (ab, cb) = if bc.alpha { (Some(&b[..8]), &b[8..]) } else { (None, b) };
+            let c0 = u16::from_le_bytes([cb[0], cb[1]]);
+            let c1 = u16::from_le_bytes([cb[2], cb[3]]);
+            let idx = u32::from_le_bytes([cb[4], cb[5], cb[6], cb[7]]);
+            let (a, b2) = (from565(c0), from565(c1));
+            let four = c0 > c1 || bc.alpha;
+            let pal: [[i32; 4]; 4] = if four {
+                [[a[0], a[1], a[2], 255], [b2[0], b2[1], b2[2], 255], [(2 * a[0] + b2[0]) / 3, (2 * a[1] + b2[1]) / 3, (2 * a[2] + b2[2]) / 3, 255], [(a[0] + 2 * b2[0]) / 3, (a[1] + 2 * b2[1]) / 3, (a[2] + 2 * b2[2]) / 3, 255]]
+            } else {
+                [[a[0], a[1], a[2], 255], [b2[0], b2[1], b2[2], 255], [(a[0] + b2[0]) / 2, (a[1] + b2[1]) / 2, (a[2] + b2[2]) / 2, 255], [0, 0, 0, 0]]
+            };
+            let alphas: Option<[i32; 8]> = ab.map(|ab| {
+                let (a0, a1) = (ab[0] as i32, ab[1] as i32);
+                if a0 > a1 {
+                    [a0, a1, (6 * a0 + a1) / 7, (5 * a0 + 2 * a1) / 7, (4 * a0 + 3 * a1) / 7, (3 * a0 + 4 * a1) / 7, (2 * a0 + 5 * a1) / 7, (a0 + 6 * a1) / 7]
+                } else {
+                    [a0, a1, (4 * a0 + a1) / 5, (3 * a0 + 2 * a1) / 5, (2 * a0 + 3 * a1) / 5, (a0 + 4 * a1) / 5, 0, 255]
+                }
+            });
+            let abits = ab.map(|ab| {
+                let mut v = 0u64;
+                for k in 0..6 {
+                    v |= (ab[2 + k] as u64) << (8 * k);
+                }
+                v
+            });
+            for i in 0..16 {
+                let (x, y) = (bx * 4 + (i & 3), by * 4 + (i >> 2));
+                if x >= w || y >= h {
+                    continue;
+                }
+                let c = pal[((idx >> (2 * i)) & 3) as usize];
+                let o = (y * w + x) * 4;
+                out[o] = c[0] as u8;
+                out[o + 1] = c[1] as u8;
+                out[o + 2] = c[2] as u8;
+                out[o + 3] = match (alphas, abits) {
+                    (Some(al), Some(bits)) => al[((bits >> (3 * i)) & 7) as usize] as u8,
+                    _ => c[3] as u8,
+                };
+            }
+        }
+    }
+    out
+}
+
 fn to565(c: [i32; 3]) -> u16 {
     let r = (c[0].clamp(0, 255) as u32 * 31 + 127) / 255;
     let g = (c[1].clamp(0, 255) as u32 * 63 + 127) / 255;
@@ -147,6 +211,21 @@ mod tests {
             o[i] = pal[((idx >> (2 * i)) & 3) as usize];
         }
         o
+    }
+
+    #[test]
+    fn decode_matches_reference_decoder() {
+        let mut px = Vec::new();
+        for _y in 0..8u32 {
+            for x in 0..8u32 {
+                px.extend_from_slice(&[(x * 32) as u8, (x * 16) as u8, 128, if x < 4 { 255 } else { 40 }]);
+            }
+        }
+        let bc = compress(&[(8, 8, px.clone())]).unwrap();
+        let d = decode(&bc, 8, 8);
+        for (a, b) in d.iter().zip(&px) {
+            assert!((*a as i32 - *b as i32).abs() <= 24);
+        }
     }
 
     #[test]

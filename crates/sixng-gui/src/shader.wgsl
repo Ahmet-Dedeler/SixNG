@@ -325,3 +325,111 @@ fn fs_sky(i: SOut) -> @location(0) vec4<f32> {
     let d = normalize(b.xyz / b.w - a.xyz / a.w);
     return vec4(aces(sky(d) * F.sky_hor.w), 1.0);
 }
+
+// map cells: many placements merged per area (see cells.rs). Base colour
+// only, from a 64 px texture array; each vertex carries its placement's
+// centre and distance range, outside which the placement is dropped.
+@group(1) @binding(0) var t_cell: texture_2d_array<f32>;
+// per placement: centre (cell-local), near; far, unused
+@group(1) @binding(1) var<storage, read> CE: array<vec4<f32>>;
+
+struct CIn {
+    @location(0) pos: vec3<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) nrm: vec4<f32>,
+    @location(3) base: vec4<f32>,
+    @location(4) tint: vec4<f32>,
+    @location(5) le: vec2<u32>,     // texture layer, placement
+    @location(8) origin: vec4<f32>,
+};
+
+struct COut {
+    @builtin(position) clip: vec4<f32>,
+    @location(0) world: vec3<f32>,
+    @location(1) nrm: vec3<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) base: vec4<f32>,
+    @location(4) tint: vec4<f32>,
+    @location(5) @interpolate(flat) lf: vec2<u32>,     // texture layer, flags (alpha mode | class << 2)
+};
+
+@vertex
+fn vs_cell(v: CIn) -> COut {
+    var o: COut;
+    let w = v.pos + v.origin.xyz;
+    let e0 = CE[v.le.y * 2u];
+    let e1 = CE[v.le.y * 2u + 1u];
+    let d = distance(e0.xyz + v.origin.xyz, F.cam_pos.xyz);
+    let k = F.misc3.y;
+    if (d < e0.w * k || d >= e1.x * k) {
+        // outside the placement's range: every vertex of it lands outside
+        // the clip volume, so its triangles are culled
+        o.clip = vec4(2.0, 2.0, 2.0, 1.0);
+        return o;
+    }
+    o.clip = F.view_proj * vec4(w, 1.0);
+    o.world = w;
+    o.nrm = v.nrm.xyz;
+    o.uv = v.uv;
+    o.base = v.base;
+    o.tint = v.tint;
+    o.lf = vec2(v.le.x, u32(round(v.nrm.w * 127.0)));
+    return o;
+}
+
+@fragment
+fn fs_cell(i: COut, @builtin(front_facing) ff: bool) -> @location(0) vec4<f32> {
+    let amode = i.lf.y & 3u;
+    let cls = i.lf.y >> 2u;
+    let base = i.base * textureSample(t_cell, samp, i.uv, i.lf.x);
+    if (amode == 1u && base.a < 0.5) {
+        discard;
+    }
+    var n = normalize(i.nrm + vec3(0.0, 1.0e-4, 0.0));
+    if (!ff) { n = -n; }
+    var albedo = base.rgb;
+    if (F.misc3.x > 0.5) { albedo = albedo * i.tint.rgb; }
+    var alpha = base.a;
+    var rough = 0.75;
+    var emissive = vec3(0.0);
+    if (cls == 5u || cls == 6u) {
+        rough = 0.04;
+        alpha = min(alpha, 0.45);
+    } else if (cls == 8u) {
+        albedo = vec3(0.04, 0.12, 0.16); rough = 0.05; alpha = 0.7;
+    } else if (cls == 7u) {
+        emissive = albedo * F.misc.y;
+    }
+    albedo = albedo * (1.0 - 0.45 * F.misc.x);
+    let v = normalize(F.cam_pos.xyz - i.world);
+    let l = normalize(F.sun_dir.xyz);
+    let h = normalize(v + l);
+    let ndl = max(dot(n, l), 0.0);
+    let ndv = max(dot(n, v), 0.001);
+    let ndh = max(dot(n, h), 0.0);
+    let a2 = rough * rough * rough * rough;
+    let dd = ndh * ndh * (a2 - 1.0) + 1.0;
+    let D = a2 / (3.14159 * dd * dd);
+    let kk = (rough + 1.0) * (rough + 1.0) / 8.0;
+    let G = (ndl / (ndl * (1.0 - kk) + kk)) * (ndv / (ndv * (1.0 - kk) + kk));
+    let f0 = vec3(0.04);
+    let Fr = f0 + (1.0 - f0) * pow(1.0 - max(dot(h, v), 0.0), 5.0);
+    let spec = D * G * Fr / max(4.0 * ndl * ndv, 0.001);
+    let kd = 1.0 - Fr;
+    let direct = (kd * albedo / 3.14159 + spec) * F.sun_col.rgb * F.sun_dir.w * ndl * 3.0;
+    let amb_d = mix(neutral(F.sky_hor.rgb, 0.8) * 0.6, neutral(F.sky_top.rgb, 0.8), n.y * 0.5 + 0.5) * F.misc.w;
+    let fr_v = f0 + (max(vec3(1.0 - rough), f0) - f0) * pow(1.0 - ndv, 5.0);
+    let env = mix(sky(reflect(-v, n)), (F.sky_top.rgb + F.sky_hor.rgb) * 0.5, rough) * F.misc.w;
+    var col = direct + kd * albedo * amb_d + env * fr_v + emissive;
+    let mode = F.mode.x;
+    if (mode == 1u) { col = albedo; }
+    else if (mode == 2u) { return vec4(n * 0.5 + 0.5, 1.0); }
+    let dist = length(F.cam_pos.xyz - i.world);
+    let fog = 1.0 - exp(-dist * F.misc2.x);
+    col = mix(col, neutral(sky(-v), 0.5) * 0.9, fog);
+    if (mode != 1u) {
+        col = aces(col * F.sky_hor.w);
+    }
+    if (amode != 2u && cls != 5u && cls != 6u && cls != 8u) { alpha = 1.0; }
+    return vec4(col, alpha);
+}

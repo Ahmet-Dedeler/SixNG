@@ -332,6 +332,26 @@ pub struct Renderer3D {
     target: Option<Target>,
     /// Draw calls in the last frame.
     pub draws: u32,
+    /// Map cells: opaque, decal, decal blend, blend pipelines.
+    pipe_cell: [wgpu::RenderPipeline; 4],
+    bgl_cell: wgpu::BindGroupLayout,
+    /// Cells to draw this frame, each with the batches that are in range.
+    pub cells: Vec<(std::sync::Arc<CellGpu>, Vec<u16>)>,
+    /// LOD distance scale of the cell ranges (detail setting).
+    pub lod_k: f32,
+}
+
+/// A map cell on the GPU (see cells.rs).
+pub struct CellGpu {
+    pub vb: wgpu::Buffer,
+    pub ib: wgpu::Buffer,
+    /// One instance: the cell origin.
+    pub inst: wgpu::Buffer,
+    pub chunk_bg: Vec<wgpu::BindGroup>,
+    _tex: Vec<wgpu::Texture>,
+    pub batches: Vec<crate::cells::Batch>,
+    pub groups: Vec<crate::cells::Group>,
+    pub bytes: u64,
 }
 
 
@@ -492,7 +512,33 @@ impl Renderer3D {
             ],
         });
         std::mem::forget(wt); // the 1x1 white texture lives for the process
-        Renderer3D { pipe_opaque, pipe_blend, pipe_decal, pipe_decal_blend, decal_bias: true, pipe_wire, pipe_lines, pipe_lines_top, pipe_sky, bgl_frame, bgl_mat, frame_ub, sampler, white, dummy_joints, default_frame_bg, target: None, draws: 0 }
+        // map cells
+        let bgl_cell = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cell"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension: wgpu::TextureViewDimension::D2Array, multisampled: false },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::VERTEX, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let layout_cell = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("cell"), bind_group_layouts: &[&bgl_frame, &bgl_cell], push_constant_ranges: &[] });
+        let cattrs = wgpu::vertex_attr_array![0 => Float32x3, 1 => Float16x2, 2 => Snorm8x4, 3 => Unorm8x4, 4 => Unorm8x4, 5 => Uint16x2];
+        let ciattrs = wgpu::vertex_attr_array![8 => Float32x4];
+        let cbufs = [
+            wgpu::VertexBufferLayout { array_stride: std::mem::size_of::<crate::cells::CellV>() as u64, step_mode: wgpu::VertexStepMode::Vertex, attributes: &cattrs },
+            wgpu::VertexBufferLayout { array_stride: 16, step_mode: wgpu::VertexStepMode::Instance, attributes: &ciattrs },
+        ];
+        let pipe_cell = [
+            mk("cell opaque", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, None, depth(true, wgpu::CompareFunction::Greater)),
+            mk("cell decal", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, None, biased(true)),
+            mk("cell decal blend", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, Some(wgpu::BlendState::ALPHA_BLENDING), biased(false)),
+            mk("cell blend", &layout_cell, "vs_cell", "fs_cell", &cbufs, wgpu::PrimitiveTopology::TriangleList, Some(wgpu::BlendState::ALPHA_BLENDING), depth(false, wgpu::CompareFunction::Greater)),
+        ];
+        Renderer3D { pipe_opaque, pipe_blend, pipe_decal, pipe_decal_blend, decal_bias: true, pipe_wire, pipe_lines, pipe_lines_top, pipe_sky, bgl_frame, bgl_mat, frame_ub, sampler, white, dummy_joints, default_frame_bg, target: None, draws: 0, pipe_cell, bgl_cell, cells: Vec::new(), lod_k: 1.0 }
     }
 
     /// Upload a CPU model (meshes, materials, textures, skeleton).
@@ -522,7 +568,7 @@ impl Renderer3D {
     /// What uploading needs, for loader threads (wgpu objects can be made on
     /// any thread).
     pub fn uploader(&self) -> Uploader {
-        Uploader { bgl_mat: self.bgl_mat.clone(), bgl_frame: self.bgl_frame.clone(), frame_ub: self.frame_ub.clone(), sampler: self.sampler.clone(), white: self.white.clone() }
+        Uploader { bgl_mat: self.bgl_mat.clone(), bgl_frame: self.bgl_frame.clone(), frame_ub: self.frame_ub.clone(), sampler: self.sampler.clone(), white: self.white.clone(), bgl_cell: self.bgl_cell.clone() }
     }
 }
 
@@ -542,9 +588,54 @@ pub struct Uploader {
     frame_ub: wgpu::Buffer,
     sampler: wgpu::Sampler,
     white: wgpu::TextureView,
+    bgl_cell: wgpu::BindGroupLayout,
 }
 
 impl Uploader {
+    /// Upload a map cell: geometry, origin and its BC3 texture arrays.
+    pub fn upload_cell(&self, device: &wgpu::Device, queue: &wgpu::Queue, c: &crate::cells::CellCpu) -> CellGpu {
+        use crate::cells::{mip_bytes, LAYER_MIPS, LAYER_PX};
+        let vb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cell vb"), contents: if c.verts.is_empty() { &[0u8; 32] } else { bytemuck::cast_slice(&c.verts) }, usage: wgpu::BufferUsages::VERTEX });
+        let eb = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cell ents"), contents: if c.ents.is_empty() { &[0u8; 32] } else { bytemuck::cast_slice(&c.ents) }, usage: wgpu::BufferUsages::STORAGE });
+        let ib = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cell ib"), contents: if c.indices.is_empty() { &[0u8; 4] } else { bytemuck::cast_slice(&c.indices) }, usage: wgpu::BufferUsages::INDEX });
+        let o = [c.origin[0], c.origin[1], c.origin[2], 0.0f32];
+        let inst = device.create_buffer_init(&wgpu::util::BufferInitDescriptor { label: Some("cell origin"), contents: bytemuck::cast_slice(&o), usage: wgpu::BufferUsages::VERTEX });
+        let mut tex = Vec::new();
+        let mut chunk_bg = Vec::new();
+        let mut bytes = (c.verts.len() * std::mem::size_of::<crate::cells::CellV>() + c.indices.len() * 4 + c.ents.len() * 32) as u64;
+        for ch in &c.chunks {
+            let t = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("cell tex"),
+                size: wgpu::Extent3d { width: LAYER_PX, height: LAYER_PX, depth_or_array_layers: ch.layers },
+                mip_level_count: LAYER_MIPS,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Bc3RgbaUnormSrgb,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let mut off = 0usize;
+            for l in 0..LAYER_MIPS {
+                let n = mip_bytes(l) * ch.layers as usize;
+                let bw = ((LAYER_PX >> l).max(1)).div_ceil(4);
+                if let Some(data) = ch.data.get(off..off + n) {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo { texture: &t, mip_level: l, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        data,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bw * 16), rows_per_image: Some(bw) },
+                        wgpu::Extent3d { width: bw * 4, height: bw * 4, depth_or_array_layers: ch.layers },
+                    );
+                }
+                off += n;
+            }
+            bytes += ch.data.len() as u64;
+            let view = t.create_view(&wgpu::TextureViewDescriptor { dimension: Some(wgpu::TextureViewDimension::D2Array), ..Default::default() });
+            chunk_bg.push(device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some("cell bg"), layout: &self.bgl_cell, entries: &[wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) }, wgpu::BindGroupEntry { binding: 1, resource: eb.as_entire_binding() }] }));
+            tex.push(t);
+        }
+        CellGpu { vb, ib, inst, chunk_bg, _tex: tex, batches: c.batches.clone(), groups: c.groups.clone(), bytes }
+    }
+
     /// Upload a model; `get_tex` gives each image's texture (shared or new).
     pub fn upload_with(&self, device: &wgpu::Device, queue: &wgpu::Queue, m: &glb::Model, overrides: &[Option<[f32; 4]>], get_tex: &mut dyn FnMut(&glb::Image) -> Option<wgpu::Texture>) -> GpuModel {
         let mut textures: Vec<wgpu::Texture> = Vec::new();
@@ -749,7 +840,7 @@ impl Renderer3D {
             paint2: [look.pearl[0], look.pearl[1], look.pearl[2], look.pearl_amount],
             misc: [look.wet, look.emissive, time, look.ambient],
             misc2: [look.fog, look.paint2nd[0], look.paint2nd[1], look.paint2nd[2]],
-            misc3: [look.tint as u32 as f32, 0.0, 0.0, 0.0],
+            misc3: [look.tint as u32 as f32, self.lod_k, 0.0, 0.0],
         }
     }
 
@@ -806,6 +897,36 @@ impl Renderer3D {
         n
     }
 
+    /// Draw the cell batches of one pass (see `cells::PASS_*`).
+    fn draw_cells(pass: &mut wgpu::RenderPass<'_>, pipe: &wgpu::RenderPipeline, fbg: &wgpu::BindGroup, cells: &[(std::sync::Arc<CellGpu>, Vec<u16>)], which: u8) -> u32 {
+        let mut n = 0;
+        let mut set = false;
+        for (c, active) in cells {
+            let mut bound = false;
+            for &bi in active {
+                let Some(b) = c.batches.get(bi as usize) else { continue };
+                if b.pass != which || b.count == 0 {
+                    continue;
+                }
+                if !set {
+                    pass.set_pipeline(pipe);
+                    pass.set_bind_group(0, fbg, &[]);
+                    set = true;
+                }
+                if !bound {
+                    pass.set_vertex_buffer(0, c.vb.slice(..));
+                    pass.set_vertex_buffer(1, c.inst.slice(..));
+                    pass.set_index_buffer(c.ib.slice(..), wgpu::IndexFormat::Uint32);
+                    bound = true;
+                }
+                pass.set_bind_group(1, &c.chunk_bg[b.chunk as usize], &[]);
+                pass.draw_indexed(b.first..b.first + b.count, 0, 0..1);
+                n += 1;
+            }
+        }
+        n
+    }
+
     pub fn render(&mut self, rs: &egui_wgpu::RenderState, size: [u32; 2], cam: &Camera, look: &Look, models: &[&GpuModel], lines: &[LineV], lines_on_top: &[LineV]) -> egui::TextureId {
         let t_r = std::time::Instant::now();
         let size = [size[0].max(16), size[1].max(16)];
@@ -842,6 +963,14 @@ impl Renderer3D {
             // no render bundles: wgpu 24 never frees a bundle, and with it
             // everything it draws (evicted models stayed in GPU memory)
             draws += Self::record_opaque(&self.pipe_opaque, &self.default_frame_bg, self.decal_bias, &mut pass, models, look.mode);
+            draws += Self::draw_cells(&mut pass, &self.pipe_cell[0], &self.default_frame_bg, &self.cells, crate::cells::PASS_OPAQUE);
+            if self.decal_bias {
+                draws += Self::draw_cells(&mut pass, &self.pipe_cell[1], &self.default_frame_bg, &self.cells, crate::cells::PASS_DECAL);
+                draws += Self::draw_cells(&mut pass, &self.pipe_cell[2], &self.default_frame_bg, &self.cells, crate::cells::PASS_DECAL_BLEND);
+            }
+            if look.mode == 0 {
+                draws += Self::draw_cells(&mut pass, &self.pipe_cell[3], &self.default_frame_bg, &self.cells, crate::cells::PASS_BLEND);
+            }
             // decals: after all opaque surfaces, by layer order; opaque-mode
             // decals (terrain blend layers) write depth, blended ones do not
             if self.decal_bias {

@@ -451,6 +451,29 @@ baked map (`entities.bin`; bake first with `--bake-map`):
   hand-offs do not open holes. A child already drawn stays out to 1.5×
   its distance while its parent's model is still loading. Eviction runs
   in 3 ms slices, not in one burst.
+- **Map cells** (far placements merged per area): a placement more than
+  0.6× the HD distance from the camera can be drawn from its cell instead
+  of one by one. A cell holds one LOD level's placements in one square of
+  the map (128 m for HD, 256 m for LOD, 512–2048 m for SLOD1–4), merged
+  into a few batches with one draw each:
+  - geometry is placed in the cell, from the low drawable LOD where a model
+    has one, and simplified by vertex clustering to about two pixels at
+    the nearest distance the cell draws it;
+  - base-colour textures go in at 64 px, in BC3 texture arrays;
+  - each vertex carries its placement's index. The vertex shader checks
+    that placement's own LOD distance range, so LOD hand-offs stay per
+    placement.
+
+  Built cells are cached in `<work>/gui_cache_v4/cells` (capped at 4 GB),
+  so a revisited area loads with one file read per cell. Until a cell has
+  loaded, its placements load and draw one by one as before. A cell the
+  camera comes close to keeps drawing until its placements' models have
+  loaded. LOD and SLOD cells are small and built on demand. HD cells are
+  the heavy ones (a downtown HD cell is several MB), so new ones are only
+  built while the camera is slow (under 15 m/s); while flying, only HD
+  cells already on disk are used. Cells need BC textures and the default
+  view settings (every kind and LOD level, no proxies);
+  `SIXNG_MAP_NO_CELLS=1` turns them off.
 - **Texture streaming**: a model first loads with 64 px base-colour
   textures only (normal and data maps come with the sharper reload), read
   from block-compressed 64 px copies in `<work>/gui_cache_v4/bc64` (a few

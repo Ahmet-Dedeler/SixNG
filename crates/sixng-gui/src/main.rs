@@ -15,6 +15,8 @@ mod assemble;
 mod map2d;
 mod map3d;
 mod bc;
+mod cells;
+mod map_cells;
 mod world3d;
 mod mem;
 

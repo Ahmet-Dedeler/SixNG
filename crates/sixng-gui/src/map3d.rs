@@ -8,8 +8,9 @@
 //! by the density setting, anything smaller than the screen-size cut (raised
 //! automatically to stay in the triangle and draw-call budget) and anything
 //! outside the (widened) view frustum, and draws one GPU model per placed
-//! model id with all its instances; the opaque draws are recorded once into
-//! a render bundle and replayed while the set stays the same.
+//! model id with all its instances. Beyond the near ring, placements can
+//! instead come from map cells (`map_cells`): one LOD level's placements in
+//! one square of the map, merged into a few draws.
 //!
 //! Models are exported on demand into `work/gui_cache` (same cache as the
 //! model viewer) by worker threads, on-screen, big and near first, and
@@ -257,6 +258,8 @@ pub struct Map3D {
     last_proxies: bool,
     frame: u64,
     dirty: bool,
+    /// Run the visibility pass again next frame (a cell handover ended).
+    dirty_next: bool,
     stats: Stats,
     picked: Option<u32>,
     lines_cache: Option<(Vec3, f32, bool, bool, Vec<LineV>, Vec<LineV>)>,
@@ -295,6 +298,9 @@ pub struct Map3D {
     gpu_real: (u64, u64),
     /// Slowest single uploads: (ms, upload ms, replace+drop ms, geometry bytes, texture bytes, meshes, materials, images).
     slow_uploads: Vec<(f32, f32, f32, usize, usize, usize, usize, usize)>,
+    /// Placements beyond the near ring, merged per area (map_cells).
+    cells: crate::map_cells::Cells,
+    children_arc: Arc<Vec<u32>>,
 }
 
 /// Seconds of camera motion to load ahead, and the cap on that distance (m).
@@ -321,6 +327,10 @@ struct VisAcc {
     handoffs: usize,
     hidden: usize,
     grace: Vec<u32>,
+    /// Per handing-over cell: placements in range not loaded yet.
+    pend: HashMap<u32, u32>,
+    /// Placements drawn by their cell.
+    in_cells: usize,
 }
 
 impl VisAcc {
@@ -349,6 +359,10 @@ impl VisAcc {
         a.handoffs += b.handoffs;
         a.hidden += b.hidden;
         a.grace.extend(b.grace);
+        for (c, n) in b.pend {
+            *a.pend.entry(c).or_insert(0) += n;
+        }
+        a.in_cells += b.in_cells;
         a
     }
 }
@@ -387,6 +401,8 @@ struct Stats {
     /// Visibility update, cumulative ms: walk, bookkeeping; then evict ms.
     upd_parts: [f32; 2],
     evict_ms: f32,
+    /// Placements drawn by map cells.
+    in_cells: usize,
 }
 
 impl Map3D {
@@ -456,6 +472,7 @@ impl Map3D {
             last_proxies: false,
             frame: 0,
             dirty: true,
+            dirty_next: false,
             stats: Stats::default(),
             picked: None,
             lines_cache: None,
@@ -482,6 +499,8 @@ impl Map3D {
             gpu_shared0: None,
             gpu_cap: None,
             gpu_real: (0, 0),
+            cells: crate::map_cells::Cells::new(),
+            children_arc: Arc::new(Vec::new()),
         };
         m.set_quality(2);
         m
@@ -696,6 +715,7 @@ impl Map3D {
         buckets.sort_by_key(|b| (b.level, b.dist, b.size));
         eprintln!("[map3d] {} entity buckets in {:.0} ms", buckets.len(), t0.elapsed().as_secs_f32() * 1000.0);
         self.buckets = buckets;
+        self.children_arc = Arc::new(count.clone());
         self.children_start = count;
         self.children_list = list;
     }
@@ -763,6 +783,19 @@ impl Map3D {
         let cam_eye = self.cam.eye();
         let cam_fwd = self.cam.forward();
         let in_view = |c: Vec3, r: f32| -> bool { (c - cam_eye).dot(cam_fwd) > -r && planes.iter().all(|p| p.truncate().dot(c) + p.w >= -r) };
+        // map cells: which draw beyond the near ring (default view settings only)
+        if let Some(data_arc) = self.data.clone() {
+            let seen = |r: [f32; 4]| -> bool {
+                let c = gl([(r[0] + r[2]) * 0.5, (r[1] + r[3]) * 0.5, eye[2]]);
+                in_view(c, (r[2] - r[0]) * 0.75 + 200.0)
+            };
+            let cs = self.children_arc.clone();
+            let moving = self.vel.length() > 15.0;
+            self.cells.update(&data_arc, &cs, d, &self.work, eye, moving, &seen);
+        }
+        let cells = self.cells.view();
+        // drawn by its cell (counts as loaded for the LOD hand-off)
+        let by_cell = |i: u32| matches!(cells.use_of(i), crate::map_cells::USE_CELL | crate::map_cells::USE_HANDOVER);
         let min_size = d.min_size * self.size_boost;
         let prev = &self.prev_drawn;
         let retire = &self.retire;
@@ -794,7 +827,7 @@ impl Map3D {
                             // the parent is drawn instead; until it has
                             // loaded, a child already on screen stays a
                             // little further out
-                            if ready(p.model) || !(prev.contains(&i) && ready(e.model)) {
+                            if ready(p.model) || by_cell(e.parent) || !(prev.contains(&i) && ready(e.model)) {
                                 return 2;
                             }
                             lim *= 1.5;
@@ -811,7 +844,7 @@ impl Map3D {
                     // hand over only when every drawable child is loaded
                     let all = cl[cs[i as usize] as usize..cs[i as usize + 1] as usize].iter().all(|&c| {
                         let ce = &data.ents[c as usize];
-                        !drawable(ce) || cache.contains_key(&ce.model)
+                        !drawable(ce) || cache.contains_key(&ce.model) || by_cell(c)
                     });
                     if all {
                         return 2;
@@ -837,6 +870,11 @@ impl Map3D {
                 if e.rflags & RF_HIDE != 0 && !data.name(e.model).is_empty() {
                     acc.hidden += 1;
                 }
+                return;
+            }
+            let cu = cells.use_of(i);
+            if cu == crate::map_cells::USE_CELL {
+                acc.in_cells += 1;
                 return;
             }
             let l = e.lod.min(5) as usize;
@@ -876,6 +914,13 @@ impl Map3D {
             };
             if dens < 1.0 && (hash32(i) as f32 / u32::MAX as f32) > dens {
                 return;
+            }
+            if cu == crate::map_cells::USE_HANDOVER {
+                // the cell still draws it while its model loads
+                draw = false;
+                if !ready(e.model) {
+                    *acc.pend.entry(cells.cell_of(i)).or_insert(0) += 1;
+                }
             }
             let wc = gl(centre(e));
             let seen = draw && in_view(wc, rad.min(2000.0));
@@ -920,7 +965,11 @@ impl Map3D {
             })
             .reduce(VisAcc::default, VisAcc::merge);
         self.stats.upd_parts[0] = t0.elapsed().as_secs_f32() * 1000.0;
-        let VisAcc { want, prio, near, visible, per_band, n_ent, keep, visited, handoffs, hidden, grace } = acc;
+        let VisAcc { want, prio, near, visible, per_band, n_ent, keep, visited, handoffs, hidden, grace, pend, in_cells } = acc;
+        if self.cells.after_pass(&pend) {
+            self.dirty_next = true;
+        }
+        self.stats.in_cells = in_cells;
         // grace clocks: start for new ones, forget the rest
         let now = Instant::now();
         let mut retire_new = HashMap::with_capacity(grace.len());
@@ -1352,7 +1401,21 @@ impl Map3D {
             eprintln!("[map3d] block-compressed textures: {}", if bc { "on" } else { "off" });
         }
         let gpu = Gpu { device: rs.device.clone(), queue: rs.queue.clone(), up: self.renderer.as_ref().unwrap().uploader() };
+        self.cells.start(gpu.device.clone(), gpu.queue.clone(), gpu.up.clone(), &self.game, &self.work);
         self.start_workers(gpu);
+        // cells only with the default view settings (they bake those in)
+        let cells_on = self.shared.bc.load(Ordering::Relaxed) && self.kinds.iter().all(|&k| k) && self.lods.iter().all(|&l| l) && !self.show_proxies && std::env::var_os("SIXNG_MAP_NO_CELLS").is_none();
+        if cells_on != self.cells.on {
+            self.cells.on = cells_on;
+            self.dirty = true;
+        }
+        if self.dirty_next {
+            self.dirty_next = false;
+            self.dirty = true;
+        }
+        if self.cells.poll() {
+            self.dirty = true;
+        }
         // side panel
         egui::SidePanel::right("map3d_side").resizable(true).default_width(300.0).show_inside(ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| self.side_ui(ui));
@@ -1521,8 +1584,23 @@ impl Map3D {
         let mut look = self.look.clone();
         let alt = (er[2] - data.height(er[0], er[1]).unwrap_or(0.0)).max(1.0);
         look.fog *= (400.0 / (alt + 400.0)).min(1.0);
+        let lod_k = self.detail.radii[0] / 330.0;
+        let cell_list = if self.cells.on {
+            let aspect = self.size[0] as f32 / self.size[1].max(1) as f32;
+            let vp = self.cam.proj(aspect) * self.cam.view();
+            let planes: Vec<glam::Vec4> = [vp.row(3) + vp.row(0), vp.row(3) - vp.row(0), vp.row(3) + vp.row(1), vp.row(3) - vp.row(1)].iter().map(|p| *p / p.truncate().length().max(1e-6)).collect();
+            let in_view = |lo: Vec3, hi: Vec3| -> bool {
+                let (c, r) = ((lo + hi) * 0.5, (hi - lo).length() * 0.5);
+                planes.iter().all(|p| p.truncate().dot(c) + p.w >= -r)
+            };
+            self.cells.draw_list(self.cam.eye(), lod_k, &in_view)
+        } else {
+            Vec::new()
+        };
         let ren = self.renderer.as_mut().unwrap();
         ren.decal_bias = self.decal_bias;
+        ren.cells = cell_list;
+        ren.lod_k = lod_k;
         let tr = Instant::now();
         let tid = ren.render(rs, px, &self.cam, &look, &models, &under, &top);
         self.stats.render_ms = tr.elapsed().as_secs_f32() * 1000.0;
@@ -1935,6 +2013,7 @@ impl Map3D {
                     format!("{} {} {}", r[0].swap(0, Ordering::Relaxed) / n, r[1].swap(0, Ordering::Relaxed) / n, r[2].swap(0, Ordering::Relaxed) / n).replace(' ', "|")
                 }
             );
+            let line = format!("{line} | draws {} | {} ({} placements)", self.stats.draws, self.cells.summary(), self.stats.in_cells);
             eprintln!("{line}");
         }
         if self.perf.near_s.is_none() && self.frame > 5 && !self.want.is_empty() && self.want.keys().all(|m| self.near_dist.get(m).map_or(true, |&d| d >= 250.0) || self.cache.contains_key(m)) {
@@ -2063,7 +2142,7 @@ impl Map3D {
                 }
             }
         }
-        b + self.world.stats.gpu_bytes
+        b + self.world.stats.gpu_bytes + self.cells.bytes
     }
 
     /// One line to stderr and `<work>/map3d_perf.log`.
@@ -2105,6 +2184,7 @@ impl Map3D {
             glb::TEX_T[3].load(Ordering::Relaxed) as f32 / 1024.0 / glb::TEX_T[1].load(Ordering::Relaxed).max(1) as f32,
             glb::TEX_T[4].load(Ordering::Relaxed) as f32 / 1000.0 / LOAD_T[3].load(Ordering::Relaxed).max(1) as f32
         );
+        let line = format!("{line} | {} ({} placements)", self.cells.summary(), self.stats.in_cells);
         eprintln!("{line}");
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(Path::new(&self.work).join("map3d_perf.log")) {
             use std::io::Write;
@@ -2263,7 +2343,7 @@ impl Bucket {
     }
 }
 
-fn hash32(i: u32) -> u32 {
+pub(crate) fn hash32(i: u32) -> u32 {
     let mut x = i.wrapping_mul(0x9E37_79B9) ^ 0x85EB_CA6B;
     x ^= x >> 16;
     x = x.wrapping_mul(0x7FEB_352D);
@@ -2279,8 +2359,8 @@ static LOAD_T: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::A
 /// Archive id -> (entry offset -> entry index), built once per archive.
 /// Also caches resolved archives (name -> info): resolving lists the game
 /// folder each time.
-type OffMaps = Arc<Mutex<HashMap<String, Arc<HashMap<u64, usize>>>>>;
-type ArcCache = Arc<Mutex<HashMap<String, (sixng_core::game::ArchiveInfo, Arc<ArchiveIndex>)>>>;
+pub(crate) type OffMaps = Arc<Mutex<HashMap<String, Arc<HashMap<u64, usize>>>>>;
+pub(crate) type ArcCache = Arc<Mutex<HashMap<String, (sixng_core::game::ArchiveInfo, Arc<ArchiveIndex>)>>>;
 
 /// Merge the meshes of a model that share a material (and are not skinned)
 /// into one, so each material is one draw call.
@@ -2317,7 +2397,7 @@ fn merge_meshes(mut m: glb::Model) -> glb::Model {
     m
 }
 
-fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opts: &glb::LoadOpts, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>, offs: &OffMaps, arcs: &ArcCache) -> anyhow::Result<glb::Model> {
+pub(crate) fn load_model(ws: &Workspace, cache: &Path, id: &str, lod: usize, opts: &glb::LoadOpts, idx: &Arc<Mutex<HashMap<String, Arc<ArchiveIndex>>>>, offs: &OffMaps, arcs: &ArcCache) -> anyhow::Result<glb::Model> {
     let t0 = Instant::now();
     let add = |k: usize, t: Instant| LOAD_T[k].fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     let (archive, off) = id.split_once('@').ok_or_else(|| anyhow::anyhow!("bad model id {id}"))?;
