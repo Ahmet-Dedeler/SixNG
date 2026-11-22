@@ -67,6 +67,11 @@ pub struct TtpfTex {
     /// field does not fit (see `Ttpf::open`); `mips()` prefers it.
     #[serde(skip)]
     pub mips_fixed: Option<u32>,
+    /// 2-byte SW_4KB_S array stored at twice its size: each 4 KiB block
+    /// holds 32x32 elements in a different order, with 1 KiB unused after
+    /// every 1 KiB (see `gfx10::untile_split_2b`). Set by `fix_mip_counts`.
+    #[serde(skip)]
+    pub split_2b: bool,
 }
 
 pub struct Ttpf {
@@ -106,12 +111,15 @@ fn decode_bc1(comp: &[u8], blocks: usize) -> Option<Vec<u8>> {
 /// does not reach the next texture and exactly one mip count does, that
 /// count is used. 2D textures and arrays (tile modes 0-3); checked as mip
 /// n+1 = mip n downsampled.
-fn fix_mip_counts(textures: &mut [TtpfTex]) {
+fn fix_mip_counts(textures: &mut [TtpfTex], end: Option<u64>) {
     let mut order: Vec<usize> = (0..textures.len()).collect();
     order.sort_by_key(|&i| textures[i].virt);
-    for w in order.windows(2) {
-        let (i, n) = (w[0], w[1]);
-        let gap = textures[n].virt - textures[i].virt;
+    // (texture, bytes up to the next one, whether that is the store end)
+    let mut spans: Vec<(usize, u64, bool)> = order.windows(2).map(|w| (w[0], textures[w[1]].virt - textures[w[0]].virt, false)).collect();
+    if let (Some(&last), Some(end)) = (order.last(), end) {
+        spans.push((last, end.saturating_sub(textures[last].virt), true));
+    }
+    for (i, gap, at_end) in spans {
         let t = &textures[i];
         if gap == t.size || t.tile_mode() > 3 {
             continue;
@@ -123,9 +131,18 @@ fn fix_mip_counts(textures: &mut [TtpfTex]) {
         let fits: Vec<u32> = (1..=full)
             .filter(|&m| crate::gfx10::Layout::new(sw, t.width.div_ceil(bd), t.height.div_ceil(bd), m, fmt.bytes_per_elem()).is_some_and(|l| l.with_slices(t.slices()).total == gap))
             .collect();
-        if let [m] = fits[..] {
+        if let ([m], false) = (&fits[..], at_end) {
+            let m = *m;
             let t = &mut textures[i];
             t.mips_fixed = Some(m);
+            t.size = gap;
+        } else if fits.len() != 1 && fmt.bytes_per_elem() == 2 && sw == crate::gfx10::Swizzle::S4K && t.slices() > 1 && gap == crate::gfx10::split_2b_slice_size(t.width, t.height) as u64 * t.slices() as u64 {
+            // One mip, every other KiB unused (one R16F array). The span also
+            // fits 4-9 mips, but those would put mip 0 (stored last) on the
+            // unused KiBs, and the image comes out smooth this way.
+            let t = &mut textures[i];
+            t.mips_fixed = Some(1);
+            t.split_2b = true;
             t.size = gap;
         }
     }
@@ -186,6 +203,7 @@ impl Ttpf {
                 loc,
                 cube_base: None,
                 mips_fixed: None,
+                split_2b: false,
             });
         }
         for t in textures.iter_mut() {
@@ -197,7 +215,7 @@ impl Ttpf {
             }
             t.size = t.layout().map(|l| l.total).unwrap_or(0);
         }
-        fix_mip_counts(&mut textures);
+        fix_mip_counts(&mut textures, Some(virt_size));
         let by_hash = textures.iter().enumerate().map(|(i, t)| (t.hash, i)).collect();
         Ok(Ttpf { path: path.to_path_buf(), chunks, virt_size, textures, by_hash })
     }
@@ -409,7 +427,7 @@ pub fn decode_rgba_slice(t: &TtpfTex, data: &[u8], m: u32, sl: u32) -> Result<(V
     if sl >= l.slices {
         return Err(anyhow!("slice {sl} out of range ({} slices)", l.slices));
     }
-    let lin = l.untile_slice(data, m as usize, sl);
+    let lin = if t.split_2b { crate::gfx10::untile_split_2b(data, t.width, t.height, sl) } else { l.untile_slice(data, m as usize, sl) };
     Ok((tx::to_rgba(fmt, &lin, mw, mh)?, mw, mh))
 }
 
@@ -551,7 +569,7 @@ mod tests {
     use super::*;
 
     fn tex(d0: u32, d1: u32, virt: u64) -> TtpfTex {
-        let mut t = TtpfTex { hash: virt, width: (d0 & 0x3FFF) + 1, height: ((d0 >> 14) & 0x3FFF) + 1, dxgi_format: (d1 >> 3) & 0x7F, virt, size: 0, d0, d1, loc: 0, cube_base: None, mips_fixed: None };
+        let mut t = TtpfTex { hash: virt, width: (d0 & 0x3FFF) + 1, height: ((d0 >> 14) & 0x3FFF) + 1, dxgi_format: (d1 >> 3) & 0x7F, virt, size: 0, d0, d1, loc: 0, cube_base: None, mips_fixed: None, split_2b: false };
         t.size = t.layout().map(|l| l.total).unwrap_or(0);
         t
     }
@@ -562,7 +580,7 @@ mod tests {
         // followed by the next texture 688128 bytes later = 3 mips.
         let mut v = vec![tex(0x00ffc3ff, 0x0120023b, 0x1000), tex(0x00ffc3ff, 0x0120023b, 0x1000 + 688128)];
         assert_eq!(v[0].mips(), 1);
-        fix_mip_counts(&mut v);
+        fix_mip_counts(&mut v, None);
         assert_eq!((v[0].mips(), v[0].size), (3, 688128));
         // the last texture has no neighbour and keeps the descriptor count
         assert_eq!(v[1].mips_fixed, None);

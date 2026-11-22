@@ -13,7 +13,8 @@
 //! `SW_4KB_S` (mip n+1 equals mip n downsampled, every format checked;
 //! 1-byte elements (A8 / R8) added 2026-11-21, checked the same way; 4-byte
 //! elements checked by mip consistency (mode 0) and by eye (mode 1), 2-byte
-//! elements by image smoothness on R16F textures).
+//! elements by image smoothness on R16F textures). One R16F array uses
+//! its own order with every other KiB unused (`untile_split_2b`).
 
 /// Element-coordinate bit order inside a block, low bit first:
 /// (is_x, coordinate bit).
@@ -44,6 +45,40 @@ pub enum Swizzle {
     S4K,
     /// SW_64KB_D
     D64K,
+}
+
+/// Element order of the 2-byte arrays stored at twice their size (one R16F
+/// array, `fd954c597b21d41c`): address bits 1-9 and 11 of a 4 KiB block of
+/// 32x32 elements; bit 10 is always 0, so every other KiB is unused. Found
+/// by brute force over monotone interleavings, scored by smoothness (half
+/// the error of the regular 2-byte order, which splits the image at x=128).
+/// (is_x, coordinate bit, address bit).
+const SPLIT_2B: [(bool, u32, u32); 10] = [(true, 0, 1), (false, 0, 2), (false, 1, 3), (true, 1, 4), (false, 2, 5), (true, 2, 6), (true, 3, 7), (false, 3, 8), (true, 4, 9), (false, 4, 11)];
+
+/// Bytes per slice of a split 2-byte array.
+pub fn split_2b_slice_size(w: u32, h: u32) -> u32 {
+    w.div_ceil(32) * h.div_ceil(32) * 4096
+}
+
+/// Linear elements of slice `sl` of a split 2-byte array (one mip).
+pub fn untile_split_2b(src: &[u8], w: u32, h: u32, sl: u32) -> Vec<u8> {
+    let base = (sl * split_2b_slice_size(w, h)) as usize;
+    let bx = w.div_ceil(32);
+    let mut out = vec![0u8; (w * h * 2) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let mut a = ((y / 32) * bx + x / 32) as usize * 4096;
+            for &(ax, k, bit) in &SPLIT_2B {
+                let v = if ax { x } else { y };
+                a |= (((v >> k) & 1) as usize) << bit;
+            }
+            if let Some(e) = src.get(base + a..base + a + 2) {
+                let d = (y * w + x) as usize * 2;
+                out[d..d + 2].copy_from_slice(e);
+            }
+        }
+    }
+    out
 }
 
 #[derive(Debug, Clone)]
