@@ -325,7 +325,9 @@ parts, Wheels, Weapons, Props, Vegetation, Interiors, Buildings & map, and
 Unnamed.
 - Search box: words match names and ids.
 - **hide LOD copies** (on by default) hides `_lod`/`_slod`/batch-LOD/`_mid`
-  copies.
+  copies. Clothing pieces that come as several entries with one name keep
+  one (the largest); pieces of a named character are listed through its
+  outfit entry.
 - ☆ marks favourites; there's a **favourites only** filter and a
   **Recent** list. Both are saved in `<work>/gui_models.json`.
 - Click to load. **Up / Down** (or ◀ ▶) step through the list.

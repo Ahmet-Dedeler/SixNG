@@ -259,10 +259,15 @@ impl ModelPicker {
                             let lname = name.to_ascii_lowercase();
                             let cat = categorise(e.name.as_deref(), rtype, &vehicle_re);
                             // animals: only the roots (their parts are put together in the viewer);
-                            // people: whole characters below, single pieces as variants
+                            // people: pieces of a named character are shown through its outfit
+                            // entry below; generic pieces (masks, costumes, `char_` items) have
+                            // no outfit, so they stay listed unless they are real LOD copies
                             let variant = match cat {
                                 Cat::Animals => rtype == "dr" || lname.contains("_bounds"),
-                                Cat::People => !crate::assemble::is_whole_ped(&lname),
+                                Cat::People => {
+                                    !crate::assemble::is_whole_ped(&lname)
+                                        && (crate::assemble::outfit_prefix(&lname).is_some() || is_variant(&lname))
+                                }
                                 _ => e.name.is_some() && is_variant(&lname),
                             };
                             if let Some(p) = crate::assemble::outfit_prefix(&lname) {
@@ -279,6 +284,18 @@ impl ModelPicker {
                 }
             }
             v.sort_by(|a, b| a.lname.cmp(&b.lname));
+            // generic ped pieces come as several entries with one name (their LOD
+            // copies): keep the largest listed, the others count as LOD copies
+            let mut best: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for (i, it) in v.iter().enumerate() {
+                if it.cat == Cat::People && !it.variant && it.rtype != "outfit" {
+                    best.entry(it.lname.as_str()).and_modify(|b| if v[*b].bytes < it.bytes { *b = i }).or_insert(i);
+                }
+            }
+            let copies: Vec<usize> = v.iter().enumerate().filter(|(i, it)| it.cat == Cat::People && !it.variant && it.rtype != "outfit" && best.get(it.lname.as_str()) != Some(i)).map(|(i, _)| i).collect();
+            for i in copies {
+                v[i].variant = true;
+            }
             refine_vehicles(&mut v);
             if v.is_empty() { Err(if errs.is_empty() { "no indexed models (run the setup or index the archives on the Jobs page first)".into() } else { errs.join("; ") }) } else { Ok(v) }
             }));
