@@ -11,7 +11,16 @@
 //! at 0x5A, u32 K (points per strand) at 0x5C. B5 = S x K points of 4 x f16
 //! (x, y, z, w), strand-major, model space, Z-up metres; B4 = T x 3 u16
 //! strand indices (triangles between strand roots); B0 = S x f16 strand
-//! length. The other sections are not decoded.
+//! length; A2 = S x 2 f16, the strand's root UV (inferred: in 0..1 and
+//! following the root position). The point w is about 0.5 mm along the
+//! strand and larger at the root (about 3 mm): a width (inferred). The
+//! other sections (A0/A1/A3-A7, B1-B3, B6, B7, Q0-Q3, the tail weights) are
+//! not decoded.
+//!
+//! Which groom belongs to which ped is not stored in any resource found so
+//! far (the 3-vertex hair / beard / brows placeholder drawables carry only
+//! their own name hash). Grooms come in LOD chains (consecutive resources
+//! with the same bones and fewer strands each time).
 use crate::resource::Resource;
 use anyhow::{anyhow, bail, Result};
 
@@ -29,6 +38,8 @@ pub struct Groom {
     pub roots: Vec<[u32; 3]>,
     /// Stored strand lengths.
     pub lengths: Vec<f32>,
+    /// Root UV per strand (A2; inferred), empty when absent.
+    pub root_uv: Vec<[f32; 2]>,
     pub bones: Vec<u32>,
     pub root_box: [[f32; 3]; 2],
     /// Second box (None when empty); equal across one groom's LODs.
@@ -92,6 +103,11 @@ pub fn parse(r: &Resource) -> Result<Groom> {
             }
         }
     }
+    let a2 = gu32(0x08) as usize;
+    let root_uv = match g.get(a2..a2 + s * 4) {
+        Some(u) if a2 > 0 => u.chunks_exact(4).map(|c| [f16(u16::from_le_bytes([c[0], c[1]])), f16(u16::from_le_bytes([c[2], c[3]]))]).collect(),
+        _ => Vec::new(),
+    };
     let lengths = match g.get(b0..b0 + s * 2) {
         Some(l) if b0 > 0 => l.chunks_exact(2).map(|c| f16(u16::from_le_bytes([c[0], c[1]]))).collect(),
         _ => Vec::new(),
@@ -104,7 +120,7 @@ pub fn parse(r: &Resource) -> Result<Groom> {
     let root_box = [v3(r, 0x30), v3(r, 0x40)];
     let gb = [v3(r, 0x50), v3(r, 0x60)];
     let group_box = (gb[0][0] <= gb[1][0] && gb[0][0].is_finite() && gb[1][0].is_finite() && gb[0][0].abs() < 1e30).then_some(gb);
-    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, bones, root_box, group_box })
+    Ok(Groom { strands: s, points_per_strand: k, points, w, roots, lengths, root_uv, bones, root_box, group_box })
 }
 
 impl Groom {
@@ -125,6 +141,69 @@ impl Groom {
         let k = self.points_per_strand as u32;
         self.roots.iter().flat_map(|t| t.map(|i| i * k)).collect()
     }
+    /// Root UV of each point's strand (zeros when absent).
+    pub fn point_uvs(&self) -> Vec<[f32; 2]> {
+        let k = self.points_per_strand;
+        (0..self.strands * k).map(|i| self.root_uv.get(i / k).copied().unwrap_or([0.0, 0.0])).collect()
+    }
+
+    /// Display mesh: two crossed ribbons along every strand (RAGE space).
+    /// `half_width` (metres) at the root, tapering to 40 % at the tip; the
+    /// taper is a display choice, not from the data. Returns positions,
+    /// normals, root UVs and triangle indices.
+    pub fn ribbons(&self, half_width: f32) -> (Vec<[f32; 3]>, Vec<[f32; 3]>, Vec<[f32; 2]>, Vec<u32>) {
+        let k = self.points_per_strand;
+        let n = self.strands * k * 4;
+        let (mut pos, mut nrm, mut uv, mut idx) = (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::new());
+        let sub = |a: [f32; 3], b: [f32; 3]| [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+        let cross = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+        let norm = |a: [f32; 3]| {
+            let l = (a[0] * a[0] + a[1] * a[1] + a[2] * a[2]).sqrt();
+            if l > 1e-9 { [a[0] / l, a[1] / l, a[2] / l] } else { [0.0, 0.0, 1.0] }
+        };
+        for s in 0..self.strands {
+            let uvs = self.root_uv.get(s).copied().unwrap_or([0.0, 0.0]);
+            let base = pos.len() as u32;
+            for j in 0..k {
+                let p = self.points[s * k + j];
+                let t = if k < 2 { [0.0, 0.0, 1.0] } else { norm(sub(self.points[s * k + (j + 1).min(k - 1)], self.points[s * k + j.saturating_sub(1)])) };
+                let up = if t[2].abs() < 0.9 { [0.0, 0.0, 1.0] } else { [1.0, 0.0, 0.0] };
+                let a = norm(cross(t, up));
+                let b = norm(cross(t, a));
+                let r = half_width * (1.0 - 0.6 * j as f32 / (k.max(2) - 1) as f32);
+                for (side, nv) in [(a, b), (b, a)] {
+                    for sg in [-1.0f32, 1.0] {
+                        pos.push([p[0] + side[0] * r * sg, p[1] + side[1] * r * sg, p[2] + side[2] * r * sg]);
+                        nrm.push(nv);
+                        uv.push(uvs);
+                    }
+                }
+            }
+            for j in 0..k.saturating_sub(1) as u32 {
+                for q in 0..2u32 {
+                    let v0 = base + j * 4 + q * 2;
+                    let v1 = v0 + 4;
+                    idx.extend_from_slice(&[v0, v0 + 1, v1 + 1, v0, v1 + 1, v1]);
+                }
+            }
+        }
+        (pos, nrm, uv, idx)
+    }
+
+    /// Ribbon GLB with one plain material of colour `rgb` (linear).
+    pub fn ribbon_glb(&self, name: &str, half_width: f32, rgb: [f32; 3], extras: serde_json::Value) -> Vec<u8> {
+        let (positions, normals, uv, indices) = self.ribbons(half_width);
+        let prim = crate::gltf::TriPrim { name: name.to_string(), positions, normals: Some(normals), tangents: None, uvs: vec![uv], colors: None, tint: None, indices, material: Some(0), joints: None, weights: None, joints1: None, weights1: None };
+        let mat = crate::gltf::Material {
+            name: "hair".into(),
+            base_color_uri: None,
+            normal_uri: None,
+            gltf: serde_json::json!({"doubleSided": true, "pbrMetallicRoughness": {"baseColorFactor": [rgb[0], rgb[1], rgb[2], 1.0], "metallicFactor": 0.0, "roughnessFactor": 0.55}}),
+            extras: serde_json::json!({"note": "display ribbons; colour chosen, not from the data"}),
+        };
+        crate::gltf::mesh_glb(name, &[crate::gltf::NodeGroup { name: name.to_string(), prims: vec![prim] }], &[mat], &[], extras)
+    }
+
     /// Share of strand roots inside the stored root box (a layout check).
     pub fn roots_in_box(&self) -> f32 {
         let k = self.points_per_strand;
@@ -159,7 +238,7 @@ impl Groom {
 /// Bone names (joaat of the lower-case name -> name) from the skeletons
 /// of the archive's named fragments (people, animals) and a sample of head
 /// drawables (facial bones).
-fn bone_names(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> std::collections::HashMap<u32, String> {
+pub fn bone_names(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> std::collections::HashMap<u32, String> {
     use rayon::prelude::*;
     let mut heads = 0;
     let src: Vec<&crate::scan::Entry> = all
@@ -185,73 +264,173 @@ fn bone_names(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> std::
     m
 }
 
-/// Export every groom among `entries` (unnamed resources of `a`) to
-/// `<out>/grooms/<archive>/<offset>.glb` plus `index.jsonl`. `all` = the
-/// archive's entries (bone names come from its named skeletons). Returns
-/// (grooms written, entries scanned, errors).
-pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], entries: &[&crate::scan::Entry], out: &std::path::Path, roots: bool, progress: crate::export::Progress) -> Result<(usize, usize, usize)> {
+/// One groom as listed by the catalog (system page only).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GroomInfo {
+    pub off: u64,
+    pub id: String,
+    pub strands: u32,
+    pub root_triangles: u32,
+    pub bones: Vec<String>,
+    pub root_box: [[f32; 3]; 2],
+    /// scalp / face / brows / lashes / body / animal / other, from the bones (a guess).
+    pub category: String,
+    /// LOD chain: consecutive grooms with the same bones and fewer strands
+    /// each time (inferred); `lod` 0 is the densest.
+    pub chain: u32,
+    pub lod: u32,
+}
+
+/// Body region from the bone names (a guess for browsing).
+/// Body region of a groom from its bones; head-only grooms whose roots all
+/// sit low on the front of the head (beards, moustaches) count as face.
+pub fn category(bones: &[String], root_box: &[[f32; 3]; 2]) -> &'static str {
+    let c = category_by_bones(bones);
+    if c == "scalp" && root_box[1][2] < 0.74 && root_box[1][1] < 0.0 {
+        "face"
+    } else {
+        c
+    }
+}
+
+fn category_by_bones(bones: &[String]) -> &'static str {
+    let has = |f: &dyn Fn(&str) -> bool| bones.iter().any(|b| f(b));
+    if has(&|b| b.starts_with("SKEL_Tail") || b.starts_with("MH_Tail") || b.contains("_Fin") || b.contains("Paw") || b.contains("Wing")) {
+        "animal"
+    } else if has(&|b| b.contains("Brow") || b.contains("Lid") || b.contains("Lash")) {
+        "brows / lashes"
+    } else if has(&|b| b.contains("Ear") || b.contains("Cheek") || b.contains("Throat") || b.contains("Chin") || b.contains("Jaw") || b.contains("Lip")) {
+        "face"
+    } else if has(&|b| b == "BM_Head" || b == "SKEL_Head" || b == "SKEL_HEAD" || b.contains("Occipitalis")) {
+        "scalp"
+    } else if has(&|b| b.contains("Pectoralis") || b.contains("Scapula") || b.contains("Spine") || b.contains("Pelvis") || b.contains("Thigh") || b.contains("Arm")) {
+        "body"
+    } else {
+        "other"
+    }
+}
+
+/// List every groom among the archive's unnamed resources from their
+/// system pages (no graphics pages read), with LOD chains.
+pub fn catalog(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> Result<Vec<GroomInfo>> {
     use rayon::prelude::*;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     let names = bone_names(a, all);
     let bone_name = |h: u32| names.get(&h).cloned().or_else(|| crate::names::lookup(h, crate::names::Ctx::Field)).unwrap_or_else(|| format!("{h:08x}"));
-    let dir = out.join("grooms").join(a.id.trim_end_matches(".rpf"));
-    std::fs::create_dir_all(&dir)?;
-    let total = entries.len() as u64;
-    let done = AtomicU64::new(0);
-    let errors = AtomicUsize::new(0);
-    let mut rows: Vec<(u64, Option<[[f32; 3]; 2]>, serde_json::Value)> = entries
+    let cands: Vec<&crate::scan::Entry> = all.iter().filter(|e| e.name.is_none() && e.kind == crate::classify::Kind::RageObj).collect();
+    let mut v: Vec<GroomInfo> = cands
         .par_iter()
         .filter_map(|e| {
-            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-            progress(&e.id, d, total);
-            let s = Resource::load_sys(&a.path, e).ok()?;
-            if !is_groom(&s.sys) {
+            let r = Resource::load_sys(&a.path, e).ok()?;
+            if !is_groom(&r.sys) {
                 return None;
             }
+            let nb = r.u32(0x98) as usize;
+            let bones = match r.sys_off(r.u64(0xA0)) {
+                Some(o) if nb <= 4096 => (0..nb).map(|i| bone_name(r.u32(o + 4 * i))).collect(),
+                _ => Vec::new(),
+            };
+            let root_box = [v3(&r, 0x30), v3(&r, 0x40)];
+            let cat = category(&bones, &root_box).to_string();
+            Some(GroomInfo { off: e.off, id: e.id.clone(), strands: r.u16(0xDE) as u32, root_triangles: r.u16(0xDC) as u32, bones, root_box, category: cat, chain: 0, lod: 0 })
+        })
+        .collect();
+    v.sort_by_key(|g| g.off);
+    let mut chain = 0;
+    for i in 0..v.len() {
+        let cont = i > 0 && v[i].bones == v[i - 1].bones && v[i].strands < v[i - 1].strands;
+        if cont {
+            v[i].lod = v[i - 1].lod + 1;
+        } else {
+            chain += 1;
+        }
+        v[i].chain = chain;
+    }
+    Ok(v)
+}
+
+/// The catalog, cached in `<work>/index/grooms_<archive>.json`.
+pub fn catalog_cached(work: &std::path::Path, a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry]) -> Result<Vec<GroomInfo>> {
+    let p = work.join("index").join(format!("grooms_{}.json", a.id.trim_end_matches(".rpf").replace(['/', '\\'], "_")));
+    if let Ok(b) = std::fs::read(&p) {
+        if let Ok(mut v) = serde_json::from_slice::<Vec<GroomInfo>>(&b) {
+            // regions may be refined after the cache was written
+            for g in &mut v {
+                g.category = category(&g.bones, &g.root_box).to_string();
+            }
+            return Ok(v);
+        }
+    }
+    let v = catalog(a, all)?;
+    std::fs::create_dir_all(p.parent().unwrap())?;
+    std::fs::write(&p, serde_json::to_vec(&v)?)?;
+    Ok(v)
+}
+
+/// Load and decode one groom by archive offset.
+pub fn load(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], off: u64) -> Result<Groom> {
+    let e = all.iter().find(|e| e.off == off).ok_or_else(|| anyhow!("no entry at {off:x}"))?;
+    parse(&Resource::load(&a.path, e)?)
+}
+
+/// Export grooms to `<out>/grooms/<archive>/<offset>.glb` plus
+/// `index.jsonl`: line strips (with `_WIDTH` and the root UV as
+/// TEXCOORD_0), or crossed ribbons of `ribbons` half-width (metres) when
+/// given. `only` limits the export to these offsets (all grooms when
+/// empty). Returns (grooms written, errors).
+pub fn export_grooms(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], only: &[u64], out: &std::path::Path, roots: bool, ribbons: Option<f32>, progress: crate::export::Progress) -> Result<(usize, usize)> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    let cat = catalog(a, all)?;
+    let sel: Vec<&GroomInfo> = cat.iter().filter(|g| only.is_empty() || only.contains(&g.off)).collect();
+    let by_off: std::collections::HashMap<u64, &crate::scan::Entry> = all.iter().map(|e| (e.off, e)).collect();
+    let dir = out.join("grooms").join(a.id.trim_end_matches(".rpf"));
+    std::fs::create_dir_all(&dir)?;
+    let total = sel.len() as u64;
+    let done = AtomicU64::new(0);
+    let errors = AtomicUsize::new(0);
+    let mut rows: Vec<(u64, String, bool)> = sel
+        .par_iter()
+        .filter_map(|info| {
+            let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+            progress(&info.id, d, total);
+            let e = by_off.get(&info.off)?;
             let g = match Resource::load(&a.path, e).map_err(|x| x.to_string()).and_then(|r| parse(&r).map_err(|x| x.to_string())) {
                 Ok(g) => g,
                 Err(msg) => {
                     errors.fetch_add(1, Ordering::Relaxed);
-                    return Some((e.off, None, serde_json::json!({"id": e.id, "error": msg})));
+                    return Some((e.off, serde_json::json!({"id": info.id, "error": msg}).to_string(), false));
                 }
             };
             let name = format!("groom_{:x}", e.off);
-            let bones: Vec<String> = g.bones.iter().map(|&h| bone_name(h)).collect();
-            let extras = serde_json::json!({"source": e.id, "strands": g.strands, "points_per_strand": g.points_per_strand, "bones": bones,
+            let extras = serde_json::json!({"source": e.id, "strands": g.strands, "points_per_strand": g.points_per_strand, "bones": info.bones, "category": info.category, "chain": info.chain, "lod": info.lod,
                 "coordinate_system": "model space (Z-up metres) converted to glTF Y-up (x, z, -y)"});
-            let tris = if roots { g.root_indices() } else { Vec::new() };
+            let bytes = match ribbons {
+                Some(hw) => g.ribbon_glb(&name, hw, [0.08, 0.05, 0.03], extras),
+                None => {
+                    let tris = if roots { g.root_indices() } else { Vec::new() };
+                    crate::gltf::lines_glb(&name, &g.points, &g.w, &g.point_uvs(), &g.segments(), &tris, extras)
+                }
+            };
             let file = dir.join(format!("{:x}.glb", e.off));
-            if std::fs::write(&file, crate::gltf::lines_glb(&name, &g.points, &g.segments(), &tris, extras)).is_err() {
+            if std::fs::write(&file, bytes).is_err() {
                 errors.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
             let len: f32 = g.lengths.iter().sum();
-            let row = serde_json::json!({"id": e.id, "file": format!("{:x}.glb", e.off), "strands": g.strands, "points_per_strand": g.points_per_strand,
-                "root_triangles": g.roots.len(), "total_length_m": (len * 1000.0).round() / 1000.0, "bones": bones,
-                "root_box": g.root_box, "roots_in_box": g.roots_in_box(), "continuous": g.continuous()});
-            Some((e.off, g.group_box, row))
+            Some((e.off, serde_json::json!({"id": e.id, "file": format!("{:x}.glb", e.off), "strands": g.strands, "points_per_strand": g.points_per_strand,
+                "root_triangles": g.roots.len(), "total_length_m": (len * 1000.0).round() / 1000.0, "bones": info.bones, "category": info.category, "chain": info.chain, "lod": info.lod,
+                "root_box": g.root_box, "roots_in_box": g.roots_in_box(), "continuous": g.continuous()}).to_string(), true))
         })
         .collect();
     rows.sort_by_key(|r| r.0);
-    // LOD groups: consecutive grooms with the same second box
-    let mut group = 0usize;
-    let mut prev: Option<[[f32; 3]; 2]> = None;
+    let n = rows.iter().filter(|r| r.2).count();
     let mut text = String::new();
-    let mut n = 0;
-    for (_, gb, mut row) in rows {
-        if row.get("error").is_none() {
-            n += 1;
-            if gb.is_none() || gb != prev {
-                group += 1;
-            }
-            prev = gb;
-            row["lod_group"] = serde_json::json!(group);
-        }
-        text.push_str(&row.to_string());
+    for r in &rows {
+        text.push_str(&r.1);
         text.push('\n');
     }
     std::fs::write(dir.join("index.jsonl"), text)?;
-    Ok((n, entries.len(), errors.into_inner()))
+    Ok((n, errors.into_inner()))
 }
 
 #[cfg(test)]
@@ -265,7 +444,7 @@ mod tests {
     }
     #[test]
     fn segments() {
-        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None };
+        let g = Groom { strands: 2, points_per_strand: 3, points: vec![[0.0; 3]; 6], w: vec![0.0; 6], roots: vec![[0, 1, 1]], lengths: vec![], root_uv: vec![], bones: vec![], root_box: [[0.0; 3]; 2], group_box: None };
         assert_eq!(g.segments(), vec![0, 1, 1, 2, 3, 4, 4, 5]);
         assert_eq!(g.root_indices(), vec![0, 3, 3]);
     }

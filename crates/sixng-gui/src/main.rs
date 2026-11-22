@@ -41,7 +41,7 @@ mod pages;
 /// Command-line automation (verification screenshots):
 /// `sixng-gui --model <id|regex|glb> [--lod N] [--mode N] [--slot N] [--rma N] [--wire] [--skeleton]
 ///  [--tod H] [--paint r,g,b] [--finish N] [--pearl A] [--spin R] [--door R] [--yaw R] [--pitch R] [--zoom F]
-///  [--no-tint] [--size WxH] --screenshot out.png --exit`
+///  [--no-tint] [--hair hex,hex] [--hair-width MM] [--size WxH] --screenshot out.png --exit`
 #[derive(Default, Clone)]
 struct Cli {
     args: std::collections::HashMap<String, String>,
@@ -1240,6 +1240,13 @@ impl App {
             return;
         }
         let m = &mut self.model;
+        if let Some(v) = c.get("hair") {
+            // grooms to show: hex offsets in packs.rpf
+            m.hair.selected = v.split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect();
+            if let Some(w) = c.f("hair-width") {
+                m.hair.width_mm = w;
+            }
+        }
         if let Some(h) = c.f("tod") {
             m.tod = h;
             m.look.set_time_of_day(h);

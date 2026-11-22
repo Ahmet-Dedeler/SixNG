@@ -245,16 +245,50 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
-    /// Strand hair grooms (hair, beards, brows, fur: unnamed packs.rpf resources) as GLB line strips in model space: <out>/grooms/<archive>/<offset>.glb and index.jsonl (strands, points, bones, LOD group). Not linked to peds yet.
+    /// Strand hair grooms (hair, beards, brows, fur: unnamed packs.rpf resources) as GLB line strips or ribbons in model space: <out>/grooms/<archive>/<offset>.glb and index.jsonl (strands, points, bones, region, LOD chain). No link to peds is stored; pick them by region and bones.
     Grooms {
         /// Archive (default packs).
         #[arg(default_value = "packs")]
         archive: String,
-        #[command(flatten)]
-        filter: FilterArgs,
         /// Also write the scalp triangles between strand roots.
         #[arg(long)]
         roots: bool,
+        /// Write crossed ribbon meshes of this half-width (mm) instead of lines (render in any viewer).
+        #[arg(long)]
+        ribbons: Option<f32>,
+        /// Only these groom offsets (hex, comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Only list the grooms (catalog with LOD chains and region) to <out>/grooms/<archive>/catalog.json.
+        #[arg(long)]
+        list: bool,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
+    /// Verlet cloth and soft bodies (particles + constraint edges, drawn as lines): <out>/cloth/<archive>/<offset>.glb + index.jsonl.
+    Cloth {
+        /// Archive (default packs).
+        #[arg(default_value = "packs")]
+        archive: String,
+        /// Only these resource offsets (hex, comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
+        /// Output directory.
+        #[arg(long, short)]
+        out: PathBuf,
+    },
+    /// Head identity deltas (per-head vertex offsets from the class's base head): matches each to its head drawable, recovers the vertex order and with --build writes the heads that have no drawable as GLBs (<out>/models/<archive>/head_<class>_delta_<offset>/model.glb). Index: <out>/head_deltas/<archive>/index.jsonl.
+    HeadDeltas {
+        /// Archive (default packs).
+        #[arg(default_value = "packs")]
+        archive: String,
+        /// Build GLBs of the LOD0 heads that exist only as deltas.
+        #[arg(long)]
+        build: bool,
+        /// With --build: only these delta offsets (hex, comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        only: Vec<String>,
         /// Output directory.
         #[arg(long, short)]
         out: PathBuf,
@@ -776,18 +810,52 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "tiles": n, "tiles_with_roads": roads,
                 "seconds": t.elapsed().as_secs_f64(), "index": po.join("navmesh").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
-        Cmd::Grooms { archive, filter, roots, out: po } => {
+        Cmd::Grooms { archive, roots, ribbons, only, list, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
-            let mut f = filter.to_filter()?;
-            if f.kinds.is_empty() {
-                f.kinds = vec![Kind::RageObj];
-            }
-            let sel: Vec<_> = f.select(&ix)?.into_iter().filter(|e| e.name.is_none()).collect();
             let t = Instant::now();
-            let (n, scanned, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &sel, po, *roots, pr)?;
-            out.print(&json!({"ok": true, "archive": a.id, "scanned": scanned, "grooms": n, "errors": errors,
-                "seconds": t.elapsed().as_secs_f64(), "index": po.join("grooms").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
+            if *list {
+                let cat = sixng_core::groom::catalog(&a, &ix.entries)?;
+                let dir = po.join("grooms").join(a.id.trim_end_matches(".rpf"));
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(dir.join("catalog.json"), serde_json::to_vec_pretty(&cat)?)?;
+                let mut by: std::collections::BTreeMap<&str, usize> = Default::default();
+                for g in cat.iter().filter(|g| g.lod == 0) {
+                    *by.entry(g.category.as_str()).or_default() += 1;
+                }
+                out.print(&json!({"ok": true, "grooms": cat.len(), "chains": cat.iter().filter(|g| g.lod == 0).count(), "chains_by_region": by, "file": dir.join("catalog.json"), "seconds": t.elapsed().as_secs_f64()}));
+            } else {
+                let only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
+                let (n, errors) = sixng_core::groom::export_grooms(&a, &ix.entries, &only, po, *roots, ribbons.map(|mm| mm / 1000.0), pr)?;
+                out.print(&json!({"ok": true, "archive": a.id, "grooms": n, "errors": errors,
+                    "seconds": t.elapsed().as_secs_f64(), "index": po.join("grooms").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
+            }
+        }
+        Cmd::Cloth { archive, only, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let t = Instant::now();
+            let only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
+            let (n, errors) = sixng_core::cloth::export_cloth(&a, &ix.entries, &only, po, pr)?;
+            out.print(&json!({"ok": true, "archive": a.id, "cloth": n, "errors": errors,
+                "seconds": t.elapsed().as_secs_f64(), "index": po.join("cloth").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
+        }
+        Cmd::HeadDeltas { archive, build, only, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let t = Instant::now();
+            let only: Vec<u64> = only.iter().filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok()).collect();
+            let rows = sixng_core::headdelta::run(&a, &ix.entries, po, *build, &only, pr)?;
+            let mut by: std::collections::BTreeMap<String, [usize; 4]> = Default::default();
+            for r in &rows {
+                let c = by.entry(format!("{} lod{}", r.class, r.lod)).or_default();
+                c[0] += 1;
+                c[1] += r.head.is_some() as usize;
+                c[2] += r.head_by_order.is_some() as usize;
+                c[3] += r.file.is_some() as usize;
+            }
+            out.print(&json!({"ok": true, "archive": a.id, "deltas": rows.len(), "by_class_lod_total_matched_named_built": by,
+                "seconds": t.elapsed().as_secs_f64(), "index": po.join("head_deltas").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }
         Cmd::Paths { archive, filter, out: po } => {
             let a = ws.resolve(archive)?;

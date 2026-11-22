@@ -14,6 +14,8 @@ pub mod export;
 pub mod game;
 pub mod gltf;
 pub mod groom;
+pub mod cloth;
+pub mod headdelta;
 pub mod meta7a;
 pub mod names;
 pub mod material;

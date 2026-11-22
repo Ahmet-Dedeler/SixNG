@@ -164,6 +164,12 @@ impl Builder {
         self.accessors.push(json!({"bufferView": bv, "componentType": 5121, "normalized": true, "count": data.len(), "type": "VEC4"}));
         self.accessors.len() - 1
     }
+    fn scalar(&mut self, data: &[f32]) -> usize {
+        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bv = self.view(&bytes, Some(34962));
+        self.accessors.push(json!({"bufferView": bv, "componentType": 5126, "count": data.len(), "type": "SCALAR"}));
+        self.accessors.len() - 1
+    }
     fn indices(&mut self, data: &[u32]) -> usize {
         let bytes: Vec<u8> = data.iter().flat_map(|i| i.to_le_bytes()).collect();
         let bv = self.view(&bytes, Some(34963));
@@ -172,7 +178,7 @@ impl Builder {
     }
 }
 
-fn pack(doc: &Value, mut bin: Vec<u8>) -> Vec<u8> {
+pub(crate) fn pack(doc: &Value, mut bin: Vec<u8>) -> Vec<u8> {
     let mut js = serde_json::to_vec(doc).unwrap();
     while js.len() % 4 != 0 {
         js.push(b' ');
@@ -378,12 +384,21 @@ pub fn mesh_glb(name: &str, groups: &[NodeGroup], materials: &[Material], skelet
 /// Build a line GLB: one node with line segments (mode 1, `segments` =
 /// index pairs into `positions`) and, when `tris` is not empty, a second
 /// node with triangles over the same positions (mode 4). RAGE space in.
-pub fn lines_glb(name: &str, positions: &[[f32; 3]], segments: &[u32], tris: &[u32], extras: Value) -> Vec<u8> {
+/// `width` (custom `_WIDTH`) and `uv` (TEXCOORD_0) are written when they
+/// have one value per position.
+pub fn lines_glb(name: &str, positions: &[[f32; 3]], width: &[f32], uv: &[[f32; 2]], segments: &[u32], tris: &[u32], extras: Value) -> Vec<u8> {
     let mut b = Builder::default();
     let pos: Vec<[f32; 3]> = positions.iter().map(|&v| yup(v)).collect();
     let a = b.vec3(&pos, true);
+    let mut attrs = json!({"POSITION": a});
+    if width.len() == positions.len() {
+        attrs["_WIDTH"] = json!(b.scalar(width));
+    }
+    if uv.len() == positions.len() {
+        attrs["TEXCOORD_0"] = json!(b.vec2(uv));
+    }
     let li = b.indices(segments);
-    let mut meshes = vec![json!({"name": format!("{name}_strands"), "primitives": [{"attributes": {"POSITION": a}, "indices": li, "mode": 1}]})];
+    let mut meshes = vec![json!({"name": format!("{name}_strands"), "primitives": [{"attributes": attrs, "indices": li, "mode": 1}]})];
     let mut nodes = vec![json!({"name": format!("{name}_strands"), "mesh": 0})];
     if !tris.is_empty() {
         let ti = b.indices(tris);

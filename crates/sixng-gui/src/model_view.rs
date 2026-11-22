@@ -99,6 +99,56 @@ pub struct ModelView {
     /// Set when the user asks to open a material's texture in the Textures tab.
     pub view_texture: Option<u64>,
     pub show_picker: bool,
+    pub hair: Hair,
+}
+
+type GroomList = Result<Vec<sixng_core::groom::GroomInfo>, String>;
+
+/// Strand hair / fur shown with the model: grooms picked from the packs
+/// catalog (no groom-to-ped link is stored), drawn as crossed ribbons.
+pub struct Hair {
+    catalog: Arc<Mutex<Option<GroomList>>>,
+    list: Option<GroomList>,
+    listing: bool,
+    pub region: String,
+    pub search: String,
+    pub selected: Vec<u64>,
+    pub width_mm: f32,
+    pub colour: [f32; 3],
+    pending: Arc<Mutex<Option<Result<Vec<glb::Model>, String>>>>,
+    key: String,
+    loading: bool,
+    gpu: Vec<GpuModel>,
+    pub status: String,
+}
+
+impl Default for Hair {
+    fn default() -> Self {
+        Hair {
+            catalog: Arc::new(Mutex::new(None)),
+            list: None,
+            listing: false,
+            region: "scalp".into(),
+            search: String::new(),
+            selected: Vec::new(),
+            width_mm: 1.0,
+            colour: [0.10, 0.06, 0.035],
+            pending: Arc::new(Mutex::new(None)),
+            key: String::new(),
+            loading: false,
+            gpu: Vec::new(),
+            status: String::new(),
+        }
+    }
+}
+
+impl Hair {
+    fn want_key(&self) -> String {
+        format!("{:?}|{}|{:?}", self.selected, self.width_mm, self.colour)
+    }
+    pub fn settled(&self) -> bool {
+        !self.loading && !self.listing && self.key == self.want_key()
+    }
 }
 
 impl ModelView {
@@ -147,6 +197,7 @@ impl ModelView {
             picker: crate::model_picker::ModelPicker::new(work),
             view_texture: None,
             show_picker: true,
+            hair: Hair::default(),
         }
     }
 
@@ -155,8 +206,162 @@ impl ModelView {
         !self.loading && self.idle_for_shot() && (!self.show_picker || self.picker.loaded())
     }
 
+    /// Start reading the groom catalog (cached in <work>/index after the
+    /// first time).
+    fn start_hair_list(&mut self, ctx: &egui::Context) {
+        if self.hair.listing || self.hair.list.is_some() {
+            return;
+        }
+        self.hair.listing = true;
+        let ws = Workspace::new(&self.game, &self.work);
+        let idx = self.indexes.clone();
+        let slot = self.hair.catalog.clone();
+        let work = PathBuf::from(&self.work);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = index_for(&ws, "packs", &idx).and_then(|(a, ix)| sixng_core::groom::catalog_cached(&work, &a, &ix.entries)).map_err(|e| format!("{e:#}"));
+            *slot.lock().unwrap() = Some(r);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Load the chosen grooms when the choice, width or colour changed, and
+    /// upload finished loads.
+    fn update_hair(&mut self, rs: &egui_wgpu::RenderState, ctx: &egui::Context) {
+        if let Some(r) = self.hair.catalog.lock().unwrap().take() {
+            self.hair.listing = false;
+            self.hair.list = Some(r);
+        }
+        if let Some(r) = self.hair.pending.lock().unwrap().take() {
+            self.hair.loading = false;
+            match r {
+                Ok(models) => {
+                    let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
+                    self.hair.gpu = models.iter().map(|m| ren.upload(rs, m, &[])).collect();
+                    self.hair.status = format!("{} groom(s) shown", models.len());
+                }
+                Err(e) => {
+                    self.hair.gpu.clear();
+                    self.hair.status = e;
+                }
+            }
+        }
+        let want = self.hair.want_key();
+        if self.hair.loading || self.hair.key == want {
+            return;
+        }
+        self.hair.key = want;
+        if self.hair.selected.is_empty() {
+            self.hair.gpu.clear();
+            self.hair.status.clear();
+            return;
+        }
+        self.hair.loading = true;
+        let ws = Workspace::new(&self.game, &self.work);
+        let idx = self.indexes.clone();
+        let slot = self.hair.pending.clone();
+        let dir = self.cache_dir().join("grooms");
+        let (sel, hw, rgb) = (self.hair.selected.clone(), self.hair.width_mm / 1000.0, self.hair.colour);
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let r = (|| -> anyhow::Result<Vec<glb::Model>> {
+                let (a, ix) = index_for(&ws, "packs", &idx)?;
+                std::fs::create_dir_all(&dir)?;
+                let mut out = Vec::new();
+                for off in sel {
+                    let g = sixng_core::groom::load(&a, &ix.entries, off)?;
+                    // linear colour from the sRGB picker value
+                    let lin = rgb.map(|c| c.powf(2.2));
+                    let p = dir.join(format!("{off:x}.glb"));
+                    std::fs::write(&p, g.ribbon_glb(&format!("groom_{off:x}"), hw, lin, serde_json::json!({})))?;
+                    out.push(glb::load(&p, &dir)?);
+                }
+                Ok(out)
+            })()
+            .map_err(|e| format!("hair: {e:#}"));
+            *slot.lock().unwrap() = Some(r);
+            ctx.request_repaint();
+        });
+    }
+
+    /// Hair and fur panel: browse the grooms by region and bone, add them
+    /// to the view, set width and colour.
+    fn hair_ui(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Hair and fur (grooms)").default_open(!self.hair.selected.is_empty()).show(ui, |ui| {
+            ui.label(egui::RichText::new("Strand grooms from packs.rpf. The game files do not say which groom belongs to which character, so pick them here. Shown as ribbons; width and colour are display choices.").weak());
+            let Some(list) = &self.hair.list else {
+                if self.hair.listing {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("reading the groom list (first time about 2 minutes) …");
+                    });
+                } else if ui.button("Load the groom list").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.start_hair_list(&ctx);
+                }
+                if !self.hair.status.is_empty() {
+                    ui.label(egui::RichText::new(&self.hair.status).weak());
+                }
+                return;
+            };
+            let list = match list {
+                Ok(l) => l.clone(),
+                Err(e) => {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                    return;
+                }
+            };
+            ui.horizontal(|ui| {
+                egui::ComboBox::from_id_salt("hair_region").selected_text(self.hair.region.clone()).show_ui(ui, |ui| {
+                    for r in ["scalp", "face", "brows / lashes", "body", "animal", "other", "all"] {
+                        ui.selectable_value(&mut self.hair.region, r.to_string(), r);
+                    }
+                });
+                ui.add(egui::TextEdit::singleline(&mut self.hair.search).hint_text("bone or offset").desired_width(120.0));
+            });
+            let q = self.hair.search.to_lowercase();
+            let rows: Vec<&sixng_core::groom::GroomInfo> = list
+                .iter()
+                .filter(|g| g.lod == 0 && (self.hair.region == "all" || g.category == self.hair.region))
+                .filter(|g| q.is_empty() || format!("{:x}", g.off).contains(&q) || g.bones.iter().any(|b| b.to_lowercase().contains(&q)))
+                .collect();
+            ui.label(format!("{} grooms (densest LOD of each chain)", rows.len()));
+            egui::ScrollArea::vertical().id_salt("hair_list").max_height(180.0).show_rows(ui, 18.0, rows.len(), |ui, range| {
+                for g in &rows[range] {
+                    let on = self.hair.selected.contains(&g.off);
+                    let text = format!("{:x} · {} strands · {}", g.off, g.strands, g.bones.iter().take(3).cloned().collect::<Vec<_>>().join(", "));
+                    if ui.selectable_label(on, text).on_hover_text(g.bones.join(", ")).clicked() {
+                        if on {
+                            self.hair.selected.retain(|x| *x != g.off);
+                        } else {
+                            self.hair.selected.push(g.off);
+                        }
+                    }
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut self.hair.width_mm, 0.2..=5.0).text("width (mm)"));
+                ui.color_edit_button_rgb(&mut self.hair.colour);
+                if ui.button("Clear").clicked() {
+                    self.hair.selected.clear();
+                }
+            });
+            if self.hair.loading {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("loading grooms …");
+                });
+            } else if !self.hair.status.is_empty() {
+                ui.label(egui::RichText::new(&self.hair.status).weak());
+            }
+        });
+    }
+
     /// Car extras settled: vehicle data applied and the fitted wheels loaded.
     fn idle_for_shot(&self) -> bool {
+        if !self.hair.settled() {
+            return false;
+        }
         let Some(l) = self.loaded.as_ref().filter(|l| l.info["wheel_mounts"].is_array()) else { return true };
         let veh = match &*self.vehicles.state.lock().unwrap() {
             crate::vehicle_db::State::Idle | crate::vehicle_db::State::Loading(_) => false,
@@ -731,10 +936,13 @@ impl ModelView {
                 ren.set_joints(rs, g, &skin);
             }
         }
+        self.update_hair(rs, &ctx);
+        let ren = self.renderer.get_or_insert_with(|| Renderer3D::new(rs));
         let mut models: Vec<&GpuModel> = self.gpu.iter().collect();
         if show_wheels {
             models.extend(self.wheels.iter());
         }
+        models.extend(self.hair.gpu.iter());
         ren.decal_bias = self.decal_bias;
         let tid = ren.render(rs, px, &self.cam, &self.look, &models, &under, &top);
         ui.painter().image(tid, rect, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), egui::Color32::WHITE);
@@ -911,6 +1119,8 @@ impl ModelView {
                 }
             }
         }
+        ui.separator();
+        self.hair_ui(ui);
         ui.separator();
         if let Some(q) = self.parts_ui(ui) {
             self.keep_cam_once = true;
