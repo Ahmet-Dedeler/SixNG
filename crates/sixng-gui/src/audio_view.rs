@@ -278,7 +278,7 @@ impl AudioView {
                 return Ok(vec![p.display().to_string()]);
             }
             let mut files = Vec::new();
-            for st in b.streams.iter().filter(|st| s.map_or(st.layout == "blocks" || st.layout == "music", |x| x.id == st.id)) {
+            for st in b.streams.iter().filter(|st| s.map_or(st.exportable(), |x| x.id == st.id)) {
                 files.extend(audio::export_stream(&bytes, b, st, &dir, fmt)?);
             }
             Ok(files)
@@ -442,6 +442,14 @@ impl AudioView {
                                 "blocks" => {
                                     ui.label(format!("Opus, {}", if s.channels == 2 { "stereo" } else { "mono" }));
                                 }
+                                "pcm16" | "pcmf32" => {
+                                    ui.label(format!("PCM {}, {}", if s.layout == "pcm16" { "16-bit" } else { "float" }, if s.channels == 2 { "stereo" } else { "mono" }))
+                                        .on_hover_text("Uncompressed: exported as WAV, samples as stored. Not playable here.");
+                                }
+                                "xma2" => {
+                                    ui.label(format!("XMA2, {}", if s.channels == 2 { "stereo" } else { "mono" }))
+                                        .on_hover_text("Exported as .xma (RIFF XMA2, lossless remux; FFmpeg decodes it). Not playable here.");
+                                }
                                 _ => {
                                     ui.label(format!("unknown codec {}", s.codec)).on_hover_text("Not decoded. Export the bank raw (.awc).");
                                 }
@@ -456,13 +464,25 @@ impl AudioView {
                             } else if ui.add_enabled(s.layout == "blocks" && self.decoding.is_none(), egui::Button::new("▶ Play")).clicked() {
                                 self.play(&b, s);
                             }
-                            ui.horizontal(|ui| {
-                                let ok = s.layout == "blocks" || s.layout == "music";
-                                if ui.add_enabled(ok, egui::Button::new(".opus").small()).clicked() {
-                                    self.export(&b, Some(s), "opus");
+                            ui.horizontal(|ui| match s.layout.as_str() {
+                                "pcm16" | "pcmf32" => {
+                                    if ui.add(egui::Button::new(".wav").small()).clicked() {
+                                        self.export(&b, Some(s), "wav");
+                                    }
                                 }
-                                if ui.add_enabled(ok, egui::Button::new(".wav").small()).clicked() {
-                                    self.export(&b, Some(s), "wav");
+                                "xma2" => {
+                                    if ui.add(egui::Button::new(".xma").small()).clicked() {
+                                        self.export(&b, Some(s), "wav");
+                                    }
+                                }
+                                _ => {
+                                    let ok = s.layout == "blocks" || s.layout == "music";
+                                    if ui.add_enabled(ok, egui::Button::new(".opus").small()).clicked() {
+                                        self.export(&b, Some(s), "opus");
+                                    }
+                                    if ui.add_enabled(ok, egui::Button::new(".wav").small()).clicked() {
+                                        self.export(&b, Some(s), "wav");
+                                    }
                                 }
                             });
                             ui.end_row();

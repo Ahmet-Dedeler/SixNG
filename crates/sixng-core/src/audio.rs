@@ -27,6 +27,17 @@
 //! then each channel's 2 KiB blocks in turn, packed as in plain streams.
 //! Sample counts (channel and block) count each channel of a stereo
 //! sub-stream, so they are twice the frame count for stereo.
+//!
+//! Codec: the 32-byte format chunk holds a codec id at 0x1C and a channel
+//! count at 0x1D: 11 Opus, 0 PCM signed 16-bit LE, 2 PCM float32 LE, 5 XMA2
+//! (see TrinitronClient/GTA6-Asset-Info, structure/03-audio-awc.md). In
+//! audio.rpf: 1,598,051 Opus, 1,818 XMA2, 227 float32 PCM and 19 PCM16
+//! streams outside music. The byte at 0x13, read as the codec before, is
+//! not the codec (it is 0 on all PCM streams and on 268 XMA2 streams).
+//! PCM exports as WAV (16-bit integer or 32-bit float, bit-exact). XMA2 data
+//! is a run of 2,048-byte XMA2 packets (the seek table holds one u32 per
+//! packet); it is remuxed losslessly into a RIFF WAVE file with an
+//! XMA2WAVEFORMATEX header (`.xma`), which FFmpeg decodes.
 
 use crate::export::Progress;
 use anyhow::{anyhow, Context, Result};
@@ -42,6 +53,20 @@ pub const CH_STREAM_FORMAT: u8 = 0x48;
 pub const CH_PEAK: u8 = 0x36;
 pub const CH_SEEK: u8 = 0xA3;
 pub const CH_MARKERS: u8 = 0xBD;
+
+/// Codec ids (u8 at 0x1C of the 32-byte format chunk).
+pub const CODEC_PCM16: u8 = 0;
+pub const CODEC_PCM_F32: u8 = 2;
+pub const CODEC_XMA2: u8 = 5;
+pub const CODEC_OPUS: u8 = 11;
+
+/// XMA2 packets are 2 KiB; each XMA frame decodes to 512 samples per channel.
+pub const XMA2_PACKET: usize = 0x800;
+pub const XMA2_FRAME_SAMPLES: u32 = 512;
+
+/// Bumped when the index meaning changes, so older indexes get rescanned.
+/// 2: codec from 0x1C; PCM and XMA2 streams get their own layouts.
+pub const INDEX_VERSION: u32 = 2;
 
 const BLOCK: usize = 0x800;
 /// Opus default encoder delay, used when the packet total does not give one.
@@ -72,28 +97,31 @@ pub struct Stream {
     pub samples: u32,
     /// Rate field of the format chunk.
     pub rate: u32,
-    /// Codec byte of the format chunk (Opus streams have 0).
+    /// Codec id: 0x1C of a 32-byte format chunk (CODEC_*), else the byte at
+    /// 0x13 of the shorter forms; for music streams, the first sub-stream's.
     pub codec: u8,
     /// Channels: from the first packet for Opus streams; for music streams
-    /// the number of sub-streams (stems) in the stream-format chunk.
+    /// the number of sub-streams (stems) in the stream-format chunk; for PCM
+    /// and XMA2 the format chunk's channel count.
     pub channels: u32,
     /// "blocks" (Opus, 2 KiB packet blocks), "music" (sub-streams in large
-    /// blocks, see the module notes), "other" (data with a codec byte other
-    /// than 0: not decoded), or "none" (no data chunk: a channel entry of a
-    /// music stream, or metadata only).
+    /// blocks, see the module notes), "pcm16" / "pcmf32" (PCM, exported as
+    /// WAV), "xma2" (XMA2 packets, remuxed to RIFF XMA2), "other" (another
+    /// codec id: not decoded), or "none" (no data chunk: a channel entry of
+    /// a music stream, or metadata only).
     pub layout: String,
 }
 
 impl From<StreamT> for Stream {
     fn from(t: StreamT) -> Self {
-        let layout = match t.5 { 1 => "blocks", 2 => "music", 3 => "other", _ => "none" }.into();
+        let layout = match t.5 { 1 => "blocks", 2 => "music", 3 => "other", 4 => "pcm16", 5 => "pcmf32", 6 => "xma2", _ => "none" }.into();
         Stream { id: t.0, chunks: Vec::new(), data: (t.6, t.7), samples: t.1, rate: t.2, codec: t.3, channels: t.4, layout }
     }
 }
 
 impl From<Stream> for StreamT {
     fn from(s: Stream) -> Self {
-        let l = match s.layout.as_str() { "blocks" => 1, "music" => 2, "other" => 3, _ => 0 };
+        let l = match s.layout.as_str() { "blocks" => 1, "music" => 2, "other" => 3, "pcm16" => 4, "pcmf32" => 5, "xma2" => 6, _ => 0 };
         (s.id, s.samples, s.rate, s.codec, s.channels, l, s.data.0, s.data.1)
     }
 }
@@ -108,6 +136,10 @@ impl Stream {
     }
     pub fn playable(&self) -> bool {
         self.layout == "blocks"
+    }
+    /// Exported per stream (Opus, music, PCM or XMA2), as opposed to raw only.
+    pub fn exportable(&self) -> bool {
+        matches!(self.layout.as_str(), "blocks" | "music" | "pcm16" | "pcmf32" | "xma2")
     }
     pub fn seconds(&self) -> f64 {
         match self.layout.as_str() {
@@ -137,6 +169,9 @@ impl Bank {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AudioIndex {
+    /// INDEX_VERSION when written (absent = 1).
+    #[serde(default)]
+    pub version: u32,
     pub archive: String,
     pub archive_size: u64,
     pub banks: Vec<Bank>,
@@ -221,7 +256,16 @@ fn read_formats(f: &mut File, bank: &mut Bank) -> Result<()> {
             f.read_exact(&mut b)?;
             s.samples = u32le(&b, 0).unwrap_or(0);
             s.rate = u16le(&b, 8).unwrap_or(0);
-            s.codec = b.get(0x13).copied().unwrap_or(0);
+            if b.len() >= 0x1E {
+                s.codec = b[0x1C];
+                s.channels = b[0x1D] as u32;
+            } else {
+                // 20/24-byte forms: earlier reading of the codec byte (0 = Opus)
+                s.codec = match b.get(0x13).copied().unwrap_or(0) {
+                    0 => CODEC_OPUS,
+                    c => c,
+                };
+            }
         }
         if let Some(c) = s.chunk(CH_STREAM_FORMAT).cloned() {
             let mut b = vec![0u8; c.size.min(12 + 16 * 64) as usize];
@@ -242,8 +286,13 @@ fn read_formats(f: &mut File, bank: &mut Bank) -> Result<()> {
         }
         s.layout = match (s.chunk(CH_DATA), s.chunk(CH_STREAM_FORMAT)) {
             (Some(_), Some(_)) => "music",
-            (Some(_), None) if s.codec == 0 => "blocks",
-            (Some(_), None) => "other",
+            (Some(_), None) => match s.codec {
+                CODEC_OPUS => "blocks",
+                CODEC_PCM16 => "pcm16",
+                CODEC_PCM_F32 => "pcmf32",
+                CODEC_XMA2 => "xma2",
+                _ => "other",
+            },
             _ => "none",
         }
         .into();
@@ -333,10 +382,11 @@ pub fn scan(path: &Path, archive: &str, pr: Progress) -> Result<AudioIndex> {
         }
     }
     Ok(AudioIndex {
+        version: INDEX_VERSION,
         archive: archive.into(),
         archive_size: len,
         banks,
-        note: "Audio banks (ADAT) found by scanning for the magic; offsets are in the archive. Stream ids are 29-bit hashes (names not recovered). layout: blocks = Opus packets in 2 KiB blocks (exported as Ogg Opus or WAV); music = sub-streams (stems), each its own Opus stream, exported one file per sub-stream; music lengths are per sub-stream; other = codec byte not 0, not decoded (exported raw); none = no data chunk. Opus sample counts are 48 kHz units over all channels.".into(),
+        note: "Audio banks (ADAT) found by scanning for the magic; offsets are in the archive. Stream ids are 29-bit hashes (names not recovered). layout: blocks = Opus packets in 2 KiB blocks (exported as Ogg Opus or WAV); music = sub-streams (stems), each its own Opus stream, exported one file per sub-stream; music lengths are per sub-stream; pcm16 / pcmf32 = PCM (exported as WAV); xma2 = XMA2 packets (remuxed to RIFF XMA2, .xma); other = another codec id, not decoded (exported raw); none = no data chunk. codec = format chunk byte 0x1C (11 Opus, 0 PCM16, 2 PCM float32, 5 XMA2). Opus sample counts are 48 kHz units over all channels.".into(),
     })
 }
 
@@ -598,6 +648,16 @@ pub fn export_stream(bank_bytes: &[u8], b: &Bank, s: &Stream, out: &Path, fmt: &
         }
         return Ok(files);
     }
+    if matches!(s.layout.as_str(), "pcm16" | "pcmf32" | "xma2") {
+        // one lossless file whatever `fmt` asks for: .wav (PCM) or .xma (XMA2)
+        let (name, bytes) = match s.layout.as_str() {
+            "xma2" => (format!("{}.xma", stem(b, s)), xma2_riff(stream_data(bank_bytes, s)?, s)?),
+            _ => (format!("{}.wav", stem(b, s)), pcm_wav(stream_data(bank_bytes, s)?, s)?),
+        };
+        let p = out.join(name);
+        std::fs::write(&p, bytes)?;
+        return Ok(vec![p.display().to_string()]);
+    }
     if s.layout != "blocks" {
         return Err(anyhow!("stream {:08x}: layout '{}' is not exported per stream (export the bank raw)", s.id, s.layout));
     }
@@ -625,6 +685,107 @@ fn write_stream(pk: &[Vec<u8>], frames: u32, st: &str, out: &Path, fmt: &str) ->
     Ok(files)
 }
 
+/// A stream's data chunk.
+pub fn stream_data<'a>(bank: &'a [u8], s: &Stream) -> Result<&'a [u8]> {
+    let (off, size) = s.data;
+    bank.get(off as usize..off as usize + size as usize).ok_or_else(|| anyhow!("stream {:08x}: data chunk outside the bank", s.id))
+}
+
+/// WAV for a PCM stream (`pcm16`: 16-bit integer, `pcmf32`: 32-bit float),
+/// samples copied as stored and cut to the format chunk's sample count.
+pub fn pcm_wav(data: &[u8], s: &Stream) -> Result<Vec<u8>> {
+    let ch = s.channels.max(1);
+    let (bytes, tag) = match s.layout.as_str() {
+        "pcm16" => (2u32, 1u16),
+        "pcmf32" => (4, 3),
+        l => return Err(anyhow!("stream {:08x}: layout '{l}' is not PCM", s.id)),
+    };
+    let block = bytes * ch;
+    let n = (s.samples as usize * block as usize).min(data.len() / block as usize * block as usize);
+    if s.rate == 0 || n == 0 {
+        return Err(anyhow!("stream {:08x}: empty PCM stream", s.id));
+    }
+    let data = &data[..n];
+    // non-integer formats carry a fact chunk and an 18-byte fmt (cbSize = 0)
+    let float = tag == 3;
+    let fmt_len: u32 = if float { 18 } else { 16 };
+    let fact_len: u32 = if float { 12 } else { 0 };
+    let mut o = Vec::with_capacity(44 + 14 + n);
+    o.extend_from_slice(b"RIFF");
+    o.extend_from_slice(&(4 + 8 + fmt_len + fact_len + 8 + n as u32).to_le_bytes());
+    o.extend_from_slice(b"WAVEfmt ");
+    o.extend_from_slice(&fmt_len.to_le_bytes());
+    o.extend_from_slice(&tag.to_le_bytes());
+    o.extend_from_slice(&(ch as u16).to_le_bytes());
+    o.extend_from_slice(&s.rate.to_le_bytes());
+    o.extend_from_slice(&(s.rate * block).to_le_bytes());
+    o.extend_from_slice(&(block as u16).to_le_bytes());
+    o.extend_from_slice(&(bytes as u16 * 8).to_le_bytes());
+    if float {
+        o.extend_from_slice(&0u16.to_le_bytes());
+        o.extend_from_slice(b"fact");
+        o.extend_from_slice(&4u32.to_le_bytes());
+        o.extend_from_slice(&((n / block as usize) as u32).to_le_bytes());
+    }
+    o.extend_from_slice(b"data");
+    o.extend_from_slice(&(n as u32).to_le_bytes());
+    o.extend_from_slice(data);
+    Ok(o)
+}
+
+/// XMA frames that start in each 2 KiB packet: the top 6 bits of the
+/// big-endian packet header (XMA2 packet header: frame count 6, first frame
+/// offset in bits 15, metadata 3, packet skip count 8).
+pub fn xma2_frames(data: &[u8]) -> u32 {
+    data.chunks_exact(XMA2_PACKET).map(|p| (p[0] >> 2) as u32).sum()
+}
+
+/// Lossless remux of an XMA2 stream into RIFF WAVE with an XMA2WAVEFORMATEX
+/// `fmt ` chunk (format tag 0x166, cbSize 34) and the packets as `data`.
+/// The play region is the format chunk's sample count from sample 0.
+pub fn xma2_riff(data: &[u8], s: &Stream) -> Result<Vec<u8>> {
+    let ch = s.channels.max(1);
+    if data.is_empty() || data.len() % XMA2_PACKET != 0 {
+        return Err(anyhow!("stream {:08x}: XMA2 data is not whole 2 KiB packets ({} bytes)", s.id, data.len()));
+    }
+    if ch > 2 || s.rate == 0 {
+        return Err(anyhow!("stream {:08x}: unexpected XMA2 format ({ch} ch, {} Hz)", s.id, s.rate));
+    }
+    let encoded = xma2_frames(data) * XMA2_FRAME_SAMPLES;
+    let samples = s.samples.min(encoded);
+    let n = data.len() as u32;
+    let avg = if samples > 0 { (n as u64 * s.rate as u64 / samples as u64) as u32 } else { 0 };
+    let mut o = Vec::with_capacity(8 + 4 + 8 + 52 + 8 + data.len());
+    o.extend_from_slice(b"RIFF");
+    o.extend_from_slice(&(4 + 8 + 52 + 8 + n).to_le_bytes());
+    o.extend_from_slice(b"WAVEfmt ");
+    o.extend_from_slice(&52u32.to_le_bytes());
+    // WAVEFORMATEX
+    o.extend_from_slice(&0x0166u16.to_le_bytes()); // WAVE_FORMAT_XMA2
+    o.extend_from_slice(&(ch as u16).to_le_bytes());
+    o.extend_from_slice(&s.rate.to_le_bytes());
+    o.extend_from_slice(&avg.to_le_bytes());
+    o.extend_from_slice(&(2 * ch as u16).to_le_bytes()); // nBlockAlign: 16-bit output per channel
+    o.extend_from_slice(&16u16.to_le_bytes()); // wBitsPerSample
+    o.extend_from_slice(&34u16.to_le_bytes()); // cbSize
+    // XMA2WAVEFORMATEX extension
+    o.extend_from_slice(&1u16.to_le_bytes()); // NumStreams (one mono or stereo stream)
+    o.extend_from_slice(&(if ch == 1 { 0x4u32 } else { 0x3 }).to_le_bytes()); // ChannelMask: FC, or FL|FR
+    o.extend_from_slice(&encoded.to_le_bytes()); // SamplesEncoded
+    o.extend_from_slice(&n.to_le_bytes()); // BytesPerBlock (one block holds every packet)
+    o.extend_from_slice(&0u32.to_le_bytes()); // PlayBegin
+    o.extend_from_slice(&samples.to_le_bytes()); // PlayLength
+    o.extend_from_slice(&0u32.to_le_bytes()); // LoopBegin
+    o.extend_from_slice(&0u32.to_le_bytes()); // LoopLength
+    o.push(0); // LoopCount
+    o.push(4); // EncoderVersion
+    o.extend_from_slice(&1u16.to_le_bytes()); // BlockCount
+    o.extend_from_slice(b"data");
+    o.extend_from_slice(&n.to_le_bytes());
+    o.extend_from_slice(data);
+    Ok(o)
+}
+
 pub fn index_path(work: &Path, archive: &str) -> std::path::PathBuf {
     work.join("index").join(format!("audio_{}.json.gz", archive.trim_end_matches(".rpf").replace(['/', '\\'], "_")))
 }
@@ -632,7 +793,11 @@ pub fn index_path(work: &Path, archive: &str) -> std::path::PathBuf {
 pub fn load_index(work: &Path, archive: &str) -> Result<AudioIndex> {
     let p = index_path(work, archive);
     let f = File::open(&p).with_context(|| format!("no audio index {} (run `sixng audio` first)", p.display()))?;
-    Ok(serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f)))?)
+    let ix: AudioIndex = serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f)))?;
+    if ix.version < INDEX_VERSION {
+        return Err(anyhow!("the audio index {} is from an older SixNG (codecs read from the wrong byte): scan audio.rpf again (`sixng audio --rescan`)", p.display()));
+    }
+    Ok(ix)
 }
 
 pub fn save_index(work: &Path, ix: &AudioIndex) -> Result<()> {
@@ -671,6 +836,66 @@ mod tests {
         assert_eq!(b.streams.len(), 1);
         assert_eq!(b.streams[0].id, 0x1234);
         assert_eq!(b.size, hl as u64 + 32 + 2048);
+    }
+    fn stream(layout: &str, samples: u32, rate: u32, channels: u32, size: u32) -> Stream {
+        Stream { id: 0x42, chunks: Vec::new(), data: (0, size), samples, rate, codec: 0, channels, layout: layout.into() }
+    }
+    #[test]
+    fn index_tuple_layouts() {
+        for l in ["blocks", "music", "other", "pcm16", "pcmf32", "xma2", "none"] {
+            let t: StreamT = stream(l, 1, 2, 1, 3).into();
+            assert_eq!(Stream::from(t).layout, l);
+        }
+    }
+    #[test]
+    fn pcm16_wav() {
+        let data: Vec<u8> = (0..20u8).collect(); // 10 samples, header says 8
+        let w = pcm_wav(&data, &stream("pcm16", 8, 48000, 1, 20)).unwrap();
+        assert_eq!(&w[0..4], b"RIFF");
+        assert_eq!(u32le(&w, 4).unwrap() as usize, w.len() - 8);
+        assert_eq!(u16le(&w, 20), Some(1)); // PCM
+        assert_eq!(u16le(&w, 34), Some(16));
+        assert_eq!(&w[36..40], b"data");
+        assert_eq!(u32le(&w, 40), Some(16));
+        assert_eq!(&w[44..], &data[..16]);
+    }
+    #[test]
+    fn pcm_float_wav() {
+        let data: Vec<u8> = [0.5f32, -0.25, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        let w = pcm_wav(&data, &stream("pcmf32", 3, 48000, 1, 12)).unwrap();
+        assert_eq!(u32le(&w, 16), Some(18)); // fmt size with cbSize
+        assert_eq!(u16le(&w, 20), Some(3)); // IEEE float
+        assert_eq!(u16le(&w, 34), Some(32));
+        assert_eq!(&w[38..42], b"fact");
+        assert_eq!(u32le(&w, 46), Some(3));
+        assert_eq!(&w[50..54], b"data");
+        assert_eq!(&w[58..], &data[..]);
+        assert_eq!(u32le(&w, 4).unwrap() as usize, w.len() - 8);
+    }
+    #[test]
+    fn xma2_remux() {
+        // two packets: 14 and 3 frames start in them
+        let mut data = vec![0u8; 2 * XMA2_PACKET];
+        data[0] = 14 << 2;
+        data[XMA2_PACKET] = 3 << 2;
+        assert_eq!(xma2_frames(&data), 17);
+        let w = xma2_riff(&data, &stream("xma2", 8000, 32000, 1, data.len() as u32)).unwrap();
+        assert_eq!(&w[8..16], b"WAVEfmt ");
+        assert_eq!(u32le(&w, 16), Some(52));
+        assert_eq!(u16le(&w, 20), Some(0x166));
+        assert_eq!(u16le(&w, 22), Some(1));
+        assert_eq!(u32le(&w, 24), Some(32000));
+        assert_eq!(u16le(&w, 36), Some(34)); // cbSize
+        let x = 38; // XMA2WAVEFORMATEX extension
+        assert_eq!(u16le(&w, x), Some(1)); // NumStreams
+        assert_eq!(u32le(&w, x + 2), Some(4)); // FC
+        assert_eq!(u32le(&w, x + 6), Some(17 * 512)); // SamplesEncoded
+        assert_eq!(u32le(&w, x + 10), Some(data.len() as u32)); // BytesPerBlock
+        assert_eq!(u32le(&w, x + 18), Some(8000)); // PlayLength
+        assert_eq!(u16le(&w, x + 32), Some(1)); // BlockCount
+        assert_eq!(&w[72..76], b"data");
+        assert_eq!(&w[80..], &data[..]);
+        assert!(xma2_riff(&data[..100], &stream("xma2", 1, 32000, 1, 100)).is_err());
     }
     #[test]
     fn music() {
