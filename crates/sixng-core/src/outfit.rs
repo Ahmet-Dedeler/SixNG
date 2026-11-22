@@ -71,11 +71,13 @@ pub struct PartOpt {
     pub default: bool,
 }
 
-/// One entry per name: the first in the archive (lowest offset).
+/// One entry per name: the largest copy (a part is stored once per LOD
+/// under the same name, and not always LOD0 first: `sc_boss_demon`'s lower
+/// body has LOD1 first, without a skeleton), the first in the archive on a tie.
 pub fn dedupe<'a>(it: impl Iterator<Item = (String, &'a Entry)>) -> BTreeMap<String, &'a Entry> {
     let mut by_name: BTreeMap<String, &Entry> = BTreeMap::new();
     for (n, e) in it {
-        by_name.entry(n).and_modify(|x| if e.off < x.off { *x = e }).or_insert(e);
+        by_name.entry(n).and_modify(|x| if (e.usize, std::cmp::Reverse(e.off)) > (x.usize, std::cmp::Reverse(x.off)) { *x = e }).or_insert(e);
     }
     by_name
 }
@@ -198,6 +200,111 @@ pub fn outfit_parts<'a>(ix: &'a ArchiveIndex, prefix: &str) -> Vec<&'a Entry> {
 }
 
 
+/// Group words of animal parts left out of the default look: accessories,
+/// corpse and roadkill copies, and `fur` (3-vertex placeholders with their
+/// own skeleton copy; the fur itself is strand grooms, see `sixng grooms`).
+const ANIMAL_SKIP: &[&str] = &[
+    "fur",
+    "generic", "costume", "collar", "harness", "hat", "badge", "ribbon", "bandana", "cape", "lace", "flower", "knife", "vest", "rope", "tranquilizer", "loop", "shadesaviators", "accessories", "human", "stick", "corpse", "roadkill", "gut", "gonad", "bone",
+];
+
+/// Every part of an animal root: `<root>_<words>_<NN>[_<set>]` (`body_00`,
+/// `body_08_collarharness`, `harness_08_collarharness`). The default look is
+/// the `_00` parts without accessories. Roots without parts of their own fall
+/// back to `<root minus _NN>_…`.
+pub fn animal_options(ix: &ArchiveIndex, root: &str) -> Vec<PartOpt> {
+    let root = root.to_ascii_lowercase();
+    let mut prefixes = vec![format!("{root}_")];
+    if let Some((stem, n)) = root.rsplit_once('_') {
+        if n.chars().all(|c| c.is_ascii_digit()) {
+            prefixes.push(format!("{stem}_"));
+        }
+    }
+    let mut first_any: Vec<PartOpt> = Vec::new();
+    for p in prefixes {
+        let by_name = dedupe(ix.entries.iter().filter(|e| e.rtype.as_deref() == Some("dr")).filter_map(|e| {
+            let n = e.name.as_ref()?.to_ascii_lowercase();
+            n.starts_with(&p).then_some((n, e))
+        }));
+        let mut opts = Vec::new();
+        for (n, e) in by_name {
+            let toks: Vec<&str> = n[p.len()..].split('_').collect();
+            let Some(j) = toks.iter().position(|t| t.len() == 2 && t.chars().all(|c| c.is_ascii_digit())) else { continue };
+            let group = &toks[..j];
+            if group.is_empty() || group.iter().any(|t| t.is_empty() || !t.chars().all(|c| c.is_ascii_lowercase())) {
+                continue;
+            }
+            let set = toks[j + 1..].join(" ");
+            let default = toks[j] == "00" && set.is_empty() && !group.iter().any(|t| ANIMAL_SKIP.contains(t));
+            let label = if toks[j] == "00" && set.is_empty() { "default".to_string() } else { format!("{} {}", toks[j], set).trim().to_string() };
+            opts.push(PartOpt { off: e.off, id: e.id.clone(), name: n.clone(), group: group.join(" "), label, default });
+        }
+        if opts.iter().any(|o| o.default) {
+            return opts;
+        }
+        if first_any.is_empty() {
+            first_any = opts;
+        }
+    }
+    first_any
+}
+
+/// Default parts of an animal root: `<root>_<words>_00` without accessories.
+pub fn animal_parts<'a>(ix: &'a ArchiveIndex, root: &str) -> Vec<&'a Entry> {
+    let offs: Vec<u64> = animal_options(ix, root).into_iter().filter(|o| o.default).map(|o| o.off).collect();
+    ix.entries.iter().filter(|e| offs.contains(&e.off)).collect()
+}
+
+/// One assemblable character or animal (see `characters`).
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct CharacterInfo {
+    pub name: String,
+    /// "character" (outfit prefix) or "animal" (fragment root).
+    pub kind: &'static str,
+    /// Distinct part names (each stored once per LOD).
+    pub parts: usize,
+    /// Parts in the default look.
+    pub default_parts: usize,
+}
+
+/// Every named character (outfit prefix with parts) and every animal root
+/// (an `ft` fragment `cr?_…` with parts of its own) in an archive index,
+/// sorted by name.
+pub fn characters(ix: &ArchiveIndex) -> Vec<CharacterInfo> {
+    let mut prefixes: BTreeMap<String, ()> = BTreeMap::new();
+    let mut roots: BTreeMap<String, ()> = BTreeMap::new();
+    for e in &ix.entries {
+        let Some(n) = e.name.as_ref().map(|n| n.to_ascii_lowercase()) else { continue };
+        match e.rtype.as_deref() {
+            Some("dr") => {
+                if let Some(p) = outfit_prefix(&n) {
+                    prefixes.insert(p, ());
+                }
+            }
+            Some("ft") if is_animal(&n) => {
+                roots.insert(n, ());
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for p in prefixes.keys() {
+        let o = outfit_options(ix, p);
+        if !o.is_empty() {
+            out.push(CharacterInfo { name: p.clone(), kind: "character", parts: o.len(), default_parts: o.iter().filter(|x| x.default).count() });
+        }
+    }
+    for r in roots.keys() {
+        // only roots with parts named after themselves (not the shared `_NN`-less fallback)
+        let o: Vec<PartOpt> = animal_options(ix, r).into_iter().filter(|x| x.name.starts_with(&format!("{r}_"))).collect();
+        if !o.is_empty() {
+            out.push(CharacterInfo { name: r.clone(), kind: "animal", parts: o.len(), default_parts: o.iter().filter(|x| x.default).count() });
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
 /// Merge the joint lists of several parts into one skeleton. Joints with the
 /// same name, the same parent name and the same bind (within 0.1 mm / 1e-4)
 /// are one joint; a name that comes back with another bind or parent is
@@ -302,9 +409,10 @@ pub fn clip_channels(d: &crate::anim::ClipDictionary, c: &crate::anim::Clip, joi
 }
 
 /// Write one rigged GLB of `parts` (LOD0) at `out`. Textures go to
-/// `<out folder>/textures/`. With a clip, the GLB carries it as a glTF
-/// animation. Returns the JSON report.
-pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, o: &ExportOptions, clip: Option<(&crate::anim::ClipDictionary, &crate::anim::Clip)>) -> Result<serde_json::Value> {
+/// `<out folder>/textures/`. Each clip becomes one glTF animation, named
+/// `<dictionary>/<clip>`. With `anim_only` the GLB holds the skeleton and
+/// the animations without meshes or textures. Returns the JSON report.
+pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, o: &ExportOptions, clips: &[(&crate::anim::ClipDictionary, &crate::anim::Clip)], anim_only: bool) -> Result<serde_json::Value> {
     if parts.is_empty() {
         bail!("no parts selected");
     }
@@ -312,6 +420,11 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
     std::fs::create_dir_all(&dir)?;
     let mut o = o.clone();
     o.out = dir.clone();
+    if anim_only {
+        o.png = false;
+        o.dds = false;
+        o.skip_embedded_textures = true;
+    }
     let mut groups: Vec<NodeGroup> = Vec::new();
     let mut materials = Vec::new();
     let mut part_joints: Vec<Vec<Joint>> = Vec::new();
@@ -352,8 +465,8 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         }
     }
     let mut anims = Vec::new();
-    let mut clip_report = serde_json::Value::Null;
-    if let Some((d, c)) = clip {
+    let mut clip_reports = Vec::new();
+    for &(d, c) in clips {
         if c.kind != 1 {
             bail!("clip {} has type {} (only animation clips, type 1, are decoded)", c.short_name(), c.kind);
         }
@@ -365,10 +478,20 @@ pub fn export_outfit(a: &ArchiveInfo, parts: &[&Entry], name: &str, out: &Path, 
         stats["clip"] = c.short_name().into();
         stats["duration"] = c.duration.into();
         stats["frames"] = channels.iter().map(|ch| ch.times.len()).max().unwrap_or(0).into();
-        clip_report = stats;
+        clip_reports.push(stats);
         anims.push(crate::gltf::Animation { name: format!("{}/{}", d.name, c.short_name()), channels });
     }
-    let extras = serde_json::json!({"outfit": name, "parts": parts.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "coordinate_system": crate::export::COORDS});
+    // one clip: the report as before (an object); several: a list
+    let clip_report = match clip_reports.len() {
+        0 => serde_json::Value::Null,
+        1 => clip_reports.pop().unwrap(),
+        _ => serde_json::Value::Array(clip_reports),
+    };
+    if anim_only {
+        groups.clear();
+        materials.clear();
+    }
+    let extras = serde_json::json!({"outfit": name, "parts": parts.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), "coordinate_system": crate::export::COORDS, "anim_only": anim_only});
     let opt = crate::gltf::GlbOptions { animations: &anims, trs_joints: true, skinned_meshes_at_root: true };
     let glb = crate::gltf::mesh_glb_with(name, &groups, &materials, &joints, extras, &opt);
     std::fs::write(out, &glb)?;
@@ -446,7 +569,7 @@ mod tests {
         assert!(parts.len() >= 5, "{} parts", parts.len());
         let out = std::env::temp_dir().join("sixng_outfit_real").join("outfit.glb");
         let o = ExportOptions { out: out.parent().unwrap().into(), png: false, dds: false, raw: false, force: true, skip_embedded_textures: true, body_shape: vec![], head_skin: 0 };
-        let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, Some((&d, clip))).unwrap();
+        let r = export_outfit(&a, &parts, "player_story000_00", &out, &o, &[(&d, clip)], false).unwrap();
         println!("{}", serde_json::to_string_pretty(&r).unwrap());
         assert_eq!(r["unresolved_influences"], 0);
         assert!(r["clip"]["bone_tracks_on_joints_pct"].as_f64().unwrap() >= 90.0);

@@ -924,6 +924,11 @@ pub(crate) fn build_drawable(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &cr
             let remap = |js: &mut Vec<[u16; 4]>| js.iter_mut().flatten().for_each(|j| *j = map.get(*j as usize).copied().unwrap_or(u16::MAX));
             m.joints.as_mut().map(remap);
             m.joints1.as_mut().map(remap);
+            // rigid part (one-bone palette): every vertex on that bone
+            if m.joints.is_none() && map.len() == 1 && map[0] != u16::MAX {
+                m.joints = Some(vec![[map[0], 0, 0, 0]; m.positions.len()]);
+                m.weights = Some(vec![[255, 0, 0, 0]; m.positions.len()]);
+            }
         }
         // Bone indices with non-zero weight in either influence set.
         let skin_used: Option<Vec<u16>> = m.joints.as_ref().map(|js| {
@@ -1107,7 +1112,11 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
     for (i, b) in skeleton.iter().enumerate() {
         own_hash.entry(crate::meta7a::joaat(&b.name)).or_insert(i);
     }
-    let cand: Vec<(&crate::drawable::Model, &Vec<u32>)> = info.models.iter().filter_map(|m| m.bone_palette.as_ref().map(|p| (m, p))).collect();
+    // An animal part's shared skeleton is its root fragment's.
+    let animal = crate::pedskel::animal(&game_root(a), e.name.as_deref().unwrap_or(""));
+    // one-bone (rigid) palettes only on ped and animal parts
+    let cand: Vec<(&crate::drawable::Model, &Vec<u32>)> =
+        info.models.iter().filter_map(|m| m.bone_palette.as_ref().map(|p| (m, p))).filter(|(_, p)| p.len() > 1 || ped_name || animal.is_some()).collect();
     if !own_ok || cand.is_empty() {
         return out;
     }
@@ -1116,7 +1125,13 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
     // (the ascending check alone is not proof), or a ped part's palette
     // names shared ped skeleton bones only (heads, low-detail copies).
     let names_own = cand.iter().any(|(_, p)| p.iter().any(|h| own_hash.contains_key(h)));
-    let ped = if names_own || ped_name { crate::pedskel::get(&game_root(a), female) } else { None };
+    let ped = if animal.is_some() {
+        animal
+    } else if names_own || ped_name {
+        crate::pedskel::get(&game_root(a), female)
+    } else {
+        None
+    };
     let in_ped = |p: &Vec<u32>| ped.is_some_and(|s| !p.is_empty() && p.iter().filter(|h| s.by_hash.contains_key(h)).count() * 10 >= p.len() * 9);
     if !names_own && !cand.iter().any(|(_, p)| in_ped(p)) {
         return out;
@@ -1138,7 +1153,7 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, r: &Resource, info: &crate::drawable::Dr
         .collect();
     if let Some(p) = ped {
         let mut j: Vec<Joint> = p.bones.iter().map(|b| joint(b, 0)).collect();
-        if !o.body_shape.is_empty() {
+        if !o.body_shape.is_empty() && animal.is_none() {
             match crate::bodyshape::get(&game_root(a), female) {
                 Ok(rig) => match crate::bodyshape::pose(&p.bones, rig, &crate::bodyshape::input_values(&o.body_shape)) {
                     Some((posed, _)) => j.iter_mut().zip(posed).for_each(|(j, m)| j.pose = Some(m)),

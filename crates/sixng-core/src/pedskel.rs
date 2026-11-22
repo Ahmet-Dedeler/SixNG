@@ -31,11 +31,23 @@ pub fn source_name(female: bool) -> &'static str {
     }
 }
 
+fn packs_index() -> Option<&'static crate::scan::ArchiveIndex> {
+    static IX: OnceLock<Option<crate::scan::ArchiveIndex>> = OnceLock::new();
+    IX.get_or_init(|| {
+        let work = crate::names::work_dir()?;
+        crate::scan::load_index(&crate::scan::index_path(&work.join("index"), "packs.rpf")).ok()
+    })
+    .as_ref()
+}
+
 fn load(game_root: &Path, female: bool) -> Option<PedSkeleton> {
-    let work = crate::names::work_dir()?;
-    let ix = crate::scan::load_index(&crate::scan::index_path(&work.join("index"), "packs.rpf")).ok()?;
-    let name = source_name(female);
-    let e = ix.entries.iter().find(|e| e.name.as_deref() == Some(name))?;
+    load_fragment(game_root, source_name(female))
+}
+
+/// Skeleton of the named fragment in packs.rpf (largest copy).
+fn load_fragment(game_root: &Path, name: &str) -> Option<PedSkeleton> {
+    let ix = packs_index()?;
+    let e = ix.entries.iter().filter(|e| e.name.as_deref() == Some(name) && e.rtype.as_deref() == Some("ft")).max_by_key(|e| e.usize)?;
     let r = Resource::load(&game_root.join("packs.rpf"), e).ok()?;
     let bones = find_skeleton(&r);
     if bones.is_empty() || bones.iter().any(|b| b.bind_matrix.is_none()) {
@@ -52,6 +64,30 @@ pub fn get(game_root: &Path, female: bool) -> Option<&'static PedSkeleton> {
     static M: OnceLock<Option<PedSkeleton>> = OnceLock::new();
     let cell = if female { &F } else { &M };
     cell.get_or_init(|| load(game_root, female)).as_ref()
+}
+
+/// The skeleton of an animal part (`crb_eagle_bald_m_00_body_00`): animal
+/// parts are skinned to the bones of their root fragment
+/// (`crb_eagle_bald_m_00`, which holds only that skeleton and a placeholder
+/// plane). The root is the longest `_`-prefix of the name that is a fragment
+/// in packs.rpf. Cached per root; None when there is none.
+pub fn animal(game_root: &Path, part_name: &str) -> Option<&'static PedSkeleton> {
+    use std::sync::Mutex;
+    static CACHE: OnceLock<Mutex<HashMap<String, Option<&'static PedSkeleton>>>> = OnceLock::new();
+    if !crate::outfit::is_animal(part_name) {
+        return None;
+    }
+    let ix = packs_index()?;
+    let toks: Vec<&str> = part_name.split('_').collect();
+    let root = (2..toks.len()).rev().map(|k| toks[..k].join("_")).find(|r| ix.entries.iter().any(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(r))))?;
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some(s) = cache.lock().ok()?.get(&root) {
+        return *s;
+    }
+    let real = ix.entries.iter().find(|e| e.rtype.as_deref() == Some("ft") && e.name.as_deref().is_some_and(|n| n.eq_ignore_ascii_case(&root)))?.name.clone()?;
+    let s: Option<&'static PedSkeleton> = load_fragment(game_root, &real).map(|s| &*Box::leak(Box::new(s)));
+    cache.lock().ok()?.insert(root, s);
+    s
 }
 
 /// Ped part name: has a fit tag (`mr1`, `fr1`, `mk1` …: sex + body type +

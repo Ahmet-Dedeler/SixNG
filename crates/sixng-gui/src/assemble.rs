@@ -7,121 +7,13 @@
 //! `u_m_m_farm_monster_man`, `player_story000_01`) are sets of clothing and
 //! body drawables `<prefix>_<item>_<fit>_…` with fit tags like `mr1` / `fr1`.
 //! Both are put together here for the viewer: the default parts, one copy each
-//! (the first in the archive), in their bind pose.
+//! (the largest copy, LOD0), in their bind pose.
 
-use sixng_core::outfit::{dedupe, is_fit};
+use sixng_core::outfit::is_fit;
 pub use sixng_core::outfit::{
-    is_animal, is_ped_part, is_whole_ped, outfit_options, outfit_parts, outfit_prefix, PartOpt,
+    animal_options, animal_parts, is_animal, is_ped_part, is_whole_ped, outfit_options,
+    outfit_parts, outfit_prefix, PartOpt,
 };
-use sixng_core::scan::{ArchiveIndex, Entry};
-
-const ANIMAL_SKIP: &[&str] = &[
-    "generic",
-    "costume",
-    "collar",
-    "harness",
-    "hat",
-    "badge",
-    "ribbon",
-    "bandana",
-    "cape",
-    "lace",
-    "flower",
-    "knife",
-    "vest",
-    "rope",
-    "tranquilizer",
-    "loop",
-    "shadesaviators",
-    "accessories",
-    "human",
-    "stick",
-    "corpse",
-    "roadkill",
-    "gut",
-    "gonad",
-    "bone",
-];
-
-/// Every part of an animal root: `<root>_<words>_<NN>[_<set>]` (`body_00`,
-/// `body_08_collarharness`, `harness_08_collarharness`). The default look is
-/// the `_00` parts without accessories. Roots without parts of their own fall
-/// back to `<root minus _NN>_…`.
-pub fn animal_options(ix: &ArchiveIndex, root: &str) -> Vec<PartOpt> {
-    let root = root.to_ascii_lowercase();
-    let mut prefixes = vec![format!("{root}_")];
-    if let Some((stem, n)) = root.rsplit_once('_') {
-        if n.chars().all(|c| c.is_ascii_digit()) {
-            prefixes.push(format!("{stem}_"));
-        }
-    }
-    let mut first_any: Vec<PartOpt> = Vec::new();
-    for p in prefixes {
-        let by_name = dedupe(
-            ix.entries
-                .iter()
-                .filter(|e| e.rtype.as_deref() == Some("dr"))
-                .filter_map(|e| {
-                    let n = e.name.as_ref()?.to_ascii_lowercase();
-                    n.starts_with(&p).then_some((n, e))
-                }),
-        );
-        let mut opts = Vec::new();
-        for (n, e) in by_name {
-            let toks: Vec<&str> = n[p.len()..].split('_').collect();
-            let Some(j) = toks
-                .iter()
-                .position(|t| t.len() == 2 && t.chars().all(|c| c.is_ascii_digit()))
-            else {
-                continue;
-            };
-            let group = &toks[..j];
-            if group.is_empty()
-                || group
-                    .iter()
-                    .any(|t| t.is_empty() || !t.chars().all(|c| c.is_ascii_lowercase()))
-            {
-                continue;
-            }
-            let set = toks[j + 1..].join(" ");
-            let default =
-                toks[j] == "00" && set.is_empty() && !group.iter().any(|t| ANIMAL_SKIP.contains(t));
-            let label = if toks[j] == "00" && set.is_empty() {
-                "default".to_string()
-            } else {
-                format!("{} {}", toks[j], set).trim().to_string()
-            };
-            opts.push(PartOpt {
-                off: e.off,
-                id: e.id.clone(),
-                name: n.clone(),
-                group: group.join(" "),
-                label,
-                default,
-            });
-        }
-        if opts.iter().any(|o| o.default) {
-            return opts;
-        }
-        if first_any.is_empty() {
-            first_any = opts;
-        }
-    }
-    first_any
-}
-
-/// Default parts of an animal root: `<root>_<words>_00` without accessories.
-pub fn animal_parts<'a>(ix: &'a ArchiveIndex, root: &str) -> Vec<&'a Entry> {
-    let offs: Vec<u64> = animal_options(ix, root)
-        .into_iter()
-        .filter(|o| o.default)
-        .map(|o| o.off)
-        .collect();
-    ix.entries
-        .iter()
-        .filter(|e| offs.contains(&e.off))
-        .collect()
-}
 
 fn cap(s: &str) -> String {
     let mut c = s.chars();

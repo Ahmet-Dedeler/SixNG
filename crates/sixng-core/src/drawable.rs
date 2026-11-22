@@ -1000,6 +1000,8 @@ pub struct Model {
     /// skeleton, which is not in the file. Model record: +0x0C u16 count,
     /// +0x20 pointer. Vehicle models use these fields for something else
     /// (the list is not ascending), so only an ascending list is taken.
+    /// A one-bone palette is a rigid part on that bone (an animal's eyes and
+    /// tongue on `SKEL_Head`): its vertices carry no joints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bone_palette: Option<Vec<u32>>,
 }
@@ -1007,7 +1009,7 @@ pub struct Model {
 /// Bone palette of a model record (see `Model::bone_palette`).
 fn model_palette(r: &Resource, o: usize) -> Option<Vec<u32>> {
     let n = r.u16(o + 12) as usize;
-    if !(2..=1024).contains(&n) {
+    if !(1..=1024).contains(&n) {
         return None;
     }
     let p = r.sys_off(r.u64(o + 0x20))?;
