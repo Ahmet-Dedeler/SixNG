@@ -84,6 +84,7 @@ pub const SLOTS: &[(&str, &str)] = &[
     ("b9f4bdac", "vehicle grime"),
     ("84d22f74", "vehicle scratches"),
     ("fb03ae36", "vehicle mask pack (green-dominant)"),
+    ("2c8d7182", "tint palette (embedded in the model: one row of RGBA8 colours)"),
 ];
 
 pub fn slot_role(param_hash: &str) -> Option<&'static str> {

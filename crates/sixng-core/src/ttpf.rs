@@ -72,7 +72,7 @@ pub struct TtpfTex {
 pub struct Ttpf {
     pub path: PathBuf,
     /// (file offset, virtual offset, flags byte, trailing pad bytes) per chunk, plus a terminator.
-    chunks: Vec<(u64, u64, u8, u64)>,
+    pub chunks: Vec<(u64, u64, u8, u64)>,
     pub virt_size: u64,
     pub textures: Vec<TtpfTex>,
     by_hash: HashMap<u64, usize>,
@@ -104,8 +104,8 @@ fn decode_bc1(comp: &[u8], blocks: usize) -> Option<Vec<u8>> {
 /// (a scrambled band of the smaller mips at the top). The store packs each
 /// texture's chain right up to the next texture, so where the field's size
 /// does not reach the next texture and exactly one mip count does, that
-/// count is used. Single-slice 2D textures only; checked as mip n+1 = mip n
-/// downsampled.
+/// count is used. 2D textures and arrays (tile modes 0-3); checked as mip
+/// n+1 = mip n downsampled.
 fn fix_mip_counts(textures: &mut [TtpfTex]) {
     let mut order: Vec<usize> = (0..textures.len()).collect();
     order.sort_by_key(|&i| textures[i].virt);
@@ -113,7 +113,7 @@ fn fix_mip_counts(textures: &mut [TtpfTex]) {
         let (i, n) = (w[0], w[1]);
         let gap = textures[n].virt - textures[i].virt;
         let t = &textures[i];
-        if gap == t.size || t.tile_mode() > 3 || t.slices() != 1 {
+        if gap == t.size || t.tile_mode() > 3 {
             continue;
         }
         let fmt = crate::texture::Fmt::from_dxgi(t.dxgi_format);
@@ -121,7 +121,7 @@ fn fix_mip_counts(textures: &mut [TtpfTex]) {
         let bd = fmt.block_dim();
         let full = 32 - t.width.max(t.height).leading_zeros();
         let fits: Vec<u32> = (1..=full)
-            .filter(|&m| crate::gfx10::Layout::new(sw, t.width.div_ceil(bd), t.height.div_ceil(bd), m, fmt.bytes_per_elem()).is_some_and(|l| l.total == gap))
+            .filter(|&m| crate::gfx10::Layout::new(sw, t.width.div_ceil(bd), t.height.div_ceil(bd), m, fmt.bytes_per_elem()).is_some_and(|l| l.with_slices(t.slices()).total == gap))
             .collect();
         if let [m] = fits[..] {
             let t = &mut textures[i];
@@ -418,7 +418,7 @@ impl TtpfTex {
         }
     }
     /// Mip-chain layout (`None` for unsupported tile modes or element sizes:
-    /// 1-, 8- and 16-byte elements are mapped).
+    /// 1-, 2-, 4-, 8- and 16-byte elements are mapped).
     /// Array size (d1 bits 10-19, plus 1). 1 for almost all textures; 6 on
     /// cube maps; 2-64 on a few texture arrays.
     pub fn slices(&self) -> u32 {

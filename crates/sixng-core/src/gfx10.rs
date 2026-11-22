@@ -11,7 +11,9 @@
 //!
 //! Verified on the stores: tile mode 0 = `SW_64KB_D`, modes 1, 2, 3 =
 //! `SW_4KB_S` (mip n+1 equals mip n downsampled, every format checked;
-//! 1-byte elements (A8 / R8) added 2026-11-21, checked the same way).
+//! 1-byte elements (A8 / R8) added 2026-11-21, checked the same way; 4-byte
+//! elements checked by mip consistency (mode 0) and by eye (mode 1), 2-byte
+//! elements by image smoothness on R16F textures).
 
 /// Element-coordinate bit order inside a block, low bit first:
 /// (is_x, coordinate bit).
@@ -23,6 +25,12 @@ fn equation(sw: Swizzle, bpe: u32) -> Option<&'static [(bool, u8)]> {
         (Swizzle::S4K, 8) => &[(X, 0), (Y, 0), (Y, 1), (X, 1), (X, 2), (Y, 2), (X, 3), (Y, 3), (X, 4)],
         (Swizzle::D64K, 16) => &[(X, 0), (Y, 0), (X, 1), (Y, 1), (Y, 2), (X, 2), (Y, 3), (X, 3), (Y, 4), (X, 4), (Y, 5), (X, 5)],
         (Swizzle::D64K, 8) => &[(X, 0), (Y, 0), (X, 1), (X, 2), (Y, 1), (Y, 2), (X, 3), (Y, 3), (X, 4), (Y, 4), (X, 5), (Y, 5), (X, 6)],
+        // 4-byte elements (RGBA8 / BGRA8)
+        (Swizzle::S4K, 4) => &[(X, 0), (X, 1), (Y, 0), (Y, 1), (Y, 2), (X, 2), (Y, 3), (X, 3), (Y, 4), (X, 4)],
+        (Swizzle::D64K, 4) => &[(X, 0), (X, 1), (Y, 0), (Y, 1), (X, 2), (Y, 2), (Y, 3), (X, 3), (Y, 4), (X, 4), (Y, 5), (X, 5), (Y, 6), (X, 6)],
+        // 2-byte elements (R16F / RG8)
+        (Swizzle::S4K, 2) => &[(X, 0), (X, 1), (X, 2), (Y, 0), (Y, 1), (Y, 2), (X, 3), (Y, 3), (X, 4), (Y, 4), (X, 5)],
+        (Swizzle::D64K, 2) => &[(X, 0), (X, 1), (X, 2), (Y, 0), (Y, 1), (Y, 2), (X, 3), (Y, 3), (X, 4), (Y, 4), (X, 5), (Y, 5), (X, 6), (Y, 6), (X, 7)],
         // 1-byte elements (R8 / A8)
         (Swizzle::S4K, 1) => &[(X, 0), (X, 1), (X, 2), (X, 3), (Y, 0), (Y, 1), (Y, 2), (Y, 3), (Y, 4), (X, 4), (Y, 5), (X, 5)],
         (Swizzle::D64K, 1) => &[(X, 0), (X, 1), (X, 2), (Y, 1), (Y, 0), (Y, 2), (X, 3), (Y, 3), (Y, 4), (X, 4), (Y, 5), (X, 5), (Y, 6), (X, 6), (Y, 7), (X, 7)],
@@ -95,6 +103,8 @@ impl Layout {
         let b256 = match bpe {
             16 => (4, 4),
             8 => (8, 4),
+            4 => (8, 8),
+            2 => (16, 8),
             _ => (16, 16),
         };
         for (k, p) in place.iter_mut().enumerate().skip(first) {
@@ -274,5 +284,14 @@ mod tests {
         assert_eq!(Layout::new(Swizzle::S4K, 512, 512, 6, 1).unwrap().total, 352256);
         // A8 1024x1024, 7 mips, tile 0: 3 full mips + one 64 KiB tail block
         assert_eq!(Layout::new(Swizzle::D64K, 1024, 1024, 7, 1).unwrap().total, 1441792);
+    }
+
+    #[test]
+    fn two_and_four_byte_elements_match_store_spacing() {
+        // RGBA8 512x512, 6 mips, mode 0; R16F 256x256, 1 mip, mode 0
+        assert_eq!(Layout::new(Swizzle::D64K, 512, 512, 6, 4).unwrap().total, 1441792);
+        assert_eq!(Layout::new(Swizzle::D64K, 256, 256, 1, 2).unwrap().total, 131072);
+        // RGBA8 256x256, 5 mips, mode 2
+        assert_eq!(Layout::new(Swizzle::S4K, 256, 256, 5, 4).unwrap().total, 352256);
     }
 }

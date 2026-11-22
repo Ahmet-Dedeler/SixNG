@@ -52,6 +52,12 @@ pub enum Fmt {
     Bgra8,
     R8,
     Rg8,
+    /// R16_FLOAT, shown as grey clamped to 0..1.
+    R16f,
+    /// R16G16B16A16_UNORM.
+    Rgba16,
+    /// R16G16B16A16_FLOAT, clamped to 0..1.
+    Rgba16f,
     Unknown,
 }
 
@@ -70,12 +76,15 @@ impl Fmt {
             87 | 88 | 90 | 91 => Fmt::Bgra8,
             60 | 61 | 62 | 63 | 64 | 65 => Fmt::R8,
             48..=52 => Fmt::Rg8,
+            54 => Fmt::R16f,
+            11 => Fmt::Rgba16,
+            10 => Fmt::Rgba16f,
             _ => Fmt::Unknown,
         }
     }
     pub fn block_dim(&self) -> u32 {
         match self {
-            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::Unknown => 1,
+            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::Unknown => 1,
             _ => 4,
         }
     }
@@ -84,7 +93,8 @@ impl Fmt {
             Fmt::Bc1 | Fmt::Bc4 => 8,
             Fmt::Bc2 | Fmt::Bc3 | Fmt::Bc5 | Fmt::Bc6u | Fmt::Bc6s | Fmt::Bc7 => 16,
             Fmt::Rgba8 | Fmt::Bgra8 => 4,
-            Fmt::Rg8 => 2,
+            Fmt::Rg8 | Fmt::R16f => 2,
+            Fmt::Rgba16 | Fmt::Rgba16f => 8,
             Fmt::R8 => 1,
             Fmt::Unknown => 0,
         }
@@ -180,6 +190,21 @@ pub fn find_textures(r: &Resource) -> Vec<TexInfo> {
         }
     }
     v
+}
+
+/// Store key (hash64) of a texture embedded in a resource: the struct's
+/// +0x30 pointer leads to a record whose +8 is the hash that shader texture
+/// references use (the same key the ttpf stores use).
+pub fn embedded_hash(r: &Resource, t: &TexInfo) -> Option<u64> {
+    let o = r.sys_off(r.u64(t.struct_off as usize + 0x30))?;
+    (o + 16 <= r.sys.len()).then(|| r.u64(o + 8)).filter(|&h| h != 0)
+}
+
+/// RGBA8 pixels of mip 0 of an embedded texture. One-row textures (the
+/// per-model tint palettes) are stored linear.
+pub fn embedded_rgba(r: &Resource, t: &TexInfo) -> Result<Vec<u8>> {
+    let (fmt, lin) = mip0_linear(r, t, t.height == 1)?;
+    to_rgba(fmt, &lin, t.width, t.height)
 }
 
 /// Dictionary name of a TXD (string following the page map), if present.
@@ -373,11 +398,13 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         Fmt::Bc6u => td::decode_bc6(data, wu, hu, &mut img, false),
         Fmt::Bc6s => td::decode_bc6(data, wu, hu, &mut img, true),
         Fmt::Bc7 => td::decode_bc7(data, wu, hu, &mut img),
-        Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 => {
+        Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::Rgba16 | Fmt::Rgba16f => {
             let bpe = fmt.bytes_per_elem() as usize;
             let mut out = vec![255u8; wu * hu * 4];
             for i in 0..wu * hu {
-                let s = &data.get(i * bpe..i * bpe + bpe).unwrap_or(&[0, 0, 0, 0][..bpe]);
+                let s = &data.get(i * bpe..i * bpe + bpe).unwrap_or(&[0; 8][..bpe]);
+                let u16at = |k: usize| u16::from_le_bytes([s[2 * k], s[2 * k + 1]]);
+                let unit = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u8;
                 let o = &mut out[i * 4..i * 4 + 4];
                 match fmt {
                     Fmt::Rgba8 => o.copy_from_slice(s),
@@ -392,6 +419,12 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
                         o[1] = s[0];
                         o[2] = s[0];
                     }
+                    Fmt::R16f => {
+                        let v = unit(f16(u16at(0)));
+                        o[..3].fill(v);
+                    }
+                    Fmt::Rgba16 => (0..4).for_each(|k| o[k] = (u16at(k) >> 8) as u8),
+                    Fmt::Rgba16f => (0..4).for_each(|k| o[k] = unit(f16(u16at(k)))),
                     _ => {
                         o[0] = s[0];
                         o[1] = s[1];
@@ -465,4 +498,17 @@ fn save_dds_n(path: &Path, t: &TexInfo, fmt: Fmt, data: &[u8], nmips: u32, mip0_
     h.extend_from_slice(data);
     std::fs::write(path, h)?;
     Ok(())
+}
+
+/// IEEE half float to f32 (NaN becomes 0).
+fn f16(h: u16) -> f32 {
+    let s = if h & 0x8000 != 0 { -1.0 } else { 1.0 };
+    let e = ((h >> 10) & 0x1F) as i32;
+    let m = (h & 0x3FF) as f32;
+    s * match e {
+        0 => m / 1024.0 * 2f32.powi(-14),
+        31 if m == 0.0 => f32::INFINITY,
+        31 => 0.0,
+        _ => (1.0 + m / 1024.0) * 2f32.powi(e - 15),
+    }
 }

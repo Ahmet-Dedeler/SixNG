@@ -310,8 +310,10 @@ fn classify_shader(s: &crate::drawable::Shader, st: &ShaderTextures) -> serde_js
 
 /// Resolve each shader's texture references in the ttpf stores, write the
 /// decodable ones as shared PNGs, and pick base-colour and normal maps.
-fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], model_dir: &Path, o: &ExportOptions) -> Vec<ShaderTextures> {
+fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], r: &Resource, embedded: &[texture::TexInfo], model_dir: &Path, o: &ExportOptions) -> Vec<ShaderTextures> {
     let set = crate::ttpf::global(&game_root(a));
+    // Textures embedded in the model itself (tint palettes), by store key.
+    let emb: std::collections::HashMap<u64, &texture::TexInfo> = embedded.iter().filter_map(|t| texture::embedded_hash(r, t).map(|h| (h, t))).collect();
     let tdir = o.out.join("textures").join("ttpf");
     let uri_of = |p: &Path| -> String {
         // relative from the model folder: models/<archive>/<name>/ -> ../../../textures/ttpf/x.png
@@ -329,7 +331,29 @@ fn link_textures(a: &ArchiveInfo, shaders: &[crate::drawable::Shader], model_dir
                 let h = u64::from_str_radix(&t.hash64, 16).unwrap_or(0);
                 let mut e = serde_json::json!({"param": t.param, "param_hash": t.param_hash, "param_name": crate::names::param(&t.param_hash), "hash64": t.hash64, "hash32": t.hash32});
                 let Some((store, tx)) = set.get(h) else {
-                    e["status"] = "not in any ttpf store".into();
+                    match emb.get(&h) {
+                        Some(et) => {
+                            e["status"] = "embedded in the model".into();
+                            e["width"] = et.width.into();
+                            e["height"] = et.height.into();
+                            e["format"] = et.format.clone().into();
+                            if let Some(sr) = crate::material::slot_role(&t.param_hash) {
+                                e["slot_role"] = sr.into();
+                            }
+                            if o.png {
+                                let p = model_dir.join("textures").join(format!("{}.png", t.hash64));
+                                let done = p.exists() || texture::embedded_rgba(r, et).and_then(|rgba| {
+                                    fs::create_dir_all(model_dir.join("textures"))?;
+                                    texture::save_png(&p, &rgba, et.width, et.height)
+                                }).map_err(|err| e["status"] = format!("embedded in the model, not decoded: {err}").into()).is_ok();
+                                if done {
+                                    e["png"] = rel(&o.out, &p).into();
+                                    e["status"] = "ok (embedded in the model)".into();
+                                }
+                            }
+                        }
+                        None => e["status"] = "not in any ttpf store".into(),
+                    }
                     st.entries.push(e);
                     continue;
                 };
@@ -547,7 +571,7 @@ pub fn export_entry(a: &ArchiveInfo, e: &Entry, o: &ExportOptions) -> Result<Exp
             fs::write(dir.join("sys.bin"), &r.sys)?;
             item.files.push(rel(&o.out, &dir.join("sys.bin")));
             let head = head_skin_shaders(a, e, &info.shaders, o, &mut item);
-            let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), &dir, o);
+            let shader_tex = link_textures(a, head.as_ref().map_or(&info.shaders[..], |h| &h.0[..]), &r, &info.embedded_textures, &dir, o);
             let slice = |i: usize| {
                 let b = &info.buffers[i];
                 let end = (b.gfx_off + b.bytes).min(r.gfx.len() as u64) as usize;
@@ -916,7 +940,8 @@ fn ped_skin(a: &ArchiveInfo, e: &Entry, info: &crate::drawable::DrawableInfo, o:
 fn export_texture(r: &Resource, t: &texture::TexInfo, dir: &Path, o: &ExportOptions, item: &mut ExportedItem) -> Result<Vec<String>> {
     let stem = if t.name.is_empty() { format!("tex_{:x}", t.struct_off) } else { sanitize(&t.name) };
     let mut files = Vec::new();
-    match texture::mip0_linear(r, t, false) {
+    // one-row textures (tint palettes) are stored linear
+    match texture::mip0_linear(r, t, t.height == 1) {
         Ok((fmt, lin)) => {
             if o.png {
                 match texture::to_rgba(fmt, &lin, t.width, t.height) {
