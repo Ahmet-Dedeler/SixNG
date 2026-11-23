@@ -404,6 +404,10 @@ enum Cmd {
         /// Also write each resource decoded to <out>/meta/<archive>/<off>.json.
         #[arg(long)]
         dump: bool,
+        /// With the dump, also write every struct instance by struct hash
+        /// ("instances"); for resources whose records the root does not reach.
+        #[arg(long)]
+        instances: bool,
         #[arg(long, short)]
         out: PathBuf,
     },
@@ -1288,7 +1292,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             out.print(&json!({"hits": hits.len(), "distinct_values": hits.iter().map(|x| x.3).collect::<std::collections::HashSet<_>>().len(), "by_struct_offset": by}));
         }
-        Cmd::Meta { archive, filter, dump, out: po } => {
+        Cmd::Meta { archive, filter, dump, instances, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let mut f = filter.to_filter()?;
@@ -1297,7 +1301,7 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             }
             let sel: Vec<_> = f.select(&ix)?.into_iter().filter(|e| e.sub == "7a").collect();
             let t = Instant::now();
-            let n = export::export_meta(&a, &sel, po, *dump, pr)?;
+            let n = export::export_meta(&a, &sel, po, *dump, *instances, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "decoded": n, "seconds": t.elapsed().as_secs_f64(),
                 "index": po.join("meta").join(a.id.trim_end_matches(".rpf")).join("index.jsonl")}));
         }

@@ -224,7 +224,9 @@ ames.json; exports and the app use it.
 # Restrict the big exports to one region (RAGE metres; use "=" so negative values parse)
 .\target\release\sixng.exe collision levels -o work\out --bbox=-1500,-1500,-1000,-1000
 
-# Schema index of every self-describing meta resource (0x7a) in an archive; --dump adds JSON
+# Schema index of every self-describing meta resource (0x7a) in an archive; --dump adds JSON;
+# --instances also writes every struct instance (for resources such as the ped wardrobe
+# records, whose records the root does not point to)
 .\target\release\sixng.exe meta data -o work\out
 
 # A character as ONE rigged GLB (one armature in Blender): its outfit parts on one shared skeleton,

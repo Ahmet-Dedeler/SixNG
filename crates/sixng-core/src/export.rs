@@ -1730,8 +1730,10 @@ pub fn export_batches(ws: &Workspace, a: &ArchiveInfo, entries: &[&Entry], out: 
 /// Scan the self-describing meta resources (`0x7a`) of an archive: write
 /// `<out>/meta/<archive>/index.jsonl` (one line per resource: id, root
 /// struct, struct hashes with counts) and, when `dump` is set, the decoded
-/// resource as `<off>.json`.
-pub fn export_meta(a: &ArchiveInfo, entries: &[&Entry], out: &Path, dump: bool, progress: Progress) -> Result<usize> {
+/// resource as `<off>.json` (with `instances`, also every struct instance
+/// under "instances").
+pub fn export_meta(a: &ArchiveInfo, entries: &[&Entry], out: &Path, dump: bool, instances: bool, progress: Progress) -> Result<usize> {
+    let dump = dump || instances;
     let dir = out.join("meta").join(a.id.trim_end_matches(".rpf"));
     fs::create_dir_all(&dir)?;
     let total = entries.len() as u64;
@@ -1749,6 +1751,9 @@ pub fn export_meta(a: &ArchiveInfo, entries: &[&Entry], out: &Path, dump: bool, 
             if dump {
                 let mut doc = m.dump();
                 doc["id"] = serde_json::json!(e.id);
+                if instances {
+                    doc["instances"] = m.instances(100_000);
+                }
                 fs::write(dir.join(format!("{:x}.json", e.off)), serde_json::to_vec(&doc).ok()?).ok()?;
             }
             let line = serde_json::json!({"id": e.id, "name": e.name, "size": e.usize, "root": root, "structs": structs});

@@ -354,6 +354,21 @@ impl<'a> Meta<'a> {
         let roots: Vec<_> = self.root_block().and_then(|(h, o)| self.object(h, o, 0)).into_iter().collect();
         serde_json::json!({"schema": self.schema(), "roots": roots})
     }
+
+    /// Every instance of every struct (hash 0x100 and up), decoded in full,
+    /// by struct hash. Some resources keep their records in blocks the root
+    /// does not point to (they are referenced by index or hash), so the root
+    /// dump alone misses them. At most `cap` instances per struct.
+    pub fn instances(&self, cap: usize) -> serde_json::Value {
+        let mut v = serde_json::Map::new();
+        for h in self.structs.keys().filter(|&&h| h >= 0x100) {
+            let objs: Vec<_> = self.objects(*h).into_iter().take(cap).filter_map(|o| self.object(*h, o, 0)).collect();
+            if !objs.is_empty() {
+                v.insert(format!("{h:08x}"), serde_json::Value::Array(objs));
+            }
+        }
+        serde_json::Value::Object(v)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
