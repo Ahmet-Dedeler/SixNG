@@ -148,10 +148,17 @@ impl<'a> Meta<'a> {
         (off < size as usize && o != usize::MAX).then_some((h, o + off))
     }
 
-    /// Index (1-based) of the root instance block, from the header (+0x4A).
+    /// The root instance block: the first block of a struct that no member
+    /// of any struct refers to (the top-level object). Blocks of plain values
+    /// (hashes below 0x100: float, u8, u16, u32 and pointer arrays) and of
+    /// nested structs are skipped. The header has no root index: +0x4A is the
+    /// enum count, which only matched the root block by chance (14 of 131
+    /// non-map resources in the minigame pack).
     pub fn root_block(&self) -> Option<(u32, usize)> {
-        let &(h, _, o) = self.blocks.get((self.r.u16(0x4A) as usize).checked_sub(1)?)?;
-        (o != usize::MAX).then_some((h, o))
+        let referenced: std::collections::HashSet<u32> = self.structs.values().flat_map(|s| s.members.iter().map(|m| m.extra)).collect();
+        let usable = |&&(h, _, o): &&(u32, u32, usize)| o != usize::MAX && self.structs.contains_key(&h);
+        let pick = self.blocks.iter().filter(usable).find(|b| !referenced.contains(&b.0)).or_else(|| self.blocks.iter().find(usable))?;
+        Some((pick.0, pick.2))
     }
 
     /// Objects of one struct type: sys offsets.

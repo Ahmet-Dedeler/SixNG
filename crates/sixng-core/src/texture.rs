@@ -54,6 +54,8 @@ pub enum Fmt {
     Rg8,
     /// R16_FLOAT, shown as grey clamped to 0..1.
     R16f,
+    /// R16_UNORM (water and sea-level height maps), shown as grey, high byte.
+    R16,
     /// R16G16B16A16_UNORM.
     Rgba16,
     /// R16G16B16A16_FLOAT, clamped to 0..1.
@@ -77,6 +79,7 @@ impl Fmt {
             60 | 61 | 62 | 63 | 64 | 65 => Fmt::R8,
             48..=52 => Fmt::Rg8,
             54 => Fmt::R16f,
+            53 | 56 | 57 => Fmt::R16,
             11 => Fmt::Rgba16,
             10 => Fmt::Rgba16f,
             _ => Fmt::Unknown,
@@ -84,7 +87,7 @@ impl Fmt {
     }
     pub fn block_dim(&self) -> u32 {
         match self {
-            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::Unknown => 1,
+            Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f | Fmt::Unknown => 1,
             _ => 4,
         }
     }
@@ -93,7 +96,7 @@ impl Fmt {
             Fmt::Bc1 | Fmt::Bc4 => 8,
             Fmt::Bc2 | Fmt::Bc3 | Fmt::Bc5 | Fmt::Bc6u | Fmt::Bc6s | Fmt::Bc7 => 16,
             Fmt::Rgba8 | Fmt::Bgra8 => 4,
-            Fmt::Rg8 | Fmt::R16f => 2,
+            Fmt::Rg8 | Fmt::R16f | Fmt::R16 => 2,
             Fmt::Rgba16 | Fmt::Rgba16f => 8,
             Fmt::R8 => 1,
             Fmt::Unknown => 0,
@@ -414,7 +417,7 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
         Fmt::Bc6u => td::decode_bc6(data, wu, hu, &mut img, false),
         Fmt::Bc6s => td::decode_bc6(data, wu, hu, &mut img, true),
         Fmt::Bc7 => td::decode_bc7(data, wu, hu, &mut img),
-        Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::Rgba16 | Fmt::Rgba16f => {
+        Fmt::Rgba8 | Fmt::Bgra8 | Fmt::R8 | Fmt::Rg8 | Fmt::R16f | Fmt::R16 | Fmt::Rgba16 | Fmt::Rgba16f => {
             let bpe = fmt.bytes_per_elem() as usize;
             let mut out = vec![255u8; wu * hu * 4];
             for i in 0..wu * hu {
@@ -439,6 +442,7 @@ pub fn to_rgba(fmt: Fmt, data: &[u8], w: u32, h: u32) -> Result<Vec<u8>> {
                         let v = unit(f16(u16at(0)));
                         o[..3].fill(v);
                     }
+                    Fmt::R16 => o[..3].fill((u16at(0) >> 8) as u8),
                     Fmt::Rgba16 => (0..4).for_each(|k| o[k] = (u16at(k) >> 8) as u8),
                     Fmt::Rgba16f => (0..4).for_each(|k| o[k] = unit(f16(u16at(k)))),
                     _ => {

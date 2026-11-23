@@ -17,6 +17,114 @@ use crate::resource::Resource;
 use anyhow::{bail, Result};
 
 pub const TYPE_CLOTH: u8 = 2;
+/// Byte 0x1A of the box-volume resources (same tag at 0x1C as soft bodies).
+pub const TYPE_VOLUMES: u8 = 5;
+
+/// One oriented box of a volume set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct BoxVolume {
+    /// Centre (model space, Z-up metres).
+    pub centre: [f32; 3],
+    /// Rotation quaternion (x, y, z, w).
+    pub rotation: [f32; 4],
+    /// Half extents along the box's own axes.
+    pub half: [f32; 3],
+}
+
+/// Box volumes stored next to the cloth resources of a map pack (8 in the
+/// minigame pack, beside its 28 cloth pieces): system byte 0x1A = 5 and the
+/// soft-body tag at 0x1C. Layout: u32 count at 0x28, ptr at 0x30 to
+/// `count` entries of 0x90 bytes (+0x00 vec3 centre, +0x10 quaternion,
+/// +0x50 vec3 half extents, +0x5C u32 70, +0x60 / +0x70 vec3 -half / +half);
+/// u32 group count at 0x3C and ptr at 0x40 to a hash map: 16 control bytes
+/// (low 7 bits of the key, 0x80 empty) then `groups` slots of 24 bytes
+/// {u32 key hash, u32 0, u32 n, u32 n, ptr u16 box indices}. The group keys
+/// do not resolve to names. Box sizes (1.4 x 3.3 x 1.9 m, 0.5 x 0.5 x 1 m)
+/// look like vehicle- and person-sized volumes; what they drive is unknown.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Volumes {
+    pub boxes: Vec<BoxVolume>,
+    /// (key hash, box indices)
+    pub groups: Vec<(String, Vec<u16>)>,
+}
+
+pub fn is_volumes(sys: &[u8]) -> bool {
+    sys.len() >= 0x48 && sys[0x1A] == TYPE_VOLUMES && u32::from_le_bytes(sys[0x1C..0x20].try_into().unwrap()) == SOFT_TAG
+}
+
+pub fn parse_volumes(r: &Resource) -> Result<Volumes> {
+    if !is_volumes(&r.sys) {
+        bail!("not a volume resource");
+    }
+    let n = r.u32(0x28) as usize;
+    let Some(arr) = r.sys_off(r.u64(0x30)) else { bail!("box array pointer outside the system page") };
+    if n == 0 || n > 4096 || arr + 0x90 * n > r.sys.len() {
+        bail!("bad box count {n}");
+    }
+    let f3 = |o: usize| [r.f32(o), r.f32(o + 4), r.f32(o + 8)];
+    let boxes: Vec<BoxVolume> = (0..n)
+        .map(|i| {
+            let e = arr + 0x90 * i;
+            BoxVolume { centre: f3(e), rotation: [r.f32(e + 0x10), r.f32(e + 0x14), r.f32(e + 0x18), r.f32(e + 0x1C)], half: f3(e + 0x50) }
+        })
+        .collect();
+    if boxes.iter().any(|b| {
+        let q = b.rotation.iter().map(|x| x * x).sum::<f32>();
+        (q - 1.0).abs() > 1e-2 || !b.centre.iter().chain(&b.half).all(|v| v.is_finite() && v.abs() < 1e4)
+    }) {
+        bail!("box not a unit rotation / finite size");
+    }
+    let mut groups = Vec::new();
+    if let Some(m) = r.sys_off(r.u64(0x40)) {
+        for k in 0..(r.u32(0x3C) as usize).min(1024) {
+            let e = m + 16 + 24 * k;
+            if e + 24 > r.sys.len() {
+                break;
+            }
+            let cnt = r.u32(e + 8) as usize;
+            let idx: Vec<u16> = match r.sys_off(r.u64(e + 16)) {
+                Some(l) if l + 2 * cnt <= r.sys.len() && cnt <= n => (0..cnt).map(|j| r.u16(l + 2 * j)).collect(),
+                _ => Vec::new(),
+            };
+            groups.push((format!("{:08x}", r.u32(e)), idx));
+        }
+    }
+    Ok(Volumes { boxes, groups })
+}
+
+impl Volumes {
+    /// Wireframe GLB: the 12 edges of every box.
+    pub fn glb(&self, name: &str, extras: serde_json::Value) -> Vec<u8> {
+        let mut pos = Vec::new();
+        let mut seg = Vec::new();
+        for b in &self.boxes {
+            let [x, y, z, w] = b.rotation;
+            let rot = |v: [f32; 3]| {
+                // v + 2 w (q x v) + 2 q x (q x v)
+                let q = [x, y, z];
+                let c = |a: [f32; 3], b: [f32; 3]| [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+                let t = c(q, v).map(|k| 2.0 * k);
+                let u = c(q, t);
+                [0, 1, 2].map(|k| v[k] + w * t[k] + u[k])
+            };
+            let base = pos.len() as u32;
+            for i in 0..8u32 {
+                let s = |bit: u32, h: f32| if i >> bit & 1 == 1 { h } else { -h };
+                let p = rot([s(0, b.half[0]), s(1, b.half[1]), s(2, b.half[2])]);
+                pos.push([b.centre[0] + p[0], b.centre[1] + p[1], b.centre[2] + p[2]]);
+            }
+            for i in 0..8u32 {
+                for bit in 0..3 {
+                    if i >> bit & 1 == 0 {
+                        seg.push(base + i);
+                        seg.push(base + (i | 1 << bit));
+                    }
+                }
+            }
+        }
+        crate::gltf::lines_glb(name, &pos, &[], &[], &seg, &[], extras)
+    }
+}
 pub const SOFT_TAG: u32 = 0x7d8f_3db3;
 
 pub struct Edge {
@@ -170,6 +278,21 @@ pub fn export_cloth(a: &crate::game::ArchiveInfo, all: &[crate::scan::Entry], on
                 progress(&e.id, d, total);
             }
             let r = Resource::load_sys(&a.path, e).ok()?;
+            if is_volumes(&r.sys) {
+                let v = match parse_volumes(&r) {
+                    Ok(v) => v,
+                    Err(x) => {
+                        errors.fetch_add(1, Ordering::Relaxed);
+                        return Some((e.off, serde_json::json!({"id": e.id, "error": x.to_string()}).to_string(), false));
+                    }
+                };
+                let info = serde_json::json!({"id": e.id, "file": format!("{:x}.glb", e.off), "kind": "box volumes", "boxes": v.boxes, "groups": v.groups});
+                let extras = serde_json::json!({"source": e.id, "kind": "box volumes", "groups": v.groups,
+                    "coordinate_system": "model space (Z-up metres) converted to glTF Y-up (x, z, -y)", "note": "oriented boxes drawn as their 12 edges"});
+                let p = dir.join(format!("{:x}.glb", e.off));
+                std::fs::write(&p, v.glb(&format!("volumes_{:x}", e.off), extras)).ok()?;
+                return Some((e.off, info.to_string(), true));
+            }
             if !is_cloth(&r.sys) {
                 return None;
             }

@@ -93,6 +93,44 @@ pub fn is_bound(r: &Resource) -> bool {
     (t == 5 || t == 6) && r.u32(0x3C) >= 1 && (0.0..0.5).contains(&margin) && r.sys_off(r.u64(if t == 6 { 0x70 } else { 0x88 })).is_some()
 }
 
+/// Bytes of system page the bound's geometry reaches (polygon, vertex,
+/// material and material-index arrays of every child). Can exceed the
+/// loaded system page when the vertices follow the last stream uncompressed.
+pub fn sys_extent(r: &Resource) -> usize {
+    fn go(r: &Resource, o: usize, depth: u32, best: &mut usize) {
+        if depth > MAX_DEPTH || o + 0x140 > r.sys.len() {
+            return;
+        }
+        let off = |p: u64| (p >> 28 == 5).then(|| (p & 0x0FFF_FFFF) as usize);
+        match r.sys[o + 0x10] {
+            6 => {
+                let n = r.u16(o + 0x98) as usize;
+                let Some(kp) = r.sys_off(r.u64(o + 0x70)) else { return };
+                for i in 0..n.min(4096) {
+                    if let Some(k) = r.sys_off(r.u64(kp + 8 * i)) {
+                        go(r, k, depth + 1, best);
+                    }
+                }
+            }
+            5 => {
+                let (nv, np) = (r.u32(o + 0xD0) as usize, r.u32(o + 0xD4) as usize);
+                let nm = r.sys[o + 0x120] as usize;
+                for (p, len) in [(r.u64(o + 0xB0), 6 * nv), (r.u64(o + 0x88), 16 * np), (r.u64(o + 0xF0), 8 * nm), (r.u64(o + 0x118), np)] {
+                    if let Some(s) = off(p) {
+                        *best = (*best).max(s + len);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut best = 0;
+    if is_bound(r) {
+        go(r, 0, 0, &mut best);
+    }
+    best
+}
+
 type M4 = [f32; 16];
 const ID: M4 = [1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.];
 

@@ -42,6 +42,19 @@ fn ptr(b: &[u8], o: usize) -> Option<usize> {
     let off = (v & 0x0fff_ffff) as usize;
     (v >> 28 == 5 && off < b.len()).then_some(off)
 }
+/// A 16-byte string field: a pointer to the text (u64, then u16 length and
+/// capacity), or, for names up to 15 bytes, the text itself with byte 15 =
+/// 0x80 | length (map clip dictionaries: `td_clip`, 0x87).
+fn str_field(b: &[u8], o: usize) -> Option<String> {
+    let tag = *b.get(o + 15)?;
+    if tag & 0x80 != 0 {
+        let n = (tag & 0x7f) as usize;
+        let t = b.get(o..o + n.min(15))?;
+        return (n <= 15 && t.iter().all(|c| c.is_ascii_graphic() || *c == b' ')).then(|| String::from_utf8_lossy(t).into_owned());
+    }
+    ptr(b, o).and_then(|p| cstr(b, p))
+}
+
 fn cstr(b: &[u8], o: usize) -> Option<String> {
     let s = b.get(o..)?;
     let end = s.iter().position(|&c| c == 0)?;
@@ -141,12 +154,12 @@ pub struct ClipDictionary {
 /// Does this system page look like a clip dictionary? (pointers at +0x08,
 /// +0x38, +0x48, zeros at +0x10..+0x38, a name at +0x38.)
 pub fn is_clip_dictionary(b: &[u8]) -> bool {
-    b.len() > 0x88 && b[0x10..0x38].iter().all(|&x| x == 0) && ptr(b, 0x08).is_some() && ptr(b, 0x48).is_some() && ptr(b, 0x38).and_then(|p| cstr(b, p)).is_some_and(|s| !s.is_empty() && s.len() < 256)
+    b.len() > 0x88 && b[0x10..0x38].iter().all(|&x| x == 0) && ptr(b, 0x08).is_some() && ptr(b, 0x48).is_some() && str_field(b, 0x38).is_some_and(|s| !s.is_empty() && s.len() < 256)
 }
 
 /// Name of a clip dictionary (+0x38), without decoding it.
 pub fn dictionary_name(b: &[u8]) -> Option<String> {
-    is_clip_dictionary(b).then(|| ptr(b, 0x38).and_then(|p| cstr(b, p))).flatten()
+    is_clip_dictionary(b).then(|| str_field(b, 0x38)).flatten()
 }
 
 /// (key hash, value offset) of every node of an `atMap`.
@@ -379,7 +392,7 @@ fn block(b: &[u8], o: usize, ntracks: usize) -> Result<(usize, Vec<Vec<f32>>)> {
 fn animation(b: &[u8], o: usize, hash: u32) -> Result<Animation> {
     let frames = u16_at(b, o + 0x24)? as usize;
     let duration = f32_at(b, o + 0x28)?;
-    let name = ptr(b, o + 0x30).and_then(|p| cstr(b, p)).unwrap_or_else(|| format!("anim_{hash:08x}"));
+    let name = str_field(b, o + 0x30).unwrap_or_else(|| format!("anim_{hash:08x}"));
     // Some animations have no blocks or tracks here (empty, or stored
     // elsewhere): they decode to no frames.
     let (Some(blocks), Some(tracks_at)) = (ptr(b, o + 0x50), ptr(b, o + 0x60)) else {
@@ -417,7 +430,7 @@ impl ClipDictionary {
         if !is_clip_dictionary(b) {
             bail!("not a clip dictionary");
         }
-        let name = ptr(b, 0x38).and_then(|p| cstr(b, p)).unwrap_or_default();
+        let name = str_field(b, 0x38).unwrap_or_default();
         let mut animations = Vec::new();
         let mut anim_at: std::collections::HashMap<usize, usize> = Default::default();
         if let Some(arr) = ptr(b, 0x70) {
@@ -438,10 +451,19 @@ impl ClipDictionary {
                 clips.push(Clip { hash: h, kind, name: format!("clip_{h:08x}"), duration: 0.0, bindings: Vec::new() });
                 continue;
             }
-            let name = ptr(b, co + 0x28).and_then(|p| cstr(b, p)).unwrap_or_else(|| format!("clip_{h:08x}"));
-            let duration = f32_at(b, co + 0x78)?;
+            let name = str_field(b, co + 0x28).unwrap_or_else(|| format!("clip_{h:08x}"));
+            let mut duration = f32_at(b, co + 0x78)?;
             let mut bindings = Vec::new();
-            if let Some(holder) = ptr(b, co + 0x68) {
+            // Single-animation clips (map object clips such as swaying
+            // cables): +0x68 points at the animation itself, with start,
+            // end and rate at +0x90 and the duration field left 0.
+            if let Some(&animation) = ptr(b, co + 0x68).and_then(|ao| anim_at.get(&ao)) {
+                let (start, end, rate) = (f32_at(b, co + 0x90)?, f32_at(b, co + 0x94)?, f32_at(b, co + 0x98)?);
+                if duration <= 0.0 {
+                    duration = (end - start) / if rate.abs() > 1e-6 { rate } else { 1.0 };
+                }
+                bindings.push(Binding { animation, start, end, rate });
+            } else if let Some(holder) = ptr(b, co + 0x68) {
                 if let Some(arr) = ptr(b, holder) {
                     for i in 0..u16_at(b, holder + 8)? as usize {
                         let e = arr + 0x38 * i;
@@ -564,8 +586,19 @@ pub fn dictionaries(game_root: &std::path::Path, work: &std::path::Path) -> Resu
 }
 
 /// Load a clip dictionary by entry id (`anim.rpf@1a2b3c`) or by name
-/// (exact, case-insensitive; see `dictionaries`).
+/// (exact, case-insensitive; see `dictionaries`). An entry id of another
+/// archive also works: map archives keep unnamed clip dictionaries for
+/// animated map objects (cables, canopies, flags: 39 in the minigame pack,
+/// `pack/shared_minigame000/shared_minigame000.rpf@273af010`).
 pub fn load_dictionary(game_root: &std::path::Path, work: &std::path::Path, q: &str) -> Result<(DictEntry, ClipDictionary)> {
+    if let Some((arch, _)) = q.split_once(".rpf@").filter(|(a, _)| *a != "anim") {
+        let arch = format!("{arch}.rpf");
+        let ixp = crate::scan::index_path(&work.join("index"), &arch);
+        let ix = crate::scan::load_index(&ixp).map_err(|e| anyhow!("{arch} index ({}): {e}; index it first", ixp.display()))?;
+        let e = ix.entries.iter().find(|e| e.id == q).ok_or_else(|| anyhow!("{q} is not in the {arch} index"))?;
+        let d = ClipDictionary::parse(&dictionary_bytes(&game_root.join(&arch), e)?)?;
+        return Ok((DictEntry { name: d.name.clone(), id: q.to_string() }, d));
+    }
     let ixp = crate::scan::index_path(&work.join("index"), "anim.rpf");
     let ix = crate::scan::load_index(&ixp).map_err(|e| anyhow!("anim.rpf index ({}): {e}; run `sixng index anim` first", ixp.display()))?;
     let id = if q.starts_with("anim.rpf@") {

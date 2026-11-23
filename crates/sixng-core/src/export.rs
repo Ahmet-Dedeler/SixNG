@@ -1626,7 +1626,7 @@ pub fn export_meta(a: &ArchiveInfo, entries: &[&Entry], out: &Path, dump: bool, 
             progress(&e.id, d, total);
             let r = if dump { Resource::load_meta(&a.path, e) } else { Resource::load_sys(&a.path, e) }.ok()?;
             let m = crate::meta7a::Meta::parse(&r)?;
-            let root = m.blocks.first().map(|b| format!("{:08x}", b.0)).unwrap_or_default();
+            let root = m.root_block().or_else(|| m.blocks.first().map(|b| (b.0, 0))).map(|b| format!("{:08x}", b.0)).unwrap_or_default();
             let mut structs: Vec<_> = m.structs.keys().map(|h| (format!("{h:08x}"), m.objects(*h).len())).collect();
             structs.sort();
             if dump {
@@ -1740,7 +1740,11 @@ pub fn export_collision(a: &ArchiveInfo, entries: &[&Entry], out: &Path, progres
         .filter_map(|e| {
             let d = done.fetch_add(1, Ordering::Relaxed) + 1;
             progress(&e.id, d, total);
-            let r = Resource::load_sys(&a.path, e).ok()?;
+            let mut r = Resource::load_sys(&a.path, e).ok()?;
+            let need = crate::bounds::sys_extent(&r);
+            if need > r.sys.len() {
+                r.extend_sys_tail(&a.path, e, need).ok()?;
+            }
             let c = crate::bounds::decode(&r)?;
             if c.by_mat.values().all(|x| x.1.is_empty()) || !in_region(c.bbox[0], c.bbox[1]) {
                 return None;

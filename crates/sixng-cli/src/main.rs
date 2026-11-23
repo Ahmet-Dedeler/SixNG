@@ -532,6 +532,12 @@ enum Cmd {
         #[arg(default_value = "levels")]
         archive: String,
     },
+    /// Audio metadata files (the sound, game-object, curve, speech, music and mixer definitions beside a pack's banks: plain files with 0x045a88ea at +8): per file its schema id, every object's name hash, offset, size and class id (first byte), as <out>/audio_meta/<archive>/<offset>.json + index.jsonl. Names are hashes; per-class fields are not decoded
+    AudioMeta {
+        archive: String,
+        #[arg(short, long)]
+        out: PathBuf,
+    },
     /// Audio banks (ADAT) in an archive: scan once (index in <work>/index/audio_<archive>.json), then list banks and streams. Stream ids are hashes; names are not recovered.
     Audio {
         /// Archive (default audio).
@@ -1565,6 +1571,14 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = sixng_core::lodlinks::build(&ws, &a, &metas, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+        }
+        Cmd::AudioMeta { archive, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let sel: Vec<_> = ix.entries.iter().filter(|e| e.kind == Kind::Bin).collect();
+            let t = Instant::now();
+            let (ok, bad) = sixng_core::audiometa::export(&a, &sel, po)?;
+            out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "decoded": ok, "failed": bad, "seconds": t.elapsed().as_secs_f64(), "out": po.join("audio_meta")}));
         }
         Cmd::Audio { archive, rescan, min_seconds, limit } => {
             use sixng_core::audio;
