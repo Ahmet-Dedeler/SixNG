@@ -544,6 +544,14 @@ enum Cmd {
         #[arg(default_value = "levels")]
         archive: String,
     },
+    /// Ped wardrobe variations (packs.rpf meta resources with struct f795e8ba, one per ped model): per variation its parts (slot, name, drawable), as JSON. Drawables are found through the item's textures, so run `texture-users` first. A variation is a clothing set or a head set (head, eyes, teeth); a full look is one of each. `parts` per variation is ready for `outfit <name> --parts`.
+    PedVariations {
+        /// Resource offsets (hex) or entry ids, e.g. 2b21010
+        #[arg(required = true)]
+        ids: Vec<String>,
+        #[arg(long, default_value = "packs")]
+        archive: String,
+    },
     /// Script data documents (script.rpf): the binary XML documents in its PSO files to XML text, `<out>/script_docs/<archive>/<offset>.xml` plus index.jsonl. Tags, attribute names and string values are named from the name dictionary (`sixng names`); the rest stay hashes.
     ScriptDocs {
         #[arg(default_value = "script")]
@@ -1612,6 +1620,31 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let t = Instant::now();
             let v = sixng_core::lodlinks::build(&ws, &a, &metas, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
+        }
+        Cmd::PedVariations { ids, archive } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let tu = sixng_core::texusers::TexUsers::load(&sixng_core::texusers::path(&ws))?;
+            let pre = sixng_core::wardrobe::prefixes(ix.entries.iter().filter(|e| e.kind == Kind::RageObj).filter_map(|e| e.name.as_deref()));
+            let mut res = serde_json::Map::new();
+            for id in ids {
+                let off = id.rsplit('@').next().unwrap_or(id).trim_start_matches("0x");
+                let off = u64::from_str_radix(off, 16).map_err(|_| anyhow::anyhow!("bad offset {id}"))?;
+                let e = ix.entries.iter().find(|e| e.off == off).ok_or_else(|| anyhow::anyhow!("no entry at {off:x}"))?;
+                let r = sixng_core::resource::Resource::load_meta(&a.path, e)?;
+                let m = sixng_core::meta7a::Meta::parse(&r).ok_or_else(|| anyhow::anyhow!("not a meta resource"))?;
+                let vs = sixng_core::wardrobe::variations(&m, &pre, &tu, &a.id);
+                let vs: Vec<_> = vs
+                    .iter()
+                    .map(|v| {
+                        let mut d: Vec<&str> = v.parts.iter().filter_map(|p| p.drawable.as_deref()).collect();
+                        d.dedup();
+                        json!({"id": v.id, "scale": v.scale, "parts": d.iter().map(|n| format!("^{n}$")).collect::<Vec<_>>().join(","), "items": v.parts})
+                    })
+                    .collect();
+                res.insert(e.id.clone(), json!(vs));
+            }
+            out.print(&serde_json::Value::Object(res));
         }
         Cmd::ScriptDocs { archive, out: po } => {
             let a = ws.resolve(archive)?;

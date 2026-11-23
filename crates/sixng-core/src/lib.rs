@@ -3,6 +3,7 @@ pub mod anim;
 pub mod audio;
 pub mod audiometa;
 pub mod scriptdoc;
+pub mod wardrobe;
 pub mod bounds;
 pub mod classify;
 pub mod navmesh;
