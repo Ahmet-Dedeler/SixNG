@@ -32,6 +32,34 @@ pub const RMA_ORDERS: [&str; 4] = [
 pub const FINISHES: [&str; 4] = ["metallic", "matte", "chrome", "gloss"];
 pub const SLOTS: [&str; 4] = ["base colour", "normal", "packed RMA", "emissive"];
 
+/// Which side-panel controls do something for a model.
+#[derive(Clone, Copy, Default)]
+struct Caps {
+    paint: bool,
+    wheels: bool,
+    doors: bool,
+    mounts: bool,
+    joints: bool,
+    tint: bool,
+    decals: bool,
+}
+
+impl Caps {
+    fn of(l: &Loaded) -> Caps {
+        let m = &l.model;
+        let names: Vec<String> = m.joints.iter().map(|j| j.name.to_lowercase()).collect();
+        Caps {
+            paint: m.materials.iter().any(|x| x.class == "car_paint"),
+            wheels: names.iter().any(|n| n.starts_with("wheel_") && !n.contains("dummy")),
+            doors: names.iter().any(|n| matches!(n.as_str(), "door_dside_f" | "door_dside_r" | "door_pside_f" | "door_pside_r")),
+            mounts: l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()),
+            joints: !m.joints.is_empty(),
+            tint: m.meshes.iter().any(|x| x.verts.iter().any(|v| v.tint != [255, 255, 255, 255] && v.tint != [0, 0, 0, 0])),
+            decals: m.materials.iter().any(|x| x.decal.is_some()),
+        }
+    }
+}
+
 pub struct Loaded {
     pub model: glb::Model,
     pub lods: Vec<PathBuf>,
@@ -91,6 +119,8 @@ pub struct ModelView {
     pub wheel_spin: f32,
     pub door_open: f32,
     pub paint_on: bool,
+    /// Side-panel controls that apply to the loaded model, keyed by (GLB path, triangles).
+    caps: Option<(PathBuf, usize, Caps)>,
     pub material_sel: Option<usize>,
     pub auto: Automation,
     frames_since_load: u32,
@@ -195,6 +225,7 @@ impl ModelView {
             wheel_spin: 0.0,
             door_open: 0.0,
             paint_on: true,
+            caps: None,
             material_sel: None,
             auto: Automation::default(),
             frames_since_load: 0,
@@ -398,7 +429,7 @@ impl ModelView {
         let Some(l) = self
             .loaded
             .as_ref()
-            .filter(|l| l.info["wheel_mounts"].is_array())
+            .filter(|l| l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()))
         else {
             return true;
         };
@@ -695,7 +726,7 @@ impl ModelView {
     /// configuration is applied when a car opens.
     fn vehicle_ui(&mut self, ui: &mut egui::Ui) {
         let Some(l) = &self.loaded else { return };
-        if !l.info["wheel_mounts"].is_array() {
+        if !l.info["wheel_mounts"].as_array().is_some_and(|a| !a.is_empty()) {
             return;
         }
         let key = crate::vehicle_db::model_key(&l.source);
@@ -1398,7 +1429,19 @@ impl ModelView {
         }
     }
 
+    /// Controls that apply to the loaded model (none when nothing is loaded).
+    fn caps(&mut self) -> Caps {
+        let Some(l) = &self.loaded else {
+            return Caps::default();
+        };
+        if !matches!(&self.caps, Some((p, t, _)) if *p == l.model.path && *t == l.model.triangles) {
+            self.caps = Some((l.model.path.clone(), l.model.triangles, Caps::of(l)));
+        }
+        self.caps.as_ref().unwrap().2
+    }
+
     fn side_ui(&mut self, ui: &mut egui::Ui, rs: &egui_wgpu::RenderState) {
+        let caps = self.caps();
         let seen = HEAD_SKIN_SEEN.lock().unwrap().clone();
         if let Some((i, n, src)) = seen.filter(|_| !self.loading) {
             ui.heading("Head skin");
@@ -1456,13 +1499,19 @@ impl ModelView {
             });
         ui.horizontal(|ui| {
             ui.checkbox(&mut self.look.wire, "wireframe");
-            ui.checkbox(&mut self.look.tint, "tint").on_hover_text("Multiply the model's tint palette colour into the base colour (the game's per-model colour variation; GLB COLOR_0)");
+            if caps.tint {
+                ui.checkbox(&mut self.look.tint, "tint").on_hover_text("Multiply the model's tint palette colour into the base colour (the game's per-model colour variation; GLB COLOR_0)");
+            }
             ui.checkbox(&mut self.show_normals, "normals");
-            ui.checkbox(&mut self.decal_bias, "decal bias").on_hover_text("Draw decal-bucket materials (markings, grime, signage, terrain blend layers) after opaque surfaces with a depth bias, by layer order");
+            if caps.decals {
+                ui.checkbox(&mut self.decal_bias, "decal bias").on_hover_text("Draw decal-bucket materials (markings, grime, signage, terrain blend layers) after opaque surfaces with a depth bias, by layer order");
+            }
         });
         ui.horizontal(|ui| {
-            ui.checkbox(&mut self.show_skeleton, "skeleton");
-            ui.checkbox(&mut self.joint_labels, "labels");
+            if caps.joints {
+                ui.checkbox(&mut self.show_skeleton, "skeleton");
+                ui.checkbox(&mut self.joint_labels, "labels");
+            }
             ui.checkbox(&mut self.cam.fly, "fly camera");
         });
         ui.separator();
@@ -1483,30 +1532,36 @@ impl ModelView {
         ui.add(egui::Slider::new(&mut self.look.wet, 0.0..=1.0).text("wet"));
         ui.separator();
         self.vehicle_ui(ui);
-        ui.heading("Car paint");
-        ui.horizontal(|ui| {
-            ui.label("primary");
-            ui.color_edit_button_rgb(&mut self.look.paint);
-            ui.label("secondary");
-            ui.color_edit_button_rgb(&mut self.look.paint2nd);
-            ui.label("pearl");
-            ui.color_edit_button_rgb(&mut self.look.pearl);
-        });
-        ui.add(egui::Slider::new(&mut self.look.pearl_amount, 0.0..=1.0).text("pearl amount"));
-        egui::ComboBox::from_label("finish")
-            .selected_text(FINISHES[self.look.finish as usize])
-            .show_ui(ui, |ui| {
-                for (k, m) in FINISHES.iter().enumerate() {
-                    ui.selectable_value(&mut self.look.finish, k as u32, *m);
-                }
+        if caps.paint {
+            ui.heading("Car paint");
+            ui.horizontal(|ui| {
+                ui.label("primary");
+                ui.color_edit_button_rgb(&mut self.look.paint);
+                ui.label("secondary");
+                ui.color_edit_button_rgb(&mut self.look.paint2nd);
+                ui.label("pearl");
+                ui.color_edit_button_rgb(&mut self.look.pearl);
             });
-        if let Some(l) = &self.loaded {
-            if !l.model.joints.is_empty() {
+            ui.add(egui::Slider::new(&mut self.look.pearl_amount, 0.0..=1.0).text("pearl amount"));
+            egui::ComboBox::from_label("finish")
+                .selected_text(FINISHES[self.look.finish as usize])
+                .show_ui(ui, |ui| {
+                    for (k, m) in FINISHES.iter().enumerate() {
+                        ui.selectable_value(&mut self.look.finish, k as u32, *m);
+                    }
+                });
+        }
+        if self.loaded.is_some() {
+            if caps.wheels || caps.doors || caps.mounts {
                 ui.separator();
                 ui.heading("Rig");
-                ui.add(egui::Slider::new(&mut self.wheel_spin, -3.14..=3.14).text("wheel spin"));
-                ui.add(egui::Slider::new(&mut self.door_open, 0.0..=1.3).text("doors open"));
-                if l.info["wheel_mounts"].is_array() {
+                if caps.wheels {
+                    ui.add(egui::Slider::new(&mut self.wheel_spin, -3.14..=3.14).text("wheel spin"));
+                }
+                if caps.doors {
+                    ui.add(egui::Slider::new(&mut self.door_open, 0.0..=1.3).text("doors open"));
+                }
+                if caps.mounts {
                     ui.checkbox(&mut self.wheels_on, "fit shared wheels at the wheel mounts");
                     ui.horizontal(|ui| {
                         ui.label("rim");
@@ -1535,8 +1590,12 @@ impl ModelView {
             }
         }
         ui.separator();
-        self.hair_ui(ui);
-        ui.separator();
+        // Grooms go on characters: rigged models that are not vehicles (or
+        // nothing loaded), and wherever some are already picked.
+        if (caps.joints && !caps.mounts) || self.loaded.is_none() || !self.hair.selected.is_empty() {
+            self.hair_ui(ui);
+            ui.separator();
+        }
         if let Some(q) = self.parts_ui(ui) {
             self.keep_cam_once = true;
             let ctx = ui.ctx().clone();
