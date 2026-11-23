@@ -1,0 +1,172 @@
+name: Release
+
+# Builds the Linux and macOS downloads of a release and attaches them to it,
+# next to the Windows zip. Runs when a v* tag is pushed, or by hand with a tag.
+# If the release doesn't exist yet it is created as a draft; an existing
+# release keeps its notes, and a "SHA-256" line is added (or replaced) for
+# each uploaded archive.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.6.2
+        required: true
+      ref:
+        description: Commit or branch to build, if the tag doesn't exist yet (default the tag)
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+  CARGO_TERM_COLOR: never
+  # Release binaries carry no debug info, so no build paths end up in them.
+  CARGO_PROFILE_RELEASE_DEBUG: '0'
+  CARGO_PROFILE_RELEASE_STRIP: debuginfo
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-22.04
+            targets: x86_64-unknown-linux-gnu
+            toolchain_targets: x86_64-unknown-linux-gnu
+          - name: macos-universal
+            os: macos-latest
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            toolchain_targets: aarch64-apple-darwin,x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || env.TAG }}
+      - name: Linux system libraries (audio, file dialogs, windowing)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libgtk-3-dev libxkbcommon-dev libwayland-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.toolchain_targets }}
+      - name: Build
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: |
+          set -eu
+          ws="$GITHUB_WORKSPACE"
+          ch="${CARGO_HOME:-$HOME/.cargo}"
+          export RUSTFLAGS="--remap-path-prefix=$ch=cargo --remap-path-prefix=$ws=sixng --remap-path-prefix=$HOME=~"
+          export CFLAGS="-ffile-prefix-map=$ch=cargo -ffile-prefix-map=$ws=sixng -ffile-prefix-map=$HOME=~"
+          export CXXFLAGS="$CFLAGS"
+          for t in ${{ matrix.targets }}; do
+            cargo build --release --locked --target "$t" -p sixng-cli -p sixng-gui
+          done
+      - name: Package
+        shell: bash
+        run: |
+          set -eu
+          dir="SixNG-$TAG-${{ matrix.name }}"
+          mkdir -p "dist/$dir"
+          set -- ${{ matrix.targets }}
+          for b in sixng sixng-gui; do
+            if [ $# -gt 1 ]; then
+              lipo -create -output "dist/$dir/$b" $(for t in "$@"; do echo "target/$t/release/$b"; done)
+              lipo -info "dist/$dir/$b"
+            else
+              cp "target/$1/release/$b" "dist/$dir/"
+            fi
+          done
+          if [ "$RUNNER_OS" = macOS ]; then
+            codesign --force --sign - "dist/$dir/sixng" "dist/$dir/sixng-gui"
+          fi
+          cp LICENSE README.md THIRD_PARTY_NOTICES.md "dist/$dir/"
+          cargo metadata --format-version 1 --locked | python3 -c '
+          import json, sys
+          m = json.load(sys.stdin)
+          ws = set(m["workspace_members"])
+          rows = sorted({(p["name"], p["version"], p.get("license") or "see crate") for p in m["packages"] if p["id"] not in ws})
+          print("Rust crates in the dependency graph of these binaries (some are only used on other platforms), with their licences from crates.io metadata.")
+          print("Each crate'"'"'s full licence text is in its source package on crates.io.")
+          print()
+          for n, v, l in rows:
+              print(f"{n} {v}: {l}")
+          ' > "dist/$dir/RUST_DEPENDENCIES.txt"
+          ./"dist/$dir/sixng" --version
+      - name: Check binaries for build paths
+        shell: bash
+        run: |
+          set -eu
+          dir="dist/SixNG-$TAG-${{ matrix.name }}"
+          bad=0
+          for b in "$dir/sixng" "$dir/sixng-gui"; do
+            hits=$( { strings -a "$b" | grep -E -i -e '/home/' -e '/Users/' -e '/runner' -e 'runneradmin' -e '/private/var/' -e 'C:\\Users'
+                      strings -a "$b" | grep -F -e "$GITHUB_WORKSPACE" -e "$HOME"; } || true)
+            if [ -n "$hits" ]; then
+              echo "::error::$b contains build paths:"; echo "$hits" | head -40; bad=1
+            fi
+          done
+          exit $bad
+      - name: Archive
+        shell: bash
+        run: |
+          set -eu
+          cd dist
+          dir="SixNG-$TAG-${{ matrix.name }}"
+          tar --version | grep -q GNU && owner="--owner=0 --group=0" || owner="--uid 0 --gid 0"
+          tar $owner -czf "$dir.tar.gz" "$dir"
+          tar -tzvf "$dir.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Upload to the release and add checksums to its notes
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -eu
+          cd dist
+          ls -l
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            target=()
+            if [ -n "$REF" ]; then target=(--target "$REF"); fi
+            gh release create "$TAG" --draft --title "SixNG $TAG" --notes "" "${target[@]}"
+          fi
+          gh release upload "$TAG" --clobber *.tar.gz
+          gh release view "$TAG" --json body -q .body > notes.md
+          # drop earlier checksum lines for these archives (a line naming one and holding a 64-hex hash)
+          for f in *.tar.gz; do
+            awk -v f="$f" '!(index($0, f) && $0 ~ /[0-9a-f]{64}/)' notes.md > notes.tmp
+            mv notes.tmp notes.md
+          done
+          {
+            echo
+            for f in *.tar.gz; do
+              echo "SHA-256 \`$f\`: \`$(sha256sum "$f" | cut -d' ' -f1)\`"
+            done
+          } >> notes.md
+          # collapse the blank lines left where old checksum lines were
+          cat -s notes.md > notes.tmp && mv notes.tmp notes.md
+          gh release edit "$TAG" --notes-file notes.md
+          cat notes.md
