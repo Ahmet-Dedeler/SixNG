@@ -540,7 +540,14 @@ enum Cmd {
         #[arg(default_value = "levels")]
         archive: String,
     },
-    /// Audio metadata files (the sound, game-object, curve, speech, music and mixer definitions beside a pack's banks: plain files with 0x045a88ea at +8): per file its schema id, every object's name hash, offset, size and class id (first byte), as <out>/audio_meta/<archive>/<offset>.json + index.jsonl. Names are hashes; per-class fields are not decoded
+    /// Script data documents (script.rpf): the binary XML documents in its PSO files to XML text, `<out>/script_docs/<archive>/<offset>.xml` plus index.jsonl. Tags, attribute names and string values are named from the name dictionary (`sixng names`); the rest stay hashes.
+    ScriptDocs {
+        #[arg(default_value = "script")]
+        archive: String,
+        #[arg(short, long)]
+        out: PathBuf,
+    },
+    /// Audio metadata files (the sound, game-object, curve, speech, music and mixer definitions beside a pack's banks: plain files with 0x045a88ea at +8): per file its schema id, every object's name hash, offset, size and class id (first byte), as <out>/audio_meta/<archive>/<offset>.json + index.jsonl. Sound files (schema 166) also get each simple sound's wave (container hash, stream id and, when the archive's audio index exists, its bank), the child sounds of randomized, sequential and wrapper sounds, and every sound's reachable (bank, stream) pairs. Names are hashes; other class fields are not decoded.
     AudioMeta {
         archive: String,
         #[arg(short, long)]
@@ -1602,13 +1609,23 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let v = sixng_core::lodlinks::build(&ws, &a, &metas, pr)?;
             out.print(&json!({"ok": true, "archive": a.id, "stats": v, "seconds": t.elapsed().as_secs_f64()}));
         }
+        Cmd::ScriptDocs { archive, out: po } => {
+            let a = ws.resolve(archive)?;
+            let ix = ws.load_index(&a)?;
+            let sel: Vec<_> = ix.entries.iter().filter(|e| e.kind == Kind::Pso).collect();
+            let t = Instant::now();
+            let (ok, bad) = sixng_core::scriptdoc::export(&a, &sel, po)?;
+            out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "documents": ok, "other": bad, "seconds": t.elapsed().as_secs_f64(), "out": po.join("script_docs")}));
+        }
         Cmd::AudioMeta { archive, out: po } => {
             let a = ws.resolve(archive)?;
             let ix = ws.load_index(&a)?;
             let sel: Vec<_> = ix.entries.iter().filter(|e| e.kind == Kind::Bin).collect();
             let t = Instant::now();
-            let (ok, bad) = sixng_core::audiometa::export(&a, &sel, po)?;
-            out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "decoded": ok, "failed": bad, "seconds": t.elapsed().as_secs_f64(), "out": po.join("audio_meta")}));
+            // The archive's audio index, if scanned, links sounds to streams.
+            let banks: Vec<(u64, std::collections::HashSet<u32>)> = sixng_core::audio::load_index(&ws.work, &a.id).map(|ix| ix.banks.iter().map(|b| (b.off, b.streams.iter().map(|s| s.id).collect())).collect()).unwrap_or_default();
+            let (ok, bad) = sixng_core::audiometa::export(&a, &sel, &banks, po)?;
+            out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "decoded": ok, "failed": bad, "linked_to_banks": !banks.is_empty(), "seconds": t.elapsed().as_secs_f64(), "out": po.join("audio_meta")}));
         }
         Cmd::Audio { archive, rescan, min_seconds, limit } => {
             use sixng_core::audio;
