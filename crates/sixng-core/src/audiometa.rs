@@ -38,6 +38,19 @@
 //!   of 17 multi-child groups, against 1 of 19 when read as hash order).
 //! - wrapper (6): the last 12 bytes are `child, u32, ref`; the child is
 //!   always a simple or wrapper sound (or none, 0xffffffff).
+//!
+//! **Sound header** (sound files, every class except 17, 49, 56 and 57,
+//! whose second byte is not a header). Byte 1 is a mask: each set bit `i`
+//! adds one sub-mask byte (in bit order) after it. Each set bit `j` of
+//! sub-mask `i` adds one field, in (i, j) order, of a fixed size: (1,0) is
+//! 8 bytes of 2-bit tristate flags (`aa` = all unset); (2,4), (2,5), (3,2),
+//! (4,5), (5,3) are 4 bytes; (3,7), (4,2), (4,7) are 1 byte; the others
+//! 2 bytes. Fields (0,0) and (0,2) are nested u8 masks whose u16 values
+//! (one per set bit) come after all other header fields. Checked on the
+//! minigame pack: 4,392 of 4,395 headers decode; every simple sound's header
+//! ends where its container hash starts (2,051 of 2,051) and 2,015 of 2,016
+//! wrappers then have exactly their 12-byte body. Field meanings are not
+//! named (2-byte fields read as i16; (1,2) looks like a volume in mB).
 use anyhow::{bail, Result};
 use serde::Serialize;
 
@@ -68,6 +81,72 @@ pub struct Object {
     /// can play, through its children.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub streams: Vec<(String, String)>,
+    /// Sound files: header fields by "mask.bit" (nested: "mask.bit.bit"):
+    /// 1-byte as u8, 2-byte as i16, 4- and 8-byte as hex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub header: Option<std::collections::BTreeMap<String, serde_json::Value>>,
+    /// Sound files: the bytes after the header (hex), when the header decodes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+}
+
+/// Classes of the sound files that have no sound header.
+const NO_HEADER: [u8; 4] = [17, 49, 56, 57];
+
+/// Size of a sound header field (mask byte, bit); `None` for the nested
+/// masks (0,0) and (0,2), handled by `sound_header`, and for unknown bits.
+fn field_size(i: usize, j: usize) -> Option<usize> {
+    Some(match (i, j) {
+        (1, 0) => 8,
+        (2, 4) | (2, 5) | (3, 2) | (4, 5) | (5, 3) => 4,
+        (3, 7) | (4, 2) | (4, 7) => 1,
+        (0, 1) | (1, 2..=5) | (2, 0..=3) | (2, 6) | (2, 7) | (3, 0) | (3, 1) | (3, 3) | (3, 5) | (4, 1) => 2,
+        _ => return None,
+    })
+}
+
+/// Decode a sound header (`d` is the whole object). Returns the fields and
+/// the offset where the class body starts.
+pub fn sound_header(d: &[u8]) -> Option<(std::collections::BTreeMap<String, serde_json::Value>, usize)> {
+    let f = *d.get(1)?;
+    let masks: Vec<usize> = (0..8).filter(|i| f >> i & 1 != 0).collect();
+    let mut p = 2 + masks.len();
+    let mb = d.get(2..p)?;
+    let mut out = std::collections::BTreeMap::new();
+    let mut nested = Vec::new();
+    for (&i, &m) in masks.iter().zip(mb) {
+        for j in 0..8 {
+            if m >> j & 1 == 0 {
+                continue;
+            }
+            if i == 0 && (j == 0 || j == 2) {
+                nested.push((j, *d.get(p)?));
+                p += 1;
+                continue;
+            }
+            let n = field_size(i, j)?;
+            let v = d.get(p..p + n)?;
+            out.insert(
+                format!("{i}.{j}"),
+                match n {
+                    1 => serde_json::json!(v[0]),
+                    2 => serde_json::json!(i16::from_le_bytes([v[0], v[1]])),
+                    _ => serde_json::json!(v.iter().rev().map(|x| format!("{x:02x}")).collect::<String>()),
+                },
+            );
+            p += n;
+        }
+    }
+    for (j, m) in nested {
+        for k in 0..8 {
+            if m >> k & 1 != 0 {
+                let v = d.get(p..p + 2)?;
+                out.insert(format!("0.{j}.{k}"), serde_json::json!(i16::from_le_bytes([v[0], v[1]])));
+                p += 2;
+            }
+        }
+    }
+    Some((out, p))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -157,7 +236,7 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
         .iter()
         .map(|&(h, o)| {
             let next = offs.iter().find(|&&x| x > o).copied().unwrap_or(data_len);
-            Object { hash: format!("{h:08x}"), offset: o, size: next - o, class: b[8 + o as usize], wave: None, children: Vec::new(), refs: Vec::new(), streams: Vec::new() }
+            Object { hash: format!("{h:08x}"), offset: o, size: next - o, class: b[8 + o as usize], wave: None, children: Vec::new(), refs: Vec::new(), streams: Vec::new(), header: None, body: None }
         })
         .collect();
     let mut objects = objects;
@@ -169,6 +248,12 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
         let u32at = |d: &[u8], p: usize| u32::from_le_bytes(d[p..p + 4].try_into().unwrap());
         for o in objects.iter_mut() {
             let d = &b[8 + o.offset as usize..8 + (o.offset + o.size) as usize];
+            if !NO_HEADER.contains(&o.class) {
+                if let Some((h, end)) = sound_header(d) {
+                    o.header = Some(h);
+                    o.body = Some(d[end..].iter().map(|x| format!("{x:02x}")).collect());
+                }
+            }
             match o.class {
                 12 => {
                     let ts = tail_lists(d, 12, max);
@@ -315,6 +400,18 @@ mod tests {
         assert_eq!(m.objects.len(), 2);
         assert_eq!((m.objects[0].class, m.objects[0].size), (0xea, 4));
         assert_eq!((m.objects[1].class, m.objects[1].size), (0x00, 4));
+    }
+
+    #[test]
+    fn sound_header_fields() {
+        // wrapper: masks 0, 1, 3 = 01 04 04; (0,0) nested mask 0x80, (1,2)
+        // volume 600, (3,2) hash; the nested u16 (50) comes last; 12-byte body
+        let d = [6u8, 0x0b, 1, 4, 4, 0x80, 0x58, 0x02, 0xfa, 0xe0, 0xff, 0xd0, 0x32, 0x00, 0xf9, 0, 0, 0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let (h, end) = super::sound_header(&d).unwrap();
+        assert_eq!(end, d.len() - 12);
+        assert_eq!(h["1.2"], serde_json::json!(600));
+        assert_eq!(h["3.2"], serde_json::json!("d0ffe0fa"));
+        assert_eq!(h["0.0.7"], serde_json::json!(50));
     }
 
     #[test]
