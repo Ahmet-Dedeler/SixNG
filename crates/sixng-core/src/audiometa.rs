@@ -38,6 +38,12 @@
 //!   of 17 multi-child groups, against 1 of 19 when read as hash order).
 //! - wrapper (6): the last 12 bytes are `child, u32, ref`; the child is
 //!   always a simple or wrapper sound (or none, 0xffffffff).
+//! - class 15: after the header, 6 bytes, `u8 k`, k bytes, `u8 n`, then n
+//!   entries of `ref, f32, u8` (70 of 70; the f32 is mostly 1.0).
+//! - child refs at fixed body offsets (every object of the class in the
+//!   minigame pack reads as valid indices or none, and they point at
+//!   sounds): class 1 at 6; 2 at 56; 5 at 0, 4 and 8; 16 at 15; 20, 27 at
+//!   0; 28 at 0 and 4; 30 at 0 and 25; 48 at 0 and 8.
 //!
 //! **Sound header** (sound files, every class except 17, 49, 56 and 57,
 //! whose second byte is not a header). Byte 1 is a mask: each set bit `i`
@@ -248,10 +254,44 @@ pub fn parse_with(b: &[u8], streams: Option<&std::collections::HashSet<u32>>) ->
         let u32at = |d: &[u8], p: usize| u32::from_le_bytes(d[p..p + 4].try_into().unwrap());
         for o in objects.iter_mut() {
             let d = &b[8 + o.offset as usize..8 + (o.offset + o.size) as usize];
+            let mut body_at = None;
             if !NO_HEADER.contains(&o.class) {
                 if let Some((h, end)) = sound_header(d) {
                     o.header = Some(h);
                     o.body = Some(d[end..].iter().map(|x| format!("{x:02x}")).collect());
+                    body_at = Some(end);
+                }
+            }
+            if let Some(e) = body_at {
+                let body = &d[e..];
+                let at = |p: usize| (p + 4 <= body.len()).then(|| u32at(body, p));
+                let fixed: &[usize] = match o.class {
+                    1 => &[6],
+                    2 => &[56],
+                    5 => &[0, 4, 8],
+                    16 => &[15],
+                    20 | 27 => &[0],
+                    28 => &[0, 4],
+                    30 => &[0, 25],
+                    48 => &[0, 8],
+                    _ => &[],
+                };
+                let mut kids: Vec<u32> = Vec::new();
+                if o.class == 15 {
+                    let mut p = 7 + *body.get(6).unwrap_or(&0) as usize;
+                    let n = body.get(p).copied().unwrap_or(0) as usize;
+                    p += 1;
+                    if p + 9 * n == body.len() {
+                        kids = (0..n).filter_map(|i| at(p + 9 * i)).collect();
+                    }
+                } else {
+                    let v: Vec<Option<u32>> = fixed.iter().map(|&p| at(p)).collect();
+                    if v.iter().all(|x| x.is_some_and(|x| x < max || x == u32::MAX)) {
+                        kids = v.into_iter().flatten().collect();
+                    }
+                }
+                if kids.iter().all(|&x| x < max || x == u32::MAX) {
+                    o.children.extend(kids.into_iter().filter(|&x| x < max).map(name));
                 }
             }
             match o.class {
@@ -400,6 +440,35 @@ mod tests {
         assert_eq!(m.objects.len(), 2);
         assert_eq!((m.objects[0].class, m.objects[0].size), (0xea, 4));
         assert_eq!((m.objects[1].class, m.objects[1].size), (0x00, 4));
+    }
+
+    #[test]
+    fn class15_children() {
+        // a class-15 sound (no header fields; body: 6 bytes, k = 0, n = 2,
+        // then `ref, f32, u8` x 2) pointing at two simple sounds
+        let mut d: Vec<u8> = super::MAGIC.to_le_bytes().to_vec();
+        d.extend_from_slice(&[15, 0, 0, 0, 0, 0, 0, 0, 0, 2]);
+        for r in [2u32, 3] {
+            d.extend_from_slice(&r.to_le_bytes());
+            d.extend_from_slice(&1f32.to_le_bytes());
+            d.push(0);
+        }
+        for w in [0x11u32, 0x22] {
+            d.extend_from_slice(&[12, 0]);
+            d.extend_from_slice(&0xc0u32.to_le_bytes());
+            d.extend_from_slice(&w.to_le_bytes());
+            d.extend_from_slice(&[0, 0, 0]);
+        }
+        let mut b = Vec::new();
+        for v in [166u32, d.len() as u32] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        b.extend_from_slice(&d);
+        for v in [4u32, 0, 4, 0, 4, 0xa, 0, 0xb, 4, 0xc, 32, 0xd, 45] {
+            b.extend_from_slice(&v.to_le_bytes());
+        }
+        let m = super::parse(&b).unwrap();
+        assert_eq!((m.objects[1].class, m.objects[1].children.clone()), (15, vec!["0000000c".to_string(), "0000000d".to_string()]));
     }
 
     #[test]
