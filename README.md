@@ -64,7 +64,10 @@ There is one Rust core library with two front ends:
 
 You need Rust 1.80+ (stable) on Windows, and **CMake** (for libopus, used
 by audio decoding; `.cargo/config.toml` sets the CMake policy libopus
-needs with CMake 4).
+needs with CMake 4). Without CMake, build with
+`cargo build --release --no-default-features -p sixng-cli -p sixng-gui`:
+everything works except Opus to WAV export and audio playback in the GUI
+(Opus streams still export as lossless `.opus`).
 
 ```powershell
 cd SixNG

@@ -8,8 +8,12 @@ license.workspace = true
 name = "sixng"
 path = "src/main.rs"
 
+[features]
+default = ["opus-decode"]
+opus-decode = ["sixng-core/opus-decode"]
+
 [dependencies]
-sixng-core = { path = "../sixng-core" }
+sixng-core = { path = "../sixng-core", default-features = false }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

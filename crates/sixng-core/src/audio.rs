@@ -583,6 +583,7 @@ pub fn ogg_opus(pk: &[Vec<u8>], samples: u32, tag: &str) -> Vec<u8> {
 
 /// Decode to interleaved 16-bit PCM at 48 kHz (pre-skip removed, trimmed to
 /// `samples` per channel). Returns (channels, interleaved samples).
+#[cfg(feature = "opus-decode")]
 pub fn decode(pk: &[Vec<u8>], samples: u32) -> Result<(u8, Vec<i16>)> {
     let ch = packet_channels(pk);
     let mut dec = opus::Decoder::new(48000, if ch == 2 { opus::Channels::Stereo } else { opus::Channels::Mono }).map_err(|e| anyhow!("opus: {e}"))?;
@@ -605,6 +606,13 @@ pub fn decode(pk: &[Vec<u8>], samples: u32) -> Result<(u8, Vec<i16>)> {
         pcm.truncate(samples as usize * ch as usize);
     }
     Ok((ch, pcm))
+}
+
+/// Built without the `opus-decode` feature (no libopus): Opus can't be
+/// decoded; export it as `.opus` instead.
+#[cfg(not(feature = "opus-decode"))]
+pub fn decode(_pk: &[Vec<u8>], _samples: u32) -> Result<(u8, Vec<i16>)> {
+    Err(anyhow!("this build has no Opus decoder (built without the opus-decode feature); export as .opus instead"))
 }
 
 pub fn wav(ch: u8, rate: u32, pcm: &[i16]) -> Vec<u8> {

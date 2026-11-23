@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [features]
+default = ["opus-decode"]
+opus-decode = ["sixng-core/opus-decode"]
 metal4-poc = ["dep:metal-rust", "dep:objc2"]
 
 [[example]]
@@ -15,7 +17,7 @@ required-features = ["metal4-poc"]
 [dependencies]
 # live GPU object counts for the map stream log (checks that evicted models are freed)
 wgpu = { version = "30", default-features = false, features = ["counters"] }
-sixng-core = { path = "../sixng-core" }
+sixng-core = { path = "../sixng-core", default-features = false }
 anyhow.workspace = true
 eframe = { version = "0.36.2", default-features = false, features = ["accesskit", "default_fonts", "wgpu", "x11", "wayland"] }
 egui-winit = { version = "0.36.2", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
