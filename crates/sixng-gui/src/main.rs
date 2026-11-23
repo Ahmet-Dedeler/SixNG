@@ -325,6 +325,8 @@ struct App {
     map2d: map2d::Map2D,
     map3d: map3d::Map3D,
     textures: texture_view::TextureView,
+    /// Job id of a `texture-users` job (the Textures tab reloads its index when it ends).
+    texture_users_job: Option<u32>,
     audio: audio_view::AudioView,
     shot: Option<(PathBuf, u32, bool)>,
     map3d_start: Option<[f32; 3]>,
@@ -421,6 +423,7 @@ impl App {
             map2d: map2d::Map2D::new(&work),
             map3d: map3d::Map3D::new(&game, &work),
             textures: texture_view::TextureView::new(&game, &work),
+            texture_users_job: None,
             audio: audio_view::AudioView::new(&game, &work),
             shot: None,
             map3d_start: None,
@@ -758,7 +761,10 @@ Optional layers not exported yet (the map works without them): {}.", opt.join(",
 impl App {
     fn logic_inner(&mut self, ctx: &egui::Context) {
         self.jobs.poll();
-        for (_, ok) in self.jobs.take_finished() {
+        for (id, ok) in self.jobs.take_finished() {
+            if ok && self.texture_users_job == Some(id) {
+                self.textures.reload_users();
+            }
             if ok {
                 self.refresh();
                 self.status = pages::Status::default();
@@ -884,6 +890,14 @@ impl App {
         }
         if self.tab == Tab::Textures {
             egui::CentralPanel::default().show(ui, |ui| self.textures.ui(ui));
+            if let Some(id) = self.textures.open_model.take() {
+                self.model.open(&id, 0, &ctx);
+                self.tab = Tab::Model;
+            }
+            if std::mem::take(&mut self.textures.want_users_job) {
+                self.texture_users_job = Some(self.jobs.enqueue("Texture users", vec!["texture-users".into()]));
+                self.tab = Tab::Jobs;
+            }
             return;
         }
         if self.tab == Tab::Audio {

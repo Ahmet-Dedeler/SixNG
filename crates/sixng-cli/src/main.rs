@@ -415,6 +415,14 @@ enum Cmd {
         #[arg(long, short)]
         out: PathBuf,
     },
+    /// Which materials use each texture: every material of every model (drawables, fragments, dictionary members) with its texture slots, so a base colour texture leads to the same material's normal map, packed roughness/metal map and so on. Writes <work>/index/texture_users.jsonl.gz, which the GUI's Textures tab reads ("Used by"). With --texture, prints the materials of one texture instead.
+    TextureUsers {
+        /// Archives to scan (default: every indexed archive with models).
+        archives: Vec<String>,
+        /// Print the materials (and their other slots) that use this texture hash (16 hex digits), from the existing index.
+        #[arg(long)]
+        texture: Option<String>,
+    },
     /// BCPack texture gaps: every material whose textures are flat (no clean mip) or low-mip, with slot roles, class, terrain-layer surface guesses and usage weight. Writes <out>/texture_gaps.json.
     TextureGaps {
         /// Archives with drawables (default levels).
@@ -1301,6 +1309,28 @@ fn run(cli: &Cli, out: &Out) -> Result<()> {
             let v = export::shader_census(&a, &sel, pr)?;
             std::fs::write(po, serde_json::to_vec_pretty(&v)?)?;
             out.print(&json!({"ok": true, "archive": a.id, "scanned": sel.len(), "shaders": v.as_object().map(|o| o.len()), "seconds": t.elapsed().as_secs_f64(), "out": po}));
+        }
+        Cmd::TextureUsers { archives, texture } => {
+            let t = Instant::now();
+            if let Some(h) = texture {
+                let h = u64::from_str_radix(h.trim_start_matches("0x"), 16).map_err(|_| anyhow::anyhow!("--texture wants a hex hash"))?;
+                let tu = sixng_core::texusers::TexUsers::load(&sixng_core::texusers::path(&ws))?;
+                let mats: Vec<serde_json::Value> = tu
+                    .users(h)
+                    .iter()
+                    .map(|&m| {
+                        let mat = &tu.materials[m as usize];
+                        let users = &tu.material_models[m as usize];
+                        json!({"shader": mat.shader, "slots": mat.slots.iter().map(|(n, x)| json!({"param": n, "texture": format!("{x:016x}")})).collect::<Vec<_>>(),
+                            "models": users.len(), "examples": users.iter().take(5).map(|&i| json!({"id": tu.models[i as usize].0, "name": tu.models[i as usize].1})).collect::<Vec<_>>()})
+                    })
+                    .collect();
+                out.print(&json!({"ok": true, "texture": format!("{h:016x}"), "materials": mats}));
+            } else {
+                let sel = sixng_core::texusers::archives(&ws, archives)?;
+                let s = sixng_core::texusers::build(&ws, &sel, pr)?;
+                out.print(&json!({"ok": true, "archives": sel.iter().map(|a| a.0.id.clone()).collect::<Vec<_>>(), "result": s, "seconds": t.elapsed().as_secs_f64()}));
+            }
         }
         Cmd::TextureGaps { archives, placements, out: po, file } => {
             let mut sel_all = Vec::new();

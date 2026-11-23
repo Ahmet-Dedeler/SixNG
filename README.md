@@ -212,6 +212,8 @@ ames.json; exports and the app use it.
 # BCPack texture gaps: every material with flat / low-mip textures, slot roles, class, terrain-layer
 # surface guesses and placement weight (~6 min; uses placements, batches, collision, surfaces)
 .\target\release\sixng.exe texture-gaps levels -o work\out --file work\texture_gaps.json --placements work\out\placements\levels
+# Which materials (and their other slots) use each texture: index for the Textures tab (~10 min)
+.\target\release\sixng.exe texture-users
 # Audio banks in audio.rpf: scan once (~2.5 min), then list (--min-seconds, --limit)
 .\target\release\sixng.exe audio --min-seconds 30 --limit 10 --pretty
 # Export a bank's streams as Ogg Opus / WAV / both, or the raw bank (awc); --stream <hex> for one, --all for every bank
@@ -758,6 +760,17 @@ hash, the same `hash64` that `model.json` lists for each material slot:
 in the Model viewer, open a material and click **view** on a slot to jump
 here. From the command line: `--texture <hash>` (or `--tab textures`)
 with `--window-screenshot out.png --exit`.
+
+**Used by**, on the right, lists the materials that use the selected
+texture, most-used first: each with its shader, its other texture slots
+(a base colour leads to its normal map, packed roughness/metal and so on;
+click a hash to view it) and a few of the models that have it (click one
+to open it in the Model viewer). It reads
+`<work>/index/texture_users.jsonl.gz`, which **Build index** (or
+`sixng texture-users`) writes from the indexed archives: about 10 min for
+the whole install (349 K models, 1.09 M distinct materials, 391 K
+textures, 44 MB). `sixng texture-users --texture <hash>` prints the same
+list as JSON.
 
 ### Audio
 

@@ -2,12 +2,17 @@
 //! filterable by store, format, size and hash, with a decoded preview of any mip,
 //! single-channel views and PNG export. Textures have no recovered names; they are
 //! identified by their 64-bit hash (the same `hash64` that model.json lists per
-//! material slot, so the model viewer can jump here).
+//! material slot, so the model viewer can jump here). The "Used by" panel lists
+//! the materials that use the selected texture and their other slots (from the
+//! `sixng texture-users` index), so a base colour leads to its normal map and
+//! the rest of its material.
 
 use eframe::egui;
 use sixng_core::ttpf::{self, TtpfSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+type UsersSlot = Arc<Mutex<Option<Result<Arc<sixng_core::texusers::TexUsers>, String>>>>;
 
 const CHANNELS: [&str; 6] = ["RGBA", "RGB", "R", "G", "B", "A"];
 
@@ -51,6 +56,13 @@ pub struct TextureView {
     scroll_to_sel: bool,
     pending_hash: Option<u64>,
     last_export: Option<PathBuf>,
+    users: Option<Result<Arc<sixng_core::texusers::TexUsers>, String>>,
+    users_slot: UsersSlot,
+    users_started: bool,
+    /// Set when "Used by" asks to open a model in the Model viewer.
+    pub open_model: Option<String>,
+    /// Set when "Used by" asks to build its index (a `texture-users` job).
+    pub want_users_job: bool,
 }
 
 impl TextureView {
@@ -83,6 +95,140 @@ impl TextureView {
             scroll_to_sel: false,
             pending_hash: None,
             last_export: None,
+            users: None,
+            users_slot: Arc::new(Mutex::new(None)),
+            users_started: false,
+            open_model: None,
+            want_users_job: false,
+        }
+    }
+
+    /// Read the texture-users index again (after a `texture-users` job).
+    pub fn reload_users(&mut self) {
+        self.users = None;
+        self.users_started = false;
+    }
+
+    fn ensure_users(&mut self) {
+        if self.users.is_some() {
+            return;
+        }
+        if let Some(r) = self.users_slot.lock().unwrap().take() {
+            self.users = Some(r);
+            return;
+        }
+        if !self.users_started {
+            self.users_started = true;
+            let ws = sixng_core::export::Workspace::new(&self.game, &self.work);
+            let p = sixng_core::texusers::path(&ws);
+            let slot = self.users_slot.clone();
+            std::thread::spawn(move || {
+                let r = if p.exists() {
+                    sixng_core::texusers::TexUsers::load(&p).map(Arc::new).map_err(|e| format!("{e:#}"))
+                } else {
+                    Err("missing".into())
+                };
+                *slot.lock().unwrap() = Some(r);
+            });
+        }
+    }
+
+    /// "Used by": the materials that use `hash`, each with its slots
+    /// (click one to view that texture) and some of its models (click to
+    /// open in the Model viewer).
+    fn users_ui(&mut self, ui: &mut egui::Ui, hash: u64) {
+        self.ensure_users();
+        ui.strong("Used by");
+        let users = match &self.users {
+            None => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.weak("reading the texture-users index");
+                });
+                ui.ctx().request_repaint();
+                return;
+            }
+            Some(Err(e)) if e == "missing" => {
+                ui.label("Which materials use a texture, and their other maps (normal, roughness/metal …), comes from an index of every model's materials. It isn't built yet.");
+                if ui
+                    .button("Build index")
+                    .on_hover_text("Runs `sixng texture-users` as a job (a few minutes; needs the archives indexed)")
+                    .clicked()
+                {
+                    self.want_users_job = true;
+                }
+                return;
+            }
+            Some(Err(e)) => {
+                ui.colored_label(egui::Color32::from_rgb(230, 120, 90), e);
+                return;
+            }
+            Some(Ok(u)) => u.clone(),
+        };
+        let mats = users.users(hash);
+        if mats.is_empty() {
+            ui.weak("No material in the indexed models uses this texture.");
+            return;
+        }
+        let models: std::collections::HashSet<u32> = mats
+            .iter()
+            .flat_map(|&m| users.material_models[m as usize].iter().copied())
+            .collect();
+        let s = |n: usize| if n == 1 { "" } else { "s" };
+        ui.label(format!("{} material{} in {} model{}", mats.len(), s(mats.len()), models.len(), s(models.len())));
+        let mut view = None;
+        let mut open = None;
+        egui::ScrollArea::vertical()
+            .id_salt("tv_users_scroll")
+            .auto_shrink([false; 2])
+            .show(ui, |ui| {
+                for (k, &m) in mats.iter().take(60).enumerate() {
+                    let mat = &users.materials[m as usize];
+                    let ms = &users.material_models[m as usize];
+                    egui::CollapsingHeader::new(format!("{} · {} model{}", mat.shader, ms.len(), s(ms.len())))
+                        .id_salt(("tv_mat", m))
+                        .default_open(k < 3)
+                        .show(ui, |ui| {
+                            egui::Grid::new(("tv_slots", m))
+                                .num_columns(2)
+                                .spacing([8.0, 2.0])
+                                .show(ui, |ui| {
+                                    for (name, h) in &mat.slots {
+                                        ui.label(egui::RichText::new(name).small());
+                                        let txt = egui::RichText::new(format!("{h:016x}")).monospace().small();
+                                        if *h == hash {
+                                            ui.label(txt.strong());
+                                        } else if ui.link(txt).on_hover_text("view this texture").clicked() {
+                                            view = Some(*h);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                            for &i in ms.iter().take(5) {
+                                let (id, name) = &users.models[i as usize];
+                                let label = if name.is_empty() { id.clone() } else { name.clone() };
+                                if ui
+                                    .link(egui::RichText::new(label).small())
+                                    .on_hover_text(format!("open {id} in the Model viewer"))
+                                    .clicked()
+                                {
+                                    open = Some(id.clone());
+                                }
+                            }
+                            if ms.len() > 5 {
+                                ui.weak(format!("+ {} more", ms.len() - 5));
+                            }
+                        });
+                }
+                if mats.len() > 60 {
+                    ui.weak(format!("+ {} more materials", mats.len() - 60));
+                }
+            });
+        if let Some(h) = view {
+            self.show_hash(h);
+        }
+        if open.is_some() {
+            self.open_model = open;
         }
     }
 
@@ -91,6 +237,7 @@ impl TextureView {
         self.set.is_some()
             && !self.decoding
             && (self.sel.is_none() || self.tex.is_some() || self.error.is_some())
+            && (self.sel.is_none() || self.users.is_some())
     }
 
     fn ensure_loading(&mut self) {
@@ -452,6 +599,14 @@ impl TextureView {
                     self.select(r);
                 }
             });
+        if let Some(r) = self.sel {
+            let h = set.stores[r.0].textures[r.1].hash;
+            egui::Panel::right("tv_users")
+                .resizable(true)
+                .default_size(330.0)
+                .size_range(220.0..=600.0)
+                .show(ui, |ui| self.users_ui(ui, h));
+        }
         // Over the preview at fit zoom the wheel steps through the list (one
         // texture per notch, also past textures that cannot decode); zoomed in, it pans.
         if self.zoom <= 0.0 && ui.rect_contains_pointer(ui.available_rect_before_wrap()) {
@@ -550,7 +705,7 @@ impl TextureView {
         }
         let Some(d) = &self.decoded else { return };
         if d.undecoded > 0 {
-            ui.colored_label(egui::Color32::from_rgb(220, 180, 80), format!("{} KiB of this texture is in BCPack chunks that cannot be decoded (only BC1 decodes so far); lower mips may be clean.", d.undecoded / 1024));
+            ui.colored_label(egui::Color32::from_rgb(220, 180, 80), format!("{} KiB of this texture is in BCPack chunks that did not decode; lower mips may be clean.", d.undecoded / 1024));
         }
         let need = (d.hash, d.mip, self.channel);
         if self.tex.as_ref().map(|x| (x.0, x.1, x.2)) != Some(need) {
